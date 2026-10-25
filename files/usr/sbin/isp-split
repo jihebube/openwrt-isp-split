@@ -407,6 +407,7 @@ cmd_wire() {
 	log "规则已注入（备份: $WORK/mwan3.bak）"
 	/etc/init.d/mwan3 reload
 	_fallback_counter
+	_dns_bypass
 }
 
 # 只刷新数据并原子刷入，不重写 mwan3 配置、不 reload mwan3。
@@ -473,6 +474,18 @@ cmd_verify() {
 	}
 	foreach_enabled _vf
 
+	echo
+	# 运行时规则自检：mwan3 重启会清掉 apply/dns 运行时插入的规则
+	if [ "$(nft list chain inet mwan3 mwan3_output 2>/dev/null | grep -c "dport 53")" -eq 0 ] &&
+	   [ -n "${DNS_TABLE:-}" ]; then
+		echo "⚠ DNS 旁路规则缺失（mwan3 重启会清掉运行时插入的规则）"
+		echo "  恢复：isp-split dns   （或 isp-split wire）"
+	fi
+	if [ "$(nft list chain inet mwan3 mwan3_rules 2>/dev/null | grep -c "counter name")" -eq 0 ] &&
+	   [ -n "${DNS_TABLE:-}" ]; then
+		echo "⚠ 兜底计数规则缺失（同上）"
+		echo "  恢复：isp-split apply"
+	fi
 	echo
 	echo "== 策略成员状态"
 	mwan3 status 2>/dev/null | head -24 || echo "  (mwan3 status 不可用)"
@@ -755,6 +768,35 @@ dns_of_policy() {
 #
 # 同时要在 mwan3_output 链顶部给这些 DNS 服务器加 return，
 # 否则 mwan3 会按目标 IP 重新打标，把 DNS 查询抢到别的线路上。
+# DNS 出线规则重放（幂等）：mwan3 重建链后运行时插入的规则会丢失，
+# wire / dns / init.d(开机) 三个入口都会调用本函数恢复。
+# bind 模式：return 旁路，出线由 dnsmasq 的 @接口 绑定决定
+# mark 模式：jump 到该 DNS 所属策略，由 mwan3 打标选路
+_dns_bypass() {
+	nft list chain inet mwan3 mwan3_output >/dev/null 2>&1 || return 0
+	for row in ${DNS_TABLE:-}; do
+		_pol=${row%%:*}
+		_dns=${row#*:}
+		[ -n "$_dns" ] || continue
+		for proto in udp tcp; do
+			if [ "$DNS_MODE" = "mark" ]; then
+				nft list chain inet mwan3 mwan3_output 2>/dev/null |
+					grep -q "ip daddr $_dns $proto dport 53 counter jump mwan3_policy_$_pol" ||
+				nft insert rule inet mwan3 mwan3_output \
+					ip daddr "$_dns" "$proto" dport 53 counter \
+					jump "mwan3_policy_$_pol" 2>/dev/null ||
+				log "警告：无法插入 DNS 打标规则 $_dns/$proto -> $_pol"
+			else
+				nft list chain inet mwan3 mwan3_output 2>/dev/null |
+					grep -q "ip daddr $_dns $proto dport 53 return" ||
+				nft insert rule inet mwan3 mwan3_output \
+					ip daddr "$_dns" "$proto" dport 53 counter return 2>/dev/null ||
+				log "警告：无法向 mwan3_output 插入 $_dns/$proto 的旁路规则"
+			fi
+		done
+	done
+}
+
 cmd_dns() {
 	need_nft
 	mkdir -p "$DNSDIR" "$DOMAINDIR"
@@ -827,33 +869,8 @@ cmd_dns() {
 		_n=$((_n + _c))
 	done
 
-	# 3) 处理 DNS 查询的出线
-	#    这一步与域名规则无关：DNS 查询本身不该被运营商规则按目标 IP 随机打标。
-	#    bind 模式：加 return，mwan3 完全不碰，出线由 dnsmasq 的 @接口 绑定决定
-	#    mark 模式：直接 jump 到该 DNS 所属策略，由 mwan3 打标选路（不依赖 @接口）
-	for row in ${DNS_TABLE:-}; do
-		_pol=${row%%:*}
-		_dns=${row#*:}
-		[ -n "$_dns" ] || continue
-		for proto in udp tcp; do
-			if [ "$DNS_MODE" = "mark" ]; then
-				if ! nft list chain inet mwan3 mwan3_output 2>/dev/null |
-					grep -q "ip daddr $_dns $proto dport 53 counter jump mwan3_policy_$_pol"; then
-					nft insert rule inet mwan3 mwan3_output \
-						ip daddr "$_dns" "$proto" dport 53 counter \
-						jump "mwan3_policy_$_pol" 2>/dev/null ||
-						log "警告：无法插入 DNS 打标规则 $_dns/$proto -> $_pol"
-				fi
-			else
-				if ! nft list chain inet mwan3 mwan3_output 2>/dev/null |
-					grep -q "ip daddr $_dns $proto dport 53 return"; then
-					nft insert rule inet mwan3 mwan3_output \
-						ip daddr "$_dns" "$proto" dport 53 counter return 2>/dev/null ||
-						log "警告：无法向 mwan3_output 插入 $_dns/$proto 的旁路规则"
-				fi
-			fi
-		done
-	done
+	# 3) 处理 DNS 查询的出线（幂等，mwan3 重启后重跑 wire/apply/dns 即恢复）
+	_dns_bypass
 
 	if [ "$_n" -eq 0 ]; then
 		rm -f "$_out"
