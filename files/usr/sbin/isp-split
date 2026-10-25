@@ -914,9 +914,14 @@ conf_get() {
 	printf 'dns_mode\t%s\n' "$(_conf_val DNS_MODE)"
 	printf 'policies\t%s\n' \
 		"$(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p' | tr '\n' ' ')"
-	_conf_val ISP_TABLE | awk -F: 'NF >= 4 { printf "isp\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
-	_conf_val DNS_TABLE | awk -F: 'NF >= 2 { printf "dns\t%s\t%s\n", $1, $2 }'
-	_conf_val DOMAIN_SPLIT | awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
+	# 值支持两种书写格式：多行（每行一条）或单行空格分隔。
+	# 先把所有空白折叠成换行，再按冒号拆字段——两种格式统一处理。
+	_conf_val ISP_TABLE | tr -s ' \t' '\n' |
+		awk -F: 'NF >= 4 { printf "isp\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
+	_conf_val DNS_TABLE | tr -s ' \t' '\n' |
+		awk -F: 'NF >= 2 { printf "dns\t%s\t%s\n", $1, $2 }'
+	_conf_val DOMAIN_SPLIT | tr -s ' \t' '\n' |
+		awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
 }
 
 # 安全重写某个 KEY 的值：写前备份、写后 sh -n 校验、失败自动回滚
