@@ -95,7 +95,7 @@ else
 	bad "缺少 curl（apk add curl / opkg install curl）"
 fi
 
-if curl -fsI --connect-timeout 8 https://ispip.clang.cn/gz.cn 2>/dev/null | head -1 | grep -q 200; then
+if curl -fsI --connect-timeout 8 https://ispip.clang.cn/chinatelecom.txt 2>/dev/null | head -1 | grep -q 200; then
 	ok "数据源 ispip.clang.cn 可达"
 else
 	bad "数据源 ispip.clang.cn 不可达 —— 检查外网/防火墙"
