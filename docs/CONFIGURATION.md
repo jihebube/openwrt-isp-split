@@ -115,6 +115,7 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 | `DNSDIR` | `/etc/isp-split/dnsmasq.d` | dnsmasq 片段目录 |
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
+| `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |
 
 ---
 

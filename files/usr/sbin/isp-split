@@ -213,6 +213,40 @@ _gen_batch() {
 	foreach_enabled _apply_one_all
 }
 
+# 兜底流量计数器：插在本工具规则块之后、既有端口/兜底规则之前。
+# 命中集合的流量在前面的 jump 里已离开本链，能走到这条规则的
+# 必然是未命中任何启用集合的流量，从而可以量化"覆盖率"。
+_fallback_counter() {
+	[ "$COUNT_FALLBACK" = "1" ] || return 0
+	nft list chain inet mwan3 mwan3_rules >/dev/null 2>&1 || return 0
+
+	if ! nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
+		nft add counter inet mwan3 isp_fallback 2>/dev/null || return 0
+	fi
+
+	# 旧版规则（无 mark 条件）会误计命中集合的新连接首包
+	# —— mwan3 策略链 jump 设置标记后 return，会继续执行链上剩余规则。
+	# 先清理，再插入带 mark==0 条件的版本，保证只统计真正的兜底包。
+	while _rh=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+		grep 'counter name "isp_fallback"' |
+		grep -oE '# handle [0-9]+' | grep -oE '[0-9]+' | head -1); do
+		nft delete rule inet mwan3 mwan3_rules handle "$_rh" 2>/dev/null || break
+	done
+
+	# 插入点：最后一条 daddr @isp_* 规则的下一条
+	_h=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+		sed -n '/chain mwan3_rules/,/^	}/p' |
+		awk '/daddr @isp_/ { seen = 1; next }
+		     seen && /# handle/    { print $NF; exit }')
+	_COND='meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"'
+	if [ -n "$_h" ]; then
+		nft insert rule inet mwan3 mwan3_rules position "$_h" \
+			"$_COND" 2>/dev/null && return 0
+	fi
+	# 没找到位置（本工具规则在链尾或版本差异）就追加到链尾
+	nft add rule inet mwan3 mwan3_rules "$_COND" 2>/dev/null || true
+}
+
 cmd_apply() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
@@ -222,6 +256,7 @@ cmd_apply() {
 
 	# nft -f 对整份文件是一个事务：要么全成功，要么全不变。
 	nft -f "$WORK/batch.nft" || die "nft 批量加载失败，线上规则未改动"
+	_fallback_counter
 	log "已生效"
 }
 
@@ -371,6 +406,7 @@ cmd_wire() {
 	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	log "规则已注入（备份: $WORK/mwan3.bak）"
 	/etc/init.d/mwan3 reload
+	_fallback_counter
 }
 
 # 只刷新数据并原子刷入，不重写 mwan3 配置、不 reload mwan3。
@@ -609,6 +645,14 @@ cmd_status() {
 	printf '%-14s %-10s %10s %12s %10s  %s\n' "集合" "来源" "条目" "命中包" "流量" "策略"
 	_st_all() { _status_one "$1" "$2" "$3"; }
 	foreach_enabled _st_all
+	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
+		_fb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
+			grep -oE "packets [0-9]+ bytes [0-9]+" | head -1)
+		_fp=$(echo "$_fb" | awk '{print $2}')
+		_fb_b=$(echo "$_fb" | awk '{print $4}')
+		printf '%-14s %-10s %10s %12s %10s  %s\n' \
+			"兜底" "-" "-" "${_fp:-0}" "${_fb_b:-0}" "未命中集合"
+	fi
 	echo
 	if [ -f "$DATA/.stamp" ]; then
 		echo "数据更新时间: $(date -d "@$(cat "$DATA/.stamp")" 2>/dev/null ||
@@ -663,6 +707,8 @@ DNSDIR=${DNSDIR:-/etc/isp-split/dnsmasq.d}
 #          不依赖 @接口，任何能按域名指定上游的解析器都适用；且在 OpenClash
 #          接管 DNS 的场景下更抗干扰（我们只看目标 IP，不管是谁发的包）
 DNS_MODE=${DNS_MODE:-bind}
+# 统计"未命中任何运营商集合"的兜底流量（isp_fallback 计数器，status 里显示）
+COUNT_FALLBACK=${COUNT_FALLBACK:-1}
 DOMAINDIR=${DOMAIN_LIST_DIR:-${DOMAINDIR:-/etc/isp-split/domains}}
 
 # 策略 -> 出接口设备名（策略取第一个成员）
