@@ -37,7 +37,7 @@ sh scripts/build-ipk.sh
 
 ## 3. 构建 `.apk`（Docker，推荐）
 
-**这是绝大多数人的路径**——因为 apk 只能用 OpenWrt SDK 编译，而 SDK 是 Linux x86_64 程序，macOS 跑不了。
+**这是绝大多数人的路径**——因为 apk 只能用 OpenWrt SDK 编译，而 SDK 是 Linux x86_64 程序。
 
 ```sh
 sh scripts/build-apk-docker.sh           # 默认 25.12.6
