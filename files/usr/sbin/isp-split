@@ -250,6 +250,13 @@ _fallback_counter() {
 cmd_apply() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
+	# 集合由 wire 写入的 config ipset 在 mwan3 reload 时建立。
+	# apply 的 batch 只 flush/add element，不含 add set——集合缺失时
+	# nft 的报错是模糊的"批量加载失败"，这里给出明确指引。
+	_fs=$(_conf_val ISP_TABLE 2>/dev/null | head -1 | cut -d: -f2)
+	if [ -n "$_fs" ] && ! nft list set inet mwan3 "$_fs" >/dev/null 2>&1; then
+		die "nft 中不存在集合 $_fs —— 集合由 wire 创建。先执行: isp-split wire（或 isp-split sync）"
+	fi
 	mkdir -p "$WORK"
 	_gen_batch "$WORK/batch.nft" mwan3
 	[ -s "$WORK/batch.nft" ] || die "没有可应用的集合"
@@ -667,6 +674,11 @@ cmd_status() {
 	printf '%-14s %-10s %10s %12s %10s  %s\n' "集合" "来源" "条目" "命中包" "流量" "策略"
 	_st_all() { _status_one "$1" "$2" "$3"; }
 	foreach_enabled _st_all
+	# 自愈式重插：mwan3 reload 会清掉计数器规则，status 是最常跑的
+	# 命令，在这里幂等恢复（_fallback_counter 内部有存在性检查）
+	if [ "$COUNT_FALLBACK" = "1" ]; then
+		_fallback_counter
+	fi
 	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
 		_fb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
 			grep -oE "packets [0-9]+ bytes [0-9]+" | head -1)
