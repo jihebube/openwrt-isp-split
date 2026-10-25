@@ -43,8 +43,10 @@ fi
 command -v nft >/dev/null 2>&1 || die "缺少 nft"
 
 # mwan3 必须是 nftables 版（Kwrt 源叫 mwan3-nft，官方 feed 的 mwan3 是 iptables 版）
-if ! apk list -I 2>/dev/null | grep -qE "^mwan3(-nft)? " &&
-   ! opkg list-installed 2>/dev/null | grep -qE "^mwan3(-nft)? "; then
+# apk list -I 的输出是 "mwan3-3.6.12-r1 ..."（连字符接版本），
+# opkg 是 "mwan3 - 3.6.x"，所以只按前缀匹配
+if ! apk list -I 2>/dev/null | grep -q "^mwan3" &&
+   ! opkg list-installed 2>/dev/null | grep -q "^mwan3"; then
 	die "未检测到 mwan3 / mwan3-nft。需要 nftables 版 mwan3（>= 3.6.0）：
      Kwrt:  apk add mwan3-nft
      上游:  https://github.com/dl12345/mwan3"
