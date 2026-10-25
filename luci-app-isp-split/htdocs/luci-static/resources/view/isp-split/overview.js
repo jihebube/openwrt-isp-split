@@ -115,44 +115,32 @@ return view.extend({
 	render: function() {
 		var self = this;
 
-		var actions = E('div', { 'class': 'cbi-page-actions' }, [
-			E('button', {
-				'class': 'cbi-button cbi-button-action',
-				'click': function() { self.run(['plan'], _('预演')); }
-			}, [ _('预演（只读）') ]),
-			' ',
-			E('button', {
-				'class': 'cbi-button',
-				'click': function() { self.run(['check'], _('干跑校验')); }
-			}, [ _('nft 校验') ]),
-			' ',
-			E('button', {
-				'class': 'cbi-button',
-				'click': function() { self.run(['selftest'], _('实弹自检')); }
-			}, [ _('实弹自检') ]),
-			' ',
-			E('button', {
-				'class': 'cbi-button cbi-button-positive',
-				'click': function() {
-					self.run(['sync'], _('同步'), _('将下载最新运营商数据、重写 mwan3 规则并刷入 nftables。这会改动分流配置，确认继续？'));
-				}
-			}, [ _('同步生效') ]),
-			' ',
-			E('button', {
-				'class': 'cbi-button cbi-button-neutral',
-				'click': function() { self.run(['verify'], _('核对')); }
-			}, [ _('核对规则') ]),
-			' ',
-			E('button', {
-				'class': 'cbi-button',
-				'click': function() { self.refresh(); }
-			}, [ _('刷新') ])
-		]);
+	var actions = E('div', { 'class': 'cbi-page-actions' }, [
+		E('button', {
+			'class': 'cbi-button cbi-button-action',
+			'click': function() { self.run(['sync'], _('同步'), _('将下载最新运营商数据、重写 mwan3 规则并刷入 nftables。这会改动分流配置，确认继续？')); }
+		}, [ _('同步生效') ]),
+		' ',
+		E('button', {
+			'class': 'cbi-button',
+			'click': function() { self.run(['refresh'], _('更新数据')); }
+		}, [ _('更新数据') ]),
+		' ',
+		E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'click': function() { self.run(['verify'], _('核对')); }
+		}, [ _('核对规则') ]),
+		' ',
+		E('button', {
+			'class': 'cbi-button',
+			'click': function() { self.refresh(); }
+		}, [ _('刷新') ])
+	]);
 
 		var container = E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, [ _('运营商分流') ]),
 			E('div', { 'class': 'cbi-map-descr' }, [
-				_('按目标 IP 归属的运营商选择出口线路。数据来自 ispisp.clang.cn，每日自动更新；'),
+				_('按目标 IP 归属的运营商选择出口线路。数据来自 ispip.clang.cn，每日自动更新；'),
 				_('只影响直连流量，代理流量由 OpenClash 自行接管。')
 			]),
 
