@@ -107,7 +107,7 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 6. 更新源的 IP 可能落在某个集合里，该线路故障时 `fetch` 会失败
 7. 启用 `othernet` 集合会把公共 DNS 一并分走，该线路故障时导致解析失败（默认关闭）
 8. mwan3 原生的「域名 -> nftset」需要 dnsmasq-full（`no-nftset` 的基础镜像不支持）；本工具的多线路 DNS 不受此限制
-9. **未命中集合的兜底流量是否参与负载均衡，取决于 mwan3 的 `default_rule_v4` 是否启用**——未启用时兜底流量走系统默认路由（`status` 会提示）。想要分流覆盖全部流量，需在 mwan3 里启用它
+9. 兜底流量的负载均衡由 mwan3 的 `default_rule_v4` 决定，**缺省即启用并参与叠加**（实测：uci 无 enabled 字段时规则照常渲染）。只有当该规则被显式禁用或删除时，兜底流量才走系统默认路由（`status` 会提示）
 
 ## 路线图
 

@@ -692,12 +692,16 @@ cmd_status() {
 		echo "数据更新时间: $(date -d "@$(cat "$DATA/.stamp")" 2>/dev/null ||
 			date -r "$(cat "$DATA/.stamp")" 2>/dev/null || echo '未知')"
 	fi
-	# 兜底提示：未命中任何运营商集合的流量去哪了
-	if [ "$(uci -q get mwan3.default_rule_v4.enabled 2>/dev/null)" != "1" ]; then
+	# 兜底流量状态：以链里 default 规则的实际渲染为准
+	# （mwan3 对 rule 的 enabled 缺省是"启用"，不能只看 uci 字段）
+	_dr=$(nft list chain inet mwan3 mwan3_rules 2>/dev/null | grep -c "default_rule")
+	if [ "${_dr:-0}" -gt 0 ]; then
+		echo "兜底流量: 已参与负载均衡（default_rule_v4 渲染中，走其 use_policy 指定的策略）"
+	else
 		echo
-		echo "提示: mwan3 的 default_rule_v4 未启用"
-		echo "      未命中任何启用集合的流量不会被打标，将走系统默认路由（不参与负载均衡）。"
-		echo "      若希望这部分流量也按策略分配，请在 mwan3 里启用 default_rule_v4。"
+		echo "提示: mwan3 的 default 规则未渲染"
+		echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
+		echo "      若 mwan3.default_rule_v4 存在，检查其 enabled 字段是否被显式置 0。"
 	fi
 
 	echo "规则顺序:"
