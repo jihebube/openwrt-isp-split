@@ -107,12 +107,51 @@ return view.extend({
 
 		/* ---------------- 域名分流 ---------------- */
 
-		var domArea = E('textarea', {
-			'class': 'cbi-input-textarea',
-			'rows': 6,
-			'style': 'width:100%;font-family:monospace',
-			'placeholder': '每行一条：域名后缀:策略　例如\nbilivideo.com:wanb_only'
-		}, [ domains.map(function(d) { return d.domain + ':' + d.policy; }).join('\n') ]);
+		var domTbody = E('tbody', { 'id': 'isp-dom-tbody' });
+
+		function renderDomains() {
+			while (domTbody.firstChild)
+				domTbody.removeChild(domTbody.firstChild);
+
+			if (!domains.length) {
+				domTbody.appendChild(E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td', 'colspan': 3 }, [
+						_('尚未配置。大多数域名不需要在这里出现——只有 CDN 调度不准的站点才需要钉线。')
+					])
+				]));
+			}
+
+			domains.forEach(function(row, idx) {
+				var inp = E('input', { 'type': 'text', 'class': 'cbi-input-text',
+					'placeholder': '域名后缀，如 bilivideo.com', 'value': row.domain, 'style': 'width:100%' });
+				inp.addEventListener('input', function() { row.domain = inp.value.trim(); });
+
+				var sel = E('select', { 'class': 'cbi-input-select' }, policies.map(function(p) {
+					return E('option', { 'value': p, 'selected': p === row.policy ? '' : null }, [ p ]);
+				}));
+				sel.addEventListener('change', function() { row.policy = sel.value; });
+
+				var del = E('button', {
+					'class': 'cbi-button cbi-button-negative',
+					'click': function() { domains.splice(idx, 1); renderDomains(); }
+				}, [ _('删除') ]);
+
+				domTbody.appendChild(E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td' }, [ inp ]),
+					E('td', { 'class': 'td' }, [ sel ]),
+					E('td', { 'class': 'td' }, [ del ])
+				]));
+			});
+		}
+		renderDomains();
+
+		var addDomBtn = E('button', {
+			'class': 'cbi-button cbi-button-positive',
+			'click': function() {
+				domains.push({ domain: '', policy: policies[0] || 'wan_only' });
+				renderDomains();
+			}
+		}, [ _('添加域名') ]);
 
 		var result = E('pre', {
 			'id': 'cfg-out',
@@ -134,9 +173,8 @@ return view.extend({
 			var dnsVal = dns.filter(function(r) { return r.dns; })
 				.map(function(r) { return r.policy + ':' + r.dns; }).join('|');
 
-			var domVal = domArea.value.split('\n')
-				.map(function(s) { return s.trim(); })
-				.filter(function(s) { return s && s.indexOf('#') !== 0; })
+			var domVal = domains.filter(function(r) { return r.domain; })
+				.map(function(r) { return r.domain + ':' + r.policy; })
 				.join('|');
 
 			var log = [];
@@ -215,9 +253,18 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('h3', {}, [ _('域名分流') ]),
 				E('div', { 'class': 'cbi-value-description' }, [
-					_('这些后缀的域名会强制用对应线路的 DNS 解析，让 CDN 返回本运营商节点。留空则不启用。')
+					_('未列出的域名走系统默认上游（默认就是 PPPoE 下发的运营商 DNS，无需配置）。'),
+					_('只有个别站点 CDN 调度不准时，才在这里把它的域名钉到指定线路。')
 				]),
-				domArea
+				E('table', { 'class': 'table cbi-section-table' }, [
+					E('thead', {}, [ E('tr', { 'class': 'tr table-titles' }, [
+						E('th', { 'class': 'th' }, [ _('域名后缀') ]),
+						E('th', { 'class': 'th' }, [ _('钉到线路') ]),
+						E('th', { 'class': 'th' }, [ _('') ])
+					]) ]),
+					domTbody
+				]),
+				E('div', { 'style': 'margin-top:6px' }, [ addDomBtn ])
 			]),
 
 			E('div', { 'class': 'cbi-page-actions' }, [
