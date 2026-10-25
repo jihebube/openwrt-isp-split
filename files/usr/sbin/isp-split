@@ -717,7 +717,10 @@ policy_device() {
 	[ -n "$_m" ] || return 0
 	_i=$(uci -q get "mwan3.$_m.interface" 2>/dev/null)
 	[ -n "$_i" ] || return 0
-	_d=$(uci -q get "network.$_i.device" 2>/dev/null)
+	# pppoe 等虚拟接口的运行时设备取 l3_device（如 pppoe-wan1）；
+	# uci 的 device 字段可能是底层 VLAN（如 eth1.10），DNS 绑定会失败
+	_d=$(ifstatus "$_i" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -z "$_d" ] && _d=$(uci -q get "network.$_i.device" 2>/dev/null)
 	[ -z "$_d" ] && _d=$(uci -q get "network.$_i.ifname" 2>/dev/null)
 	echo "$_d"
 }
