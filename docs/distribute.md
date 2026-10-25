@@ -68,7 +68,7 @@ gzip -kf ../Packages
 客户端：
 
 ```sh
-echo "src/gz isp-split https://github.com/jihebube/openwrt-isp-split-repo（示例，按实际托管地址替换）" >> /etc/opkg/customfeeds.conf
+echo "src/gz isp-split <你的 opkg 源地址>" >> /etc/opkg/customfeeds.conf
 opkg update
 opkg install isp-split
 ```
@@ -80,10 +80,14 @@ opkg install isp-split
 ### 3. 一键脚本（门槛最低，但要给校验方式）
 
 ```sh
-wget -qO- https://github.com/jihebube/openwrt-isp-split/releases/latest/download/isp-split-install.sh | sh -s -- --all
+wget -O /tmp/isp.tgz https://github.com/OWNER/REPO/releases/latest/download/isp-split.tar.gz
+echo "<SHA256SUMS 里这一行的内容>" | sha256sum -c
+mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp --strip-components=1
+sh /tmp/isp/scripts/install.sh --all
 ```
 
-**务必同时提供 sha256**，让用户能核对：
+> 注意：`OWNER/REPO` 换成实际仓库路径。**不推荐** `curl | sh` 直接管道执行——
+> 那等于让对方以 root 跑任意代码，先下载、再校验、最后执行的三段式更负责任。
 
 ```sh
 wget -O /tmp/isp.tgz https://.../isp-split-0.1.0.tar.gz
