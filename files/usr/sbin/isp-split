@@ -632,6 +632,15 @@ cmd_status_json() {
 			"$_set" "$_src" "$_pol" "$_ex" "${_n:-0}" "${_p:-0}" "${_b:-0}"
 	}
 	foreach_enabled _sj
+	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
+		_fbp=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
+			grep -oE "packets [0-9]+" | grep -oE "[0-9]+")
+		_fbb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
+			grep -oE "bytes [0-9]+" | grep -oE "[0-9]+")
+		[ "$_first" = "1" ] || printf ','
+		printf '{"set":"兜底","src":"-","policy":"未命中集合","exists":true,"elements":"","packets":%s,"bytes":%s}' \
+			"${_fbp:-0}" "${_fbb:-0}"
+	fi
 	printf ']'
 	echo
 }
@@ -982,11 +991,8 @@ conf_set() {
 				_bad="行格式必须是 运营商:集合名:策略:0或1 —— 出错行: $_line"
 				break
 			fi
-			case "$3" in
-			wan_only | wanb_only | balanced) ;;
-			*) _bad="策略 '$3' 不是保留策略，只能用 wan_only / wanb_only / balanced（出错行: $_line）" ;;
-			esac
-			[ -z "$_bad" ] || break
+			# 策略名不做白名单限制：只要在 mwan3 中真实存在即可
+			# （LuCI 下拉列出的就是 mwan3 的全部策略，含用户自定义的）
 			case " $_pols " in
 			*" $3 "*) ;;
 			*) _bad="mwan3 里不存在策略 '$3'，请先在 MultiWAN 管理器创建（出错行: $_line）" ;;

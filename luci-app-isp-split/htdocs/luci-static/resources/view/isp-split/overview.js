@@ -99,7 +99,7 @@ return view.extend({
 				tb.appendChild(E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, [ r.set ]),
 					E('td', { 'class': 'td' }, [ r.src ]),
-					E('td', { 'class': 'td', 'style': 'text-align:right' }, [ r.exists ? String(r.elements) : '—' ]),
+					E('td', { 'class': 'td', 'style': 'text-align:right' }, [ r.elements != null && r.elements !== '' ? String(r.elements) : '—' ]),
 					E('td', { 'class': 'td', 'style': 'text-align:right' }, [ r.exists ? String(r.packets) : '—' ]),
 					E('td', { 'class': 'td', 'style': 'text-align:right' }, [ r.exists ? fmtBytes(r.bytes) : '—' ]),
 					E('td', { 'class': 'td' }, [ r.policy ])
