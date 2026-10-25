@@ -1,0 +1,33 @@
+config globals 'globals'
+	option mmx_mask '0x3F00'
+	option local_policy 'wanb_wan'
+
+config interface 'wan1'
+	option enabled '1'
+
+config member 'wan_m1_w3'
+	option interface 'wan1'
+	option metric '1'
+	option weight '3'
+
+config policy 'wan_only'
+	list use_member 'wan_m1_w3'
+
+config rule 'nas_all'
+	option src_ip '192.168.50.9'
+	option use_policy 'balanced'
+
+config rule 'pc_wan'
+	option src_ip '192.168.50.147'
+	option sticky '1'
+	option use_policy 'wan_only'
+
+config rule 'https'
+	option sticky '1'
+	option dest_port '443'
+	option proto 'tcp'
+	option use_policy 'wanb_wan'
+
+config rule 'default_rule_v4'
+	option dest_ip '0.0.0.0/0'
+	option use_policy 'balanced'

@@ -1,0 +1,104 @@
+name: release
+
+# 打 tag 触发：自动编译出 opkg(ipk) 与 apk 两种包，并建 Release。
+#
+# 为什么要用 CI 编译：OpenWrt 25.12 起包格式是 ADB 容器（魔数 ADBd），
+# 无法手工拼装，且 apk 3.0.5 没有 mkpkg 子命令、不接受旧的 v2 tar.gz 包。
+# 唯一产出 apk 的方式就是 OpenWrt SDK。放进 CI 后，使用者只需要下载产物。
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 25.12+ 走 apk；24.10 走 opkg(ipk)
+          - branch: 25.12.6
+          - branch: 24.10.4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译（复用 scripts/build-apk.sh，与本地构建同一路径）
+        run: sh scripts/build-apk.sh ${{ matrix.branch }} x86/64
+
+      - name: 收集产物
+        run: |
+          set -eu
+          mkdir -p out
+          find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.branch }}
+          path: out/*
+          if-no-files-found: warn
+
+  source:
+    name: source tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建分发包
+        run: sh scripts/build-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: dist/*
+
+  release:
+    needs: [ build, source ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: 汇总
+        run: |
+          mkdir -p rel
+          find artifacts -type f -exec cp -v {} rel/ \;
+          cd rel && sha256sum * 2>/dev/null > SHA256SUMS || shasum -a 256 * > SHA256SUMS
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rel/*
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            **OpenWrt 25.12+（apk 系，含 Kwrt 25.12）** —— 下载源码包用脚本安装：
+
+            ```sh
+            wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
+            mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp --strip-components=1
+            sh /tmp/isp/scripts/install.sh --all
+            ```
+
+            若本页附带了 `.apk`（由 CI 用 SDK 编译），也可以直接装：
+
+            ```sh
+            apk add --no-network --allow-untrusted ./isp-split_*.apk
+            ```
+
+            **OpenWrt 24.10 及以下（opkg 系）**：
+
+            ```sh
+            opkg install isp-split_*_all.ipk
+            ```
+
+            装完先只读预演，确认无误再生效：
+
+            ```sh
+            isp-split plan && isp-split check && isp-split sync && isp-split verify
+            ```

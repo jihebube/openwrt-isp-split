@@ -1,0 +1,27 @@
+{
+	"luci-app-isp-split": {
+		"description": "Grant access to ISP split status and control",
+		"read": {
+			"ubus": {
+				"file": [ "read", "stat", "exec" ]
+			},
+			"file": {
+				"/usr/sbin/isp-split": [ "exec" ],
+				"/etc/isp-split.conf": [ "read" ],
+				"/etc/isp-split": [ "read" ],
+				"/etc/isp-split/*": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/usr/sbin/isp-split": [ "exec" ],
+				"/etc/isp-split.conf": [ "write" ],
+				"/etc/isp-split": [ "write" ],
+				"/etc/isp-split/*": [ "write" ]
+			}
+		}
+	}
+}

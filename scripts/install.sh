@@ -1,0 +1,138 @@
+#!/bin/sh
+# 通用安装脚本 —— 适用于任何 OpenWrt，尤其是 25.12+ 的 apk 系固件
+#
+# 为什么需要它：
+#   OpenWrt 25.12 起包管理器从 opkg 换成 apk-tools 3.x，包格式是带签名段的
+#   私有容器，无法像 .ipk 那样手工拼装。没有 SDK 编译环境时，直接用这个脚本
+#   复制文件即可，效果与装包一致。
+#
+# 用法（在解压后的仓库目录，或仅上传 files/ 目录亦可）：
+#   sh scripts/install.sh            安装（不启用定时任务）
+#   sh scripts/install.sh --cron     安装并启用每日自动更新
+#   sh scripts/install.sh --uninstall 卸载（调用 isp-split uninstall）
+set -eu
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SRC=$ROOT/files
+
+say() { printf '[install] %s\n' "$*"; }
+die() { printf '[install] 错误: %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" = "0" ] || die "需要 root 权限"
+[ -d "$SRC" ] || die "找不到 $SRC，请在仓库根目录运行"
+
+if [ "${1:-}" = "--uninstall" ]; then
+	if [ -x /usr/sbin/isp-split ]; then
+		/usr/sbin/isp-split uninstall || true
+	else
+		say "isp-split 未安装"
+	fi
+	# 同时移除 LuCI 页面
+	rm -f /www/luci-static/resources/view/isp-split/*.js
+	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
+	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
+	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
+	rm -f /tmp/luci-indexcache* 2>/dev/null
+	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+	say "已卸载（含 LuCI 页面）"
+	exit 0
+fi
+
+# 前置检查
+[ -f /etc/openwrt_release ] || say "警告：这不像 OpenWrt，继续但可能有问题"
+command -v nft >/dev/null 2>&1 || die "缺少 nft"
+
+# mwan3 必须是 nftables 版（Kwrt 源叫 mwan3-nft，官方 feed 的 mwan3 是 iptables 版）
+if ! apk list -I 2>/dev/null | grep -qE "^mwan3(-nft)? " &&
+   ! opkg list-installed 2>/dev/null | grep -qE "^mwan3(-nft)? "; then
+	die "未检测到 mwan3 / mwan3-nft。需要 nftables 版 mwan3（>= 3.6.0）：
+     Kwrt:  apk add mwan3-nft
+     上游:  https://github.com/dl12345/mwan3"
+fi
+if grep -q render_config_ipsets /lib/mwan3/mwan3.sh 2>/dev/null; then
+	say "mwan3 为 nftables 版 ✓"
+else
+	die "检测到 iptables 版 mwan3 —— 本项目需要 nftables 版（>= 3.6.0）"
+fi
+if ! nft list table inet mwan3 >/dev/null 2>&1; then
+	say "警告：table inet mwan3 不存在"
+	say "      说明 mwan3-nft 未运行或装的是 iptables 版，本项目无法工作"
+	say "      检查: grep -c render_config_ipsets /lib/mwan3/mwan3.sh   （需 >=1）"
+fi
+
+# 备份已有配置
+if [ -f /etc/isp-split.conf ]; then
+	BAK=/etc/isp-split.conf.bak.$(date +%Y%m%d-%H%M%S)
+	cp -f /etc/isp-split.conf "$BAK"
+	say "已备份原配置到 $BAK（保留你的 ISP_TABLE 设置前请先比对）"
+	KEEP_CONF=1
+fi
+
+# 复制文件
+mkdir -p /usr/sbin /usr/lib/isp-split /etc/init.d /etc/isp-split/data
+cp -f "$SRC/usr/sbin/isp-split" /usr/sbin/isp-split
+cp -f "$SRC/usr/lib/isp-split/"*.awk "$SRC/usr/lib/isp-split/build.sh" /usr/lib/isp-split/
+cp -f "$SRC/etc/init.d/isp-split" /etc/init.d/isp-split
+chmod 755 /usr/sbin/isp-split /etc/init.d/isp-split /usr/lib/isp-split/build.sh
+
+# 配置文件：已存在则不覆盖，避免冲掉用户的 ISP_TABLE
+if [ "${KEEP_CONF:-0}" = "1" ]; then
+	say "保留现有 /etc/isp-split.conf 不覆盖"
+	say "  新版默认值可参考 $SRC/etc/isp-split.conf（注意 cmcc 默认已改为 wanb_only）"
+else
+	cp -f "$SRC/etc/isp-split.conf" /etc/isp-split.conf
+	say "已写入 /etc/isp-split.conf"
+fi
+
+/etc/init.d/isp-split enable >/dev/null 2>&1 || true
+
+# ---- 可选组件：LuCI 页面 ----
+install_luci() {
+	L=$ROOT/luci-app-isp-split
+	[ -d "$L" ] || { say "找不到 $L，跳过 LuCI"; return 0; }
+	mkdir -p /www/luci-static/resources/view/isp-split /usr/share/luci/menu.d /usr/share/rpcd/acl.d
+	cp -f "$L/htdocs/luci-static/resources/view/isp-split/"*.js \
+		/www/luci-static/resources/view/isp-split/
+	cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split.json" /usr/share/luci/menu.d/
+	cp -f "$L/root/usr/share/rpcd/acl.d/luci-app-isp-split.json" /usr/share/rpcd/acl.d/
+	rm -f /tmp/luci-indexcache* 2>/dev/null
+	# 只重启 rpcd（ACL 生效所需）。uhttpd 不必重启——
+	# 静态文件与 menu.d 都是按请求读取的，重启反而会造成短暂无法访问。
+	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+	say "LuCI 页面已安装：网络 → 运营商分流"
+}
+
+remove_luci() {
+	rm -f /www/luci-static/resources/view/isp-split/*.js
+	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
+	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
+	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
+	rm -f /tmp/luci-indexcache* 2>/dev/null
+	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
+	say "LuCI 页面已移除"
+}
+
+add_cron() {
+	mkdir -p /etc/crontabs
+	touch /etc/crontabs/root
+	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron 2>/dev/null || true
+	echo "17 4 * * * /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split" >> /tmp/.ispcron
+	mv /tmp/.ispcron /etc/crontabs/root
+	/etc/init.d/cron restart >/dev/null 2>&1 || true
+	say "已启用每日 04:17 自动更新数据（refresh，不改 mwan3 配置）"
+}
+
+for arg in "$@"; do
+	case "$arg" in
+	--cron) add_cron ;;
+	--luci) install_luci ;;
+	--all) add_cron; install_luci ;;
+	esac
+done
+
+say "安装完成。建议顺序："
+echo "  1) isp-split plan      只读预演"
+echo "  2) isp-split check     nft 干跑校验"
+echo "  3) isp-split selftest  独立表实弹加载"
+echo "  4) isp-split sync      正式生效"
+echo "  5) isp-split verify    核对规则渲染"
