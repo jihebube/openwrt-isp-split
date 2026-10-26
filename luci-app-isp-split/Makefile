@@ -18,8 +18,8 @@ endef
 
 define Package/luci-app-isp-split/description
   LuCI page for isp-split: shows per-ISP element counts and hit
-  counters, and provides buttons to preview, validate, self-test
-  and apply the ISP routing rules.
+  counters, and offers one-click sync, data refresh, and config
+  editing (wire/apply/dns).
 endef
 
 define Build/Compile

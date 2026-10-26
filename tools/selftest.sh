@@ -101,9 +101,9 @@ fi
 awk -v insert="$TMP/empty.txt" -v anchor="$ANCHOR" \
 	-f "$LIB/rules-splice.awk" "$TMP/w1" > "$TMP/w3"
 if cmp -s "$FIX/mwan3" "$TMP/w3"; then
-	ok "卸载后配置完全还原"
+	ok "卸载后配置恢复原样"
 else
-	ng "卸载后配置未能还原"
+	ng "卸载后配置未能恢复原样"
 fi
 
 echo "== 3. 坏 CIDR 防御"

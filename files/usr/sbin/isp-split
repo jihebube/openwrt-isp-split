@@ -1237,7 +1237,8 @@ dns_of_policy() {
 #
 # 依据：dnsmasq 的 server=/域名/IP@接口 语法会用 SO_BINDTODEVICE 绑定出接口，
 #      从而保证"从哪条线出去，就用哪条线的 DNS"，让 CDN 返回本运营商节点。
-#      这是补齐与爱快差距的关键一环（见 docs/why-ikuai.md）。
+#      这是补齐与爱快差距的关键一环（原理见 docs/DESIGN.md 的
+#      「与商业方案（iKuai）的对比」一节）。
 #
 # 同时要在 mwan3_output 链顶部给这些 DNS 服务器加 return，
 # 否则 mwan3 会按目标 IP 重新打标，把 DNS 查询抢到别的线路上。
