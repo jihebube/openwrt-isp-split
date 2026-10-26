@@ -829,16 +829,28 @@ cmd_status() {
 	_dr=0
 	_last=$(_mwan3_rules_body | grep -v '^[[:space:]]*$' | tail -1)
 	if printf '%s\n' "$_last" | grep -qE \
-		'meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_'; then
+		'meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_' &&
+	   ! printf '%s\n' "$_last" | grep -q '@isp_'; then
+		# 本工具的运营商规则也是 mark==0 + policy jump，不能把它误当成
+		# default 规则（default 规则不带 daddr @isp_）。
 		_dr=1
 	fi
 	if [ "$_dr" -gt 0 ]; then
 		echo "兜底流量: 已参与负载均衡（链尾 default 规则已渲染，走其 use_policy 指定的策略）"
 	else
 		echo
-		echo "提示: mwan3 的 default 规则未渲染（链尾没有 mark==0 的 policy jump）"
-		echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
-		echo "      若 mwan3.default_rule_v4 存在，检查其 enabled 字段是否被显式置 0。"
+		# 区分“用户故意禁用”和“配置存在但渲染失败”：两者的下一步操作
+		# 完全不同。enabled=0 是合法配置，不该让用户去查 mwan3 日志。
+		_dr_en=$(uci -q get mwan3.default_rule_v4.enabled 2>/dev/null)
+		if [ "${_dr_en:-}" = "0" ]; then
+			echo "提示: mwan3 的 default_rule_v4 已被禁用（enabled=0）"
+			echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
+			echo "      如需启用：uci set mwan3.default_rule_v4.enabled=1 && uci commit mwan3 && /etc/init.d/mwan3 reload"
+		else
+			echo "提示: mwan3 的 default 规则渲染异常（链尾没有 mark==0 的 policy jump）"
+			echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
+			echo "      请检查 mwan3.default_rule_v4 是否存在、enabled 是否为 1，并查看 mwan3 日志。"
+		fi
 	fi
 
 	echo "规则顺序:"
