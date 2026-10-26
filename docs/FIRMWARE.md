@@ -84,6 +84,8 @@ make image \
   FILES=files
 ```
 
+> **警告**：上游官方 feed 的 `mwan3` 为 iptables 版，上面的 `PACKAGES="... mwan3 ..."` 会安装错误版本；需先替换为 nft 版，或改用含 `mwan3-nft` 的自定义 feed（见文首「前提」）。
+
 注意：`FILES=` 只复制文件、不执行包的 postinst，自启与定时任务由包内自带的 `/etc/uci-defaults/99-isp-split` 在首次启动时完成。
 
 ## 方式 C：ImageBuilder + 本地 ipk 仓库（≤ 24.10）
@@ -107,6 +109,8 @@ make image PROFILE=generic \
   PACKAGES="luci mwan3 nftables curl isp-split" \
   --repository "local,file://$(cd ../repo && pwd)"
 ```
+
+> **警告**：上游官方 feed 的 `mwan3` 为 iptables 版，上面的 `PACKAGES="... mwan3 ..."` 会安装错误版本；需先替换为 nft 版，或改用含 `mwan3-nft` 的自定义 feed（见文首「前提」）。
 
 25.12 的 apk 索引（`packages.adb`）无法手工生成，此方式仅适用于 opkg 系。
 

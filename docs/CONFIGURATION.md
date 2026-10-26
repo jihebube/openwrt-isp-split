@@ -48,8 +48,8 @@ tw:isp_tw:wanb_only:0
 
 不在任何**已启用**集合内的流量（海外 IP、未启用的运营商、云厂商自有 AS 等）不会被本工具打标，交给 mwan3 处理：
 
-- mwan3 的 `default_rule_v4` 已启用 → 按默认策略分配（推荐）
-- 未启用 → 走系统默认路由，不参与负载均衡
+- `default_rule_v4` **缺省即启用**（mwan3 对 rule 的 `enabled` 缺省=启用）→ 按默认策略分配（推荐）
+- 显式禁用或删除该规则 → 走系统默认路由，不参与负载均衡
 
 `isp-split status` 会检测后一种情况并给出提示。
 
@@ -81,8 +81,10 @@ DNS_MODE="bind"
 1. 先探测 dnsmasq **实际加载**的 conf-dir，再把 `isp-split.conf` 写进去：
 
    ```
-   server=/bilivideo.com/119.29.29.29@wan2
+   server=/bilivideo.com/119.29.29.29@pppoe-wan2
    ```
+
+    `@` 后是 mwan3 成员接口的运行时设备名（如 `pppoe-wan2`），不是 UCI 接口名（`wan2`）；照写 UCI 接口名会得到 dnsmasq 的 unknown interface 错误。
 
    探测优先级：`/var/etc/dnsmasq.conf.*` 里的 `conf-dir=` 行（权威源）→
    运行中 dnsmasq 的 `--conf-dir=` 参数 → UCI
