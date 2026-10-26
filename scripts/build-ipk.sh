@@ -59,6 +59,8 @@ EOF
 cat > "$WORK/control/prerm" <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
+# opkg 升级时以 prerm upgrade <version> 调用；升级不能清数据/删规则
+[ "$1" = "upgrade" ] && exit 0
 /usr/sbin/isp-split uninstall >/dev/null 2>&1 || true
 exit 0
 EOF
