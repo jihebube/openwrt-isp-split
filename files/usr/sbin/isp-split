@@ -259,8 +259,21 @@ cmd_apply() {
 	# 集合由 wire 写入的 config ipset 在 mwan3 reload 时建立。
 	# apply 的 batch 只 flush/add element，不含 add set——集合缺失时
 	# nft 的报错是模糊的"批量加载失败"，这里给出明确指引。
-	_fs=$(_conf_val ISP_TABLE 2>/dev/null | head -1 | cut -d: -f2)
-	if [ -n "$_fs" ] && ! nft list set inet mwan3 "$_fs" >/dev/null 2>&1; then
+	# 取第一个 enabled=1 的行，而不是无条件取第一行：用户禁用第一个
+	# 运营商后，wire 不会为它建集合，旧写法会让每日 refresh 永久失败。
+	_fs=""
+	for _row in $(_conf_val ISP_TABLE 2>/dev/null); do
+		_old_ifs=$IFS
+		IFS=':'
+		set -- $_row
+		IFS=$_old_ifs
+		[ $# -ge 4 ] || continue
+		[ "$4" = "1" ] || continue
+		_fs=$2
+		break
+	done
+	[ -n "$_fs" ] || die "ISP_TABLE 中没有启用的运营商（第 4 列为 1），请先修改 $CONF"
+	if ! nft list set inet mwan3 "$_fs" >/dev/null 2>&1; then
 		die "nft 中不存在集合 $_fs —— 集合由 wire 创建。先执行: isp-split wire（或 isp-split sync）"
 	fi
 	mkdir -p "$WORK"
