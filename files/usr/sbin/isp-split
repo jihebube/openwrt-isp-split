@@ -222,6 +222,14 @@ _gen_batch() {
 # 兜底流量计数器：插在本工具规则块之后、既有端口/兜底规则之前。
 # 命中集合的流量在前面的 jump 里已离开本链，能走到这条规则的
 # 必然是未命中任何启用集合的流量，从而可以量化"覆盖率"。
+# 判断某条链上规则是否已经是我们要的兜底计数规则。
+# nft list chain 会渲染 counter packets N bytes N，比较前先去掉，避免误判。
+_fallback_rule_ok() {
+	printf '%s\n' "$1" |
+		sed 's/ # handle [0-9][0-9]*$//; s/counter packets [0-9][0-9]* bytes [0-9][0-9]* //g' |
+		grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+ .*counter name "isp_fallback"'
+}
+
 _fallback_counter() {
 	[ "$COUNT_FALLBACK" = "1" ] || return 0
 	nft list chain inet mwan3 mwan3_rules >/dev/null 2>&1 || return 0
@@ -230,13 +238,26 @@ _fallback_counter() {
 		nft add counter inet mwan3 isp_fallback 2>/dev/null || return 0
 	fi
 
-	# 旧版规则（无 mark 条件）会误计命中集合的新连接首包
-	# —— mwan3 策略链 jump 设置标记后 return，会继续执行链上剩余规则。
-	# 先清理，再插入带 mark==0 条件的版本，保证只统计真正的兜底包。
-	while _rh=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
-		grep 'counter name "isp_fallback"' |
-		grep -oE '# handle [0-9]+' | grep -oE '[0-9]+' | head -1); do
+	# 幂等：规则已存在且形状正确（mark==0、IPv4、命名计数器）就不动它。
+	# 旧版规则（无 mark 条件）会误计命中集合的新连接首包，需要重建。
+	_fb_lines=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+		grep 'counter name "isp_fallback"')
+	_fb_count=$(printf '%s\n' "$_fb_lines" | grep -c 'counter name "isp_fallback"' || true)
+	_fb_count=${_fb_count:-0}
+	if [ "$_fb_count" -eq 1 ] && _fallback_rule_ok "$_fb_lines"; then
+		return 0
+	fi
+
+	# 只在缺失/重复/形状不对时重建；删除循环加上限，避免 nft 删除
+	# 返回成功但规则实际仍在时无限循环。
+	_i=0
+	while [ "$_i" -lt 5 ]; do
+		_rh=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+			grep 'counter name "isp_fallback"' |
+			grep -oE '# handle [0-9]+' | grep -oE '[0-9]+' | head -1)
+		[ -n "$_rh" ] || break
 		nft delete rule inet mwan3 mwan3_rules handle "$_rh" 2>/dev/null || break
+		_i=$((_i + 1))
 	done
 
 	# 插入点：最后一条 daddr @isp_* 规则的下一条
@@ -244,7 +265,7 @@ _fallback_counter() {
 		sed -n '/chain mwan3_rules/,/^	}/p' |
 		awk '/daddr @isp_/ { seen = 1; next }
 		     seen && /# handle/    { print $NF; exit }')
-	_COND='meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"'
+	_COND='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"'
 	if [ -n "$_h" ]; then
 		nft insert rule inet mwan3 mwan3_rules position "$_h" \
 			"$_COND" 2>/dev/null && return 0
@@ -713,10 +734,11 @@ cmd_status() {
 	printf '%-14s %-10s %10s %12s %10s  %s\n' "集合" "来源" "条目" "命中包" "流量" "策略"
 	_st_all() { _status_one "$1" "$2" "$3"; }
 	foreach_enabled _st_all
-	# 自愈式重插：mwan3 reload 会清掉计数器规则，status 是最常跑的
-	# 命令，在这里幂等恢复（_fallback_counter 内部有存在性检查）
-	if [ "$COUNT_FALLBACK" = "1" ]; then
-		_fallback_counter
+	# status 是只读命令：绝不在这里删除/重插 nft 规则。
+	# LuCI 每 10 秒轮询一次，自愈式重插会造成统计缺口和规则抖动。
+	if [ "$COUNT_FALLBACK" = "1" ] &&
+	   ! _mwan3_rules_body | grep -q 'counter name "isp_fallback"'; then
+		echo "提示: 兜底计数规则缺失（status 只读，不自动修复；运行 isp-split apply 恢复）"
 	fi
 	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
 		_fb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
