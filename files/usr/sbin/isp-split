@@ -545,8 +545,7 @@ cmd_verify() {
 
 	echo
 	# 运行时规则自检：mwan3 重启会清掉 apply/dns 运行时插入的规则
-	if [ "$(nft list chain inet mwan3 mwan3_output 2>/dev/null | grep -c "dport 53")" -eq 0 ] &&
-	   [ -n "${DNS_TABLE:-}" ]; then
+	if ! _dns_chain_ok && [ -n "${DNS_TABLE:-}" ]; then
 		echo "⚠ DNS 旁路规则缺失（mwan3 重启会清掉运行时插入的规则）"
 		echo "  恢复：isp-split dns   （或 isp-split wire）"
 	fi
@@ -934,33 +933,55 @@ dns_of_policy() {
 #
 # 同时要在 mwan3_output 链顶部给这些 DNS 服务器加 return，
 # 否则 mwan3 会按目标 IP 重新打标，把 DNS 查询抢到别的线路上。
-# DNS 出线规则重放（幂等）：mwan3 重建链后运行时插入的规则会丢失，
-# wire / dns / init.d(开机) 三个入口都会调用本函数恢复。
+# DNS 出线规则重放：mwan3 重建链后运行时插入的规则会丢失，
+# wire / apply / dns / init.d(开机) 都会调用本函数恢复。
 # bind 模式：return 旁路，出线由 dnsmasq 的 @接口 绑定决定
 # mark 模式：jump 到该 DNS 所属策略，由 mwan3 打标选路
 _dns_bypass() {
 	nft list chain inet mwan3 mwan3_output >/dev/null 2>&1 || return 0
+
+	# 先按唯一 comment 删除所有旧规则：DNS_TABLE 改了策略/删了条目后，
+	# 旧规则不会残留；重复调用也不会越插越多。
+	_i=0
+	while [ "$_i" -lt 256 ]; do
+		_h=$(nft -a list chain inet mwan3 mwan3_output 2>/dev/null |
+			grep 'comment "isp-split-dns"' |
+			grep -oE '# handle [0-9]+' | head -1 | grep -oE '[0-9]+')
+		[ -n "$_h" ] || break
+		nft delete rule inet mwan3 mwan3_output handle "$_h" 2>/dev/null || break
+		_i=$((_i + 1))
+	done
+
+	_seen=" "
 	for row in ${DNS_TABLE:-}; do
 		_pol=${row%%:*}
 		_dns=${row#*:}
 		[ -n "$_dns" ] || continue
+		case "$_seen" in
+		*" $_pol:$_dns "*) continue ;;
+		esac
+		_seen="$_seen $_pol:$_dns "
 		for proto in udp tcp; do
 			if [ "$DNS_MODE" = "mark" ]; then
-				nft list chain inet mwan3 mwan3_output 2>/dev/null |
-					grep -q "ip daddr $_dns $proto dport 53 counter jump mwan3_policy_$_pol" ||
 				nft insert rule inet mwan3 mwan3_output \
-					ip daddr "$_dns" "$proto" dport 53 counter \
+					ip daddr "$_dns" "$proto" dport 53 counter comment "isp-split-dns" \
 					jump "mwan3_policy_$_pol" 2>/dev/null ||
 				log "警告：无法插入 DNS 打标规则 $_dns/$proto -> $_pol"
 			else
-				nft list chain inet mwan3 mwan3_output 2>/dev/null |
-					grep -q "ip daddr $_dns $proto dport 53 return" ||
 				nft insert rule inet mwan3 mwan3_output \
-					ip daddr "$_dns" "$proto" dport 53 counter return 2>/dev/null ||
+					ip daddr "$_dns" "$proto" dport 53 counter comment "isp-split-dns" \
+					return 2>/dev/null ||
 				log "警告：无法向 mwan3_output 插入 $_dns/$proto 的旁路规则"
 			fi
 		done
 	done
+}
+
+# 检查 mwan3_output 里是否已有 DNS 旁路规则。
+# nft 实际渲染会插入 "counter packets N bytes N"，匹配时必须容忍。
+_dns_chain_ok() {
+	nft list chain inet mwan3 mwan3_output 2>/dev/null |
+		grep -qE 'dport 53 (counter packets [0-9]+ bytes [0-9]+ )?(return|jump mwan3_policy_)'
 }
 
 cmd_dns() {
