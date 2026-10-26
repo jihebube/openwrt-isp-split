@@ -260,6 +260,40 @@ else
 	ok "DNS_TABLE 配置错误立即失败（非 0）"
 fi
 
+echo "== 5. conf set 失败退出码"
+cat > "$TMP/conf.conf" <<'CONF_FILE'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+CONF_FILE
+cp "$TMP/conf.conf" "$TMP/conf.before"
+_pwn="/tmp/isp-split-selftest-pwn.$$"
+rm -f "$_pwn"
+if ISP_SPLIT_CONF="$TMP/conf.conf" sh "$ROOT/files/usr/sbin/isp-split" \
+	conf set domain_split "x\$(id>$_pwn):wan_only" >/dev/null 2>&1; then
+	ng "非法配置值被接受（退出码为 0）"
+else
+	ok "非法配置值被拒绝且退出码非 0"
+fi
+if [ -e "$_pwn" ]; then
+	ng "非法值中的命令替换被执行"
+	rm -f "$_pwn"
+else
+	ok "非法值中的命令替换未执行"
+fi
+if cmp -s "$TMP/conf.before" "$TMP/conf.conf"; then
+	ok "校验失败未改动配置文件"
+else
+	ng "校验失败后配置文件被改动"
+fi
+if ISP_SPLIT_CONF="$TMP/conf.conf" sh "$ROOT/files/usr/sbin/isp-split" \
+	conf set bogus x >/dev/null 2>&1; then
+	ng "未知配置项退出码为 0"
+else
+	ok "未知配置项退出码非 0"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]

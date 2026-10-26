@@ -1599,7 +1599,9 @@ conf_set() {
 
 	# _conf_write 内部会先调用 _conf_validate 做白名单校验；
 	# 校验失败直接 die，不会留下半写入的配置。
-	_conf_write "$_key" "$_val"
+	# 显式传播非 0：校验函数将来若改成 return 而不是 exit，
+	# conf_set 也不能继续打印"已更新"并返回 0。
+	_conf_write "$_key" "$_val" || return $?
 
 	log "已更新 $_key。要让改动生效："
 	echo "  运营/策略映射 -> isp-split wire && isp-split apply"
@@ -1610,7 +1612,7 @@ cmd_conf() {
 	_op=${1:-get}
 	case "$_op" in
 	get) conf_get ;;
-	set) shift; conf_set "$@" ;;
+	set) shift; conf_set "$@" || return $? ;;
 	*) die "用法: isp-split conf [get | set <项> <值>]" ;;
 	esac
 }
@@ -1859,3 +1861,7 @@ EOF
 	exit 1
 	;;
 esac
+
+# 显式把最后一个命令的退出码作为进程退出码：conf set 等命令校验失败时，
+# 调用方（LuCI fs.exec、cron、shell）必须能拿到非 0，不能依赖隐式行为。
+exit $?
