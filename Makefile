@@ -39,6 +39,50 @@ define Package/isp-split/conffiles
 /etc/isp-split.conf
 endef
 
+# opkg 升级会以 prerm upgrade 调用；apk 的 prerm 只映射到 pre-deinstall。
+# 升级时绝不能 uninstall：数据目录、mwan3 规则都必须保留。
+define Package/isp-split/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+case "$${1:-}" in
+	upgrade|pre-upgrade|*upgrade*) exit 0 ;;
+esac
+if [ -x /usr/sbin/isp-split ]; then
+	/usr/sbin/isp-split uninstall >/dev/null 2>&1 || true
+fi
+exit 0
+endef
+
+# 卸载后的兜底清理：cron、命名计数器、dnsmasq confdir、数据目录。
+# 正常路径由 prerm 的 isp-split uninstall 完成，这里防止二进制先被删掉。
+define Package/isp-split/postrm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+case "$${1:-}" in
+	upgrade|pre-upgrade|*upgrade*) exit 0 ;;
+esac
+if [ -f /etc/crontabs/root ]; then
+	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron.$$$$ 2>/dev/null || true
+	mv /tmp/.ispcron.$$$$ /etc/crontabs/root 2>/dev/null || true
+	/etc/init.d/cron restart >/dev/null 2>&1 || true
+fi
+nft delete counter inet mwan3 isp_fallback >/dev/null 2>&1 || true
+_state=/etc/isp-split/state/dnsmasq.confdir.orig
+if [ -f "$$_state" ]; then
+	_orig=$$(cat "$$_state" 2>/dev/null)
+	if [ -n "$$_orig" ]; then
+		uci -q set "dhcp.@dnsmasq[0].confdir=$$_orig" 2>/dev/null || true
+	else
+		uci -q delete dhcp.@dnsmasq[0].confdir 2>/dev/null || true
+	fi
+	uci -q commit dhcp 2>/dev/null || true
+	rm -f "$$_state"
+fi
+rm -f /tmp/dnsmasq.d/isp-split.conf /etc/isp-split/dnsmasq.d/isp-split.conf 2>/dev/null || true
+rm -rf /etc/isp-split 2>/dev/null || true
+exit 0
+endef
+
 # 显式指定权限，不依赖源文件的权限位——固件里脚本不可执行会很难查
 define Package/isp-split/install
 	$(INSTALL_DIR) $(1)/usr/sbin
