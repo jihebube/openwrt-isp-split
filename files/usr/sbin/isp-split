@@ -1177,14 +1177,18 @@ _dns_bypass() {
 			_db_pol=${_db_kv%%:*}
 			_db_dns=${_db_kv#*:}
 			for _db_proto in udp tcp; do
+				# nft 的 comment 是规则级属性，必须放在规则末尾（verdict 之后）。
+				# 写成 comment ... return 会被真 nft 拒绝：
+				#   Error: syntax error, unexpected return, expecting end of file
+				# 删除循环按 comment 子串匹配，comment 在行尾仍能命中。
 				if [ "${DNS_MODE:-bind}" = "mark" ]; then
 					_db_err=$(nft insert rule inet mwan3 mwan3_output \
-						ip daddr "$_db_dns" "$_db_proto" dport 53 counter comment "isp-split-dns" \
-						jump "mwan3_policy_$_db_pol" 2>&1)
+						ip daddr "$_db_dns" "$_db_proto" dport 53 counter \
+						jump "mwan3_policy_$_db_pol" comment "isp-split-dns" 2>&1)
 				else
 					_db_err=$(nft insert rule inet mwan3 mwan3_output \
-						ip daddr "$_db_dns" "$_db_proto" dport 53 counter comment "isp-split-dns" \
-						return 2>&1)
+						ip daddr "$_db_dns" "$_db_proto" dport 53 counter \
+						return comment "isp-split-dns" 2>&1)
 				fi
 				_db_rc=$?
 				[ "$_db_rc" -eq 0 ] && continue

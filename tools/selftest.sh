@@ -162,6 +162,7 @@ list)
 		echo "table inet mwan3 { chain mwan3_rules { } }"
 		exit 0
 		;;
+	*"chain inet mwan3 mwan3_policy_"*) exit 0 ;;
 	*"table inet mwan3"*) exit 0 ;;
 	*"set inet mwan3"*) exit 0 ;;
 	*) exit 1 ;;
@@ -172,6 +173,16 @@ insert)
 		echo "Error: Could not process rule: Device or resource busy" >&2
 		exit 1
 	}
+	# 模拟真 nft 语法：comment 是规则级属性，后面不能再有 verdict/语句。
+	_cseen=0
+	for _a in "$@"; do
+		if [ "$_cseen" = "1" ]; then _cseen=2; continue; fi
+		if [ "$_cseen" = "2" ]; then
+			echo "Error: syntax error, unexpected $_a (comment must be last)" >&2
+			exit 1
+		fi
+		[ "$_a" = "comment" ] && _cseen=1
+	done
 	echo "$*" | sed 's/comment isp-split-dns/comment "isp-split-dns"/' >> "$S/rules"
 	c=0; [ -f "$S/inserts" ] && c=$(cat "$S/inserts")
 	c=$((c + 1)); echo "$c" > "$S/inserts"
@@ -209,6 +220,18 @@ wan_only:not-an-ip
 "
 DNS_MODE="bind"
 DNS_BAD
+cat > "$TMP/dns-mark.conf" <<'DNS_MARK'
+DNS_TABLE="
+wan_only:223.5.5.5
+"
+DNS_MODE="mark"
+DNS_MARK
+cat > "$TMP/dns-changed.conf" <<'DNS_CHANGED'
+DNS_TABLE="
+wan_only:9.9.9.9
+"
+DNS_MODE="bind"
+DNS_CHANGED
 
 # 只取主脚本的函数定义（去掉 main 的 case），在隔离的 PATH 下直接调 _dns_bypass。
 sed '/^# ---------------------------------------------------------------- main$/,$d' \
@@ -237,13 +260,47 @@ dns_case() {
 rm -rf "$TMP/nft1"; mkdir -p "$TMP/nft1"
 if dns_case "$TMP/nft1" 3 2 "$TMP/dns.conf" >/dev/null 2>&1; then
 	_n=$(grep -c 'comment "isp-split-dns"' "$TMP/nft1/rules" 2>/dev/null || echo 0)
-	if [ "$_n" -eq 4 ]; then
-		ok "mwan3 重建竞态下 4 条 DNS 旁路规则全部恢复"
+	_bad=$(grep -vc 'counter return comment "isp-split-dns"$' "$TMP/nft1/rules" 2>/dev/null || true)
+	if [ "$_n" -eq 4 ] && [ "$_bad" -eq 0 ]; then
+		ok "mwan3 重建竞态下 4 条 DNS 旁路规则全部恢复（comment 收尾）"
 	else
-		ng "mwan3 重建后 DNS 规则数异常: $_n（期望 4）"
+		ng "bind 模式 DNS 规则异常: $_n 条，$_bad 条 comment 不在行尾（期望 4/0）"
 	fi
 else
 	ng "mwan3 重建竞态下 DNS 旁路恢复失败"
+fi
+
+# 幂等：同一 DNS_TABLE 连续再跑两次，每次都应先按 comment 删旧再重插。
+_dns_idem=1
+_i=0
+while [ "$_i" -lt 2 ]; do
+	_i=$((_i + 1))
+	if dns_case "$TMP/nft1" 1 0 "$TMP/dns.conf" >/dev/null 2>&1; then
+		_n=$(grep -c 'comment "isp-split-dns"' "$TMP/nft1/rules" 2>/dev/null || echo 0)
+		[ "$_n" -eq 4 ] || { _dns_idem=0; break; }
+	else
+		_dns_idem=0
+		break
+	fi
+done
+if [ "$_dns_idem" -eq 1 ]; then
+	ok "连续 3 次 dns 后仍为 4 条（按 comment 删除旧规则，无叠加）"
+else
+	ng "重复 dns 后规则数异常: ${_n:-调用失败}（期望 4）"
+fi
+
+# 改 DNS_TABLE：旧 IP 的规则必须被清掉，只保留新 IP 的 2 条。
+if dns_case "$TMP/nft1" 1 0 "$TMP/dns-changed.conf" >/dev/null 2>&1; then
+	_n=$(grep -c 'comment "isp-split-dns"' "$TMP/nft1/rules" 2>/dev/null || echo 0)
+	_old=$(grep -c '223.5.5.5' "$TMP/nft1/rules" 2>/dev/null || true)
+	_new=$(grep -c '9.9.9.9' "$TMP/nft1/rules" 2>/dev/null || true)
+	if [ "$_n" -eq 2 ] && [ "$_old" -eq 0 ] && [ "$_new" -eq 2 ]; then
+		ok "DNS_TABLE 变更后旧规则已清、新规则就位（2 条）"
+	else
+		ng "DNS_TABLE 变更后残留异常: 总数 $_n，旧 IP $_old，新 IP $_new（期望 2/0/2）"
+	fi
+else
+	ng "DNS_TABLE 变更后 dns 调用失败"
 fi
 
 rm -rf "$TMP/nft2"; mkdir -p "$TMP/nft2"
@@ -260,7 +317,83 @@ else
 	ok "DNS_TABLE 配置错误立即失败（非 0）"
 fi
 
-echo "== 5. conf set 失败退出码"
+rm -rf "$TMP/nft4"; mkdir -p "$TMP/nft4"
+if dns_case "$TMP/nft4" 1 0 "$TMP/dns-mark.conf" >/dev/null 2>&1; then
+	_n=$(grep -c 'comment "isp-split-dns"' "$TMP/nft4/rules" 2>/dev/null || echo 0)
+	_j=$(grep -c 'counter jump mwan3_policy_wan_only comment "isp-split-dns"$' \
+		"$TMP/nft4/rules" 2>/dev/null || true)
+	if [ "$_n" -eq 2 ] && [ "$_j" -eq 2 ]; then
+		ok "mark 模式 2 条规则 comment 收尾且 jump 目标正确"
+	else
+		ng "mark 模式 DNS 规则异常: $_n 条，$_j 条形状不符（期望 2/2）"
+	fi
+else
+	ng "mark 模式 DNS 旁路恢复失败"
+fi
+
+echo "== 5. nft 语句构造"
+# comment 是规则级属性，必须是规则的最后一条语句。真 nft 对
+#   ... counter comment "x" return
+# 会报 "syntax error, unexpected return"。这里静态扫描源码里的
+# nft insert/add rule 语句（自动拼接反斜杠续行）做回归检查。
+cat > "$TMP/comment-last.awk" <<'COMMENT_LAST_AWK'
+function report(msg) { printf "%s\n", msg; bad = 1 }
+function flush(   pos, tail) {
+	if (buf !~ /comment/) { buf = ""; return }
+	pos = match(buf, /comment[[:space:]]+"[^"]*"/)
+	if (pos == 0) {
+		report("无法定位 comment 参数: " buf)
+		buf = ""
+		return
+	}
+	tail = substr(buf, RSTART + RLENGTH)
+	# 去掉 shell 层的重定向/命令替换收尾，它们不属于 nft 语句本身。
+	sub(/[[:space:]]*2>&1.*$/, "", tail)
+	sub(/[[:space:]]*2>.*$/, "", tail)
+	sub(/[[:space:]]*\).*$/, "", tail)
+	sub(/[[:space:]]*;.*$/, "", tail)
+	if (tail !~ /^[[:space:]]*$/)
+		report("comment 不是最后一条语句: " buf)
+	buf = ""
+}
+FNR == 1 { collecting = 0; buf = "" }
+/^[[:space:]]*#/ { next }
+/nft[[:space:]].*(insert|add)[[:space:]]+rule/ {
+	buf = $0
+	if ($0 ~ /\\[[:space:]]*$/) { collecting = 1; next }
+	flush()
+	next
+}
+collecting {
+	buf = buf " " $0
+	if ($0 ~ /\\[[:space:]]*$/) next
+	collecting = 0
+	flush()
+}
+END {
+	if (collecting) flush()
+	exit bad
+}
+COMMENT_LAST_AWK
+
+# 先证明检查器能抓住历史错误写法，避免它本身变成永远通过的假阳性。
+printf '%s\n' \
+	'nft insert rule inet mwan3 mwan3_output ip daddr 223.5.5.5 udp dport 53 counter comment "isp-split-dns" return' \
+	> "$TMP/bad-comment.nft"
+if _bad_scan=$(awk -f "$TMP/comment-last.awk" "$TMP/bad-comment.nft" 2>&1); then
+	ng "静态检查漏掉了 comment 位于 verdict 之前的语句"
+else
+	ok "静态检查能识别 comment 位于 verdict 之前"
+fi
+
+if _scan=$(awk -f "$TMP/comment-last.awk" "$ROOT/files/usr/sbin/isp-split" 2>&1); then
+	ok "源码中所有 nft 规则 comment 均位于规则末尾"
+else
+	ng "源码中存在 comment 未收尾的 nft 规则"
+	printf '%s\n' "$_scan" | sed 's/^/    /'
+fi
+
+echo "== 6. conf set 失败退出码"
 cat > "$TMP/conf.conf" <<'CONF_FILE'
 ISP_TABLE="a:isp_a:wan_only:1"
 DNS_TABLE=""
