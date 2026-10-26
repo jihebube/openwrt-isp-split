@@ -75,7 +75,9 @@ END {
 			continue
 		if (is_ours(i))
 			continue
-		if (blocktext(i) ~ anchor)
+		# blocktext 只含 option/list 行；section 名（如 default_rule_v4）
+		# 也要参与锚点匹配，否则默认锚点里的 default_rule 会失效。
+		if (blocktext(i) ~ anchor || bn[i] ~ anchor)
 			aidx = i
 	}
 
