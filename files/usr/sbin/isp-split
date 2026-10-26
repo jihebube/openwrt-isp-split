@@ -304,6 +304,9 @@ cmd_apply() {
 	# nft -f 对整份文件是一个事务：要么全成功，要么全不变。
 	nft -f "$WORK/batch.nft" || die "nft 批量加载失败，线上规则未改动"
 	_fallback_counter
+	# 任何一次 mwan3 reload 都会 flush mwan3_output，DNS 旁路规则会丢；
+	# apply/refresh 是日常最常跑的入口，这里也重放一次。
+	_dns_bypass
 	log "已生效"
 }
 
