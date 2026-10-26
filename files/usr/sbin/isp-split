@@ -445,10 +445,21 @@ cmd_wire() {
 		-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" ||
 		die "规则注入失败，配置未改动"
 
-	# 冒烟检查：产物必须还能被 uci 解析
-	if ! uci -q -c /etc/config show mwan3 >/dev/null 2>&1; then
-		die "注入后 mwan3 配置无法解析，已放弃（备份在 $WORK/mwan3.bak）"
+	# 冒烟检查：必须用新生成的 mwan3.new 做 uci 解析，而不是读旧的
+	# /etc/config/mwan3（旧写法永远通过，等于没检查）。把新文件放到临时
+	# 目录并命名为 mwan3，校验通过后才覆盖正式配置。
+	_ucitmp=$WORK/uci-check
+	rm -rf "$_ucitmp"
+	mkdir -p "$_ucitmp" || die "无法创建 uci 校验临时目录"
+	cp "$WORK/mwan3.new" "$_ucitmp/mwan3" || {
+		rm -rf "$_ucitmp"
+		die "无法复制待校验配置，已放弃（备份在 $WORK/mwan3.bak）"
+	}
+	if ! uci -q -c "$_ucitmp" show mwan3 >/dev/null 2>&1; then
+		rm -rf "$_ucitmp"
+		die "注入后的 mwan3 配置无法解析，已放弃（备份在 $WORK/mwan3.bak）"
 	fi
+	rm -rf "$_ucitmp"
 
 	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	log "规则已注入（备份: $WORK/mwan3.bak）"
