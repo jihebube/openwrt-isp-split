@@ -576,11 +576,19 @@ cmd_verify() {
 		echo "  ！链为空 —— 这是异常信号，请立刻检查 mwan3 日志"
 	fi
 
-	# 第一条 catch-all 的行号：default 的 0.0.0.0/0，或 mark==0 的
-	# policy jump。@isp_* 规则必须排在它之前，否则永远不命中。
+	# 第一条 catch-all 的行号。只有真正无条件的兜底才算：
+	#   1) ip daddr 0.0.0.0/0（direct policy jump 与 mwan3 3.6 的
+	#      jump mwan3_rule_default_rule_v4 间接跳转都覆盖）；
+	#   2) mark==0 的 policy jump，且整行是“纯 mark 条件”（可带
+	#      meta nfproto ipv4 前缀），没有任何 ip saddr/daddr/tcp/udp 等
+	#      前置匹配条件。tcp dport 443 这类用户规则不是无条件兜底。
+	# 用户自己的 `ip saddr 192.168.50.9 ... jump mwan3_policy_balanced`
+	# 只匹配特定源地址，对其他源是 no-op，绝不能当成 catch-all。
 	_ca=$(printf '%s\n' "$_body" | awk '
 		/ip daddr 0\.0\.0\.0\/0/ { print NR; exit }
-		/meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_/ { print NR; exit }
+		/^[[:space:]]*(meta nfproto ipv4[[:space:]]+)?meta mark (&|and) 0x0*3f00 == 0x0+/ &&
+		/(jump|goto) mwan3_policy_/ &&
+		!/ip (saddr|daddr)/ { print NR; exit }
 	')
 
 	echo
