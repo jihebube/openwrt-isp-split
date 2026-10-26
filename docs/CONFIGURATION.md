@@ -119,6 +119,18 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 
 ---
 
+## 关于 status 的流量口径
+
+`isp-split status` 中的「命中包 / 流量」统计的是**连接首包**：每个连接只有
+首包进入 mwan3 规则链（后续包由 conntrack 恢复标记，被 `mark==0` 前置条件
+挡住），因此这两列反映的是连接建立开销，**不是业务吞吐**。
+
+判断实际带宽分布要看接口计数：
+
+```sh
+cat /sys/class/net/pppoe-wan*/statistics/rx_bytes
+```
+
 ## 定时更新
 
 ```sh

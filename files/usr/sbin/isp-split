@@ -688,6 +688,8 @@ cmd_status() {
 			"兜底" "-" "-" "${_fp:-0}" "${_fb_b:-0}" "未命中集合"
 	fi
 	echo
+	echo "注: 命中包/流量为连接首包统计（后续包由 conntrack 恢复标记，不再经过规则链）。"
+	echo "    业务吞吐请看接口计数: cat /sys/class/net/pppoe-wan*/statistics/rx_bytes"
 	if [ -f "$DATA/.stamp" ]; then
 		echo "数据更新时间: $(date -d "@$(cat "$DATA/.stamp")" 2>/dev/null ||
 			date -r "$(cat "$DATA/.stamp")" 2>/dev/null || echo '未知')"
