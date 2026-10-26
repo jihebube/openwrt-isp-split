@@ -582,7 +582,7 @@ cmd_verify() {
 	#   2) mark==0 的 policy jump，且整行是“纯 mark 条件”（可带
 	#      meta nfproto ipv4 前缀），没有任何 ip saddr/daddr/tcp/udp 等
 	#      前置匹配条件。tcp dport 443 这类用户规则不是无条件兜底。
-	# 用户自己的 `ip saddr 192.168.50.9 ... jump mwan3_policy_balanced`
+	# 用户自己的 `ip saddr 192.168.50.9 ... jump mwan3_policy_balanced`（示例地址）
 	# 只匹配特定源地址，对其他源是 no-op，绝不能当成 catch-all。
 	_ca=$(printf '%s\n' "$_body" | awk '
 		/ip daddr 0\.0\.0\.0\/0/ { print NR; exit }
