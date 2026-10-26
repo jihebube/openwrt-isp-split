@@ -185,9 +185,10 @@ _apply_one() {
 	_src=$1
 	_set=$2
 	_file=$DATA/$_src.txt
-	[ -s "$_file" ] || { log "跳过 $_set（无数据）"; return 0; }
 
 	if [ "$TABLE" = "mwan3" ] && nft list set inet mwan3 "$_set" >/dev/null 2>&1; then
+		# 即使数据文件为空也必须 flush：否则上游当天把该运营商完全
+		# 覆盖（或源返回空）时，旧网段会永远留在 nft 里继续分流。
 		echo "flush set inet $TABLE $_set" >> "$BATCH"
 	else
 		[ "$TABLE" = "mwan3" ] && log "集合 $_set 不存在，创建"
@@ -196,7 +197,12 @@ _apply_one() {
 		echo "add set inet $TABLE $_set { type ipv4_addr; flags interval; auto-merge; counter; }" \
 			>> "$BATCH"
 	fi
-	_emit_elements "$_set" "$_file" >> "$BATCH"
+
+	if [ -s "$_file" ]; then
+		_emit_elements "$_set" "$_file" >> "$BATCH"
+	else
+		log "集合 $_set 无数据，已清空"
+	fi
 }
 
 # 生成 nft 批处理语句
