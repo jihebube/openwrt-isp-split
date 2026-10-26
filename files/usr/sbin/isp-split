@@ -443,7 +443,7 @@ cmd_wire() {
 	cp "$CFG_MWAN3" "$WORK/mwan3.bak"
 	awk -v insert="$WORK/rules.txt" -v anchor="$ISP_ANCHOR" \
 		-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" ||
-		die "规则注入失败，配置未改动"
+		die "规则注入失败（锚点缺失或配置不可写），配置未改动"
 
 	# 冒烟检查：必须用新生成的 mwan3.new 做 uci 解析，而不是读旧的
 	# /etc/config/mwan3（旧写法永远通过，等于没检查）。把新文件放到临时
@@ -509,25 +509,33 @@ cmd_enable() {
 cmd_verify() {
 	need_nft
 	echo "== mwan3_rules 链中的规则顺序（自上而下，命中即停）"
-	_chain=$(nft list chain inet mwan3 mwan3_rules 2>/dev/null |
-		sed -n '/chain mwan3_rules/,/^	}/p' |
-		grep -vE '^[[:space:]]*(table|chain|type|})' |
-		sed 's/^[[:space:]]*/  /')
+	_body=$(_mwan3_rules_body)
+	_chain=$(printf '%s\n' "$_body" | sed 's/^[[:space:]]*/  /')
 	if [ -n "$_chain" ]; then
 		echo "$_chain"
 	else
 		echo "  ！链为空 —— 这是异常信号，请立刻检查 mwan3 日志"
 	fi
 
+	# 第一条 catch-all 的行号：default 的 0.0.0.0/0，或 mark==0 的
+	# policy jump。@isp_* 规则必须排在它之前，否则永远不命中。
+	_ca=$(printf '%s\n' "$_body" | awk '
+		/ip daddr 0\.0\.0\.0\/0/ { print NR; exit }
+		/meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_/ { print NR; exit }
+	')
+
 	echo
-	echo "== 本工具的运营商规则是否已渲染"
+	echo "== 本工具的运营商规则是否已渲染且在 catch-all 之前"
 	# mwan3-nft 3.6 不再为每条规则建独立子链，规则直接内联在 mwan3_rules 里，
 	# 形如：ip daddr @isp_tel meta mark & 0x3f00 == 0x0 jump mwan3_policy_wan_only
 	_vf() {
-		if nft list chain inet mwan3 mwan3_rules 2>/dev/null | grep -q "@$2 "; then
-			echo "  ✓ @$2 -> $3"
-		else
+		_ln=$(printf '%s\n' "$_body" | grep -n "@$2 " | head -1 | cut -d: -f1)
+		if [ -z "$_ln" ]; then
 			echo "  ✗ @$2 未出现在 mwan3_rules（enabled=0 或注入失败）"
+		elif [ -n "$_ca" ] && [ "$_ln" -ge "$_ca" ]; then
+			echo "  ✗ @$2 位于第一条 catch-all 之后（规则不会命中）"
+		else
+			echo "  ✓ @$2 -> $3"
 		fi
 	}
 	foreach_enabled _vf

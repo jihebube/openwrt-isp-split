@@ -10,7 +10,8 @@
 # 行为：
 #   1. 删掉所有已存在的本工具规则块（节名以 isp_ 开头，或块内含 isp_split 标记）
 #   2. 在第一个匹配 anchor 的 rule 块之前插入 insert 文件内容
-#   3. 找不到锚点时追加到末尾
+#   3. 找不到锚点且 insert 非空时，输出警告到 stderr 并以 3 退出，
+#      绝不静默追加到链尾（追加在 catch-all 之后永远不命中）
 #
 # 注意：awk 函数除首参外多写的形参才是局部变量，务必写全，否则污染全局。
 
@@ -33,11 +34,20 @@ function is_ours(i,	t) {
 	return 0
 }
 
+function warn_no_anchor() {
+	print "rules-splice.awk: 找不到锚点 '" anchor "'，拒绝把规则追加到链尾（inserted=0）" > "/dev/stderr"
+}
+
 BEGIN {
 	if (insert == "") {
 		print "rules-splice.awk: 缺少参数 -v insert=<规则片段文件>" > "/dev/stderr"
 		exit 2
 	}
+	# 先读入待插入片段，顺便判断是否为空（卸载时 insert 为空是合法的）
+	ni = 0
+	while ((getline l < insert) > 0)
+		ins[++ni] = l
+	close(insert)
 }
 
 {
@@ -54,8 +64,6 @@ END {
 	for (i = 1; i <= nb; i++) {
 		gsub(/['\''"]/, "", bn[i])
 	}
-	if (nb == 0)
-		nb = 0
 
 	# 找锚点：第一个不是我们的、且匹配 anchor 的 rule 块
 	aidx = 0
@@ -69,10 +77,11 @@ END {
 	}
 
 	if (nb == 0) {
-		# 空配置：直接追加
-		while ((getline l < insert) > 0)
-			print l
-		exit
+		if (ni > 0) {
+			warn_no_anchor()
+			exit 3
+		}
+		exit 0
 	}
 
 	# 文件头（第一个 config 之前的内容）
@@ -84,9 +93,8 @@ END {
 		if (is_ours(i))
 			continue
 		if (!inserted && i == aidx) {
-			while ((getline l < insert) > 0)
-				print l
-			close(insert)
+			for (k = 1; k <= ni; k++)
+				print ins[k]
 			inserted = 1
 		}
 		e = (i < nb) ? bs[i + 1] - 1 : NR
@@ -94,9 +102,9 @@ END {
 			print line[j]
 	}
 
-	# 没有锚点 -> 追加到末尾
-	if (!inserted) {
-		while ((getline l < insert) > 0)
-			print l
+	# 没有锚点：insert 为空（卸载）时原样输出；非空时拒绝追加
+	if (!inserted && ni > 0) {
+		warn_no_anchor()
+		exit 3
 	}
 }
