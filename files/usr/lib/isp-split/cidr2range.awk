@@ -31,6 +31,9 @@ function pad(n,	s) {
 	if (alen != 4)
 		next
 
+	# 前缀必须是纯数字；否则 "abc"/"" 会被 +0 当成 0，单行就吞掉整个 IPv4
+	if (p[2] !~ /^[0-9]+$/)
+		next
 	len = p[2] + 0
 	if (len < 0 || len > 32)
 		next

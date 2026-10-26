@@ -8,7 +8,9 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LIB=$ROOT/files/usr/lib/isp-split
 FIX=$ROOT/tools/fixtures
-TMP=$(mktemp -d)
+TMP=$(mktemp -d 2>/dev/null) ||
+	TMP=$(mktemp -d /tmp/isp-split-selftest.XXXXXX 2>/dev/null) ||
+	{ echo "无法创建临时目录" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 pass=0
@@ -102,6 +104,26 @@ if cmp -s "$FIX/mwan3" "$TMP/w3"; then
 	ok "卸载后配置完全还原"
 else
 	ng "卸载后配置未能还原"
+fi
+
+echo "== 3. 坏 CIDR 防御"
+printf '1.2.3.4/abc\n10.0.0.0/8\n' > "$TMP/bad.raw"
+_bad_out=$(awk -f "$LIB/cidr2range.awk" "$TMP/bad.raw")
+case "$_bad_out" in
+*"0000000000 4294967295"*)
+	ng "坏前缀被当成 /0"
+	;;
+*"0167772160 "*)
+	ok "坏前缀被跳过，合法 /8 正常解析"
+	;;
+*)
+	ng "坏 CIDR 防御输出异常: $_bad_out"
+	;;
+esac
+if awk -f "$LIB/badcidr.awk" "$TMP/bad.raw" | grep -q '^1:'; then
+	ok "badcidr 能识别坏前缀"
+else
+	ng "badcidr 未识别坏前缀"
 fi
 
 echo

@@ -124,8 +124,17 @@ cmd_fetch() {
 		log "下载 $_src"
 		fetch_one "$ISP_MIRROR/$_src.txt" "$WORK/raw.new/$_src.raw" ||
 			die "$_src 下载失败，保留现有数据不动"
-		_n=$(grep -c '[0-9]' "$WORK/raw.new/$_src.raw" 2>/dev/null || echo 0)
+		_n=$(grep -c '[0-9]' "$WORK/raw.new/$_src.raw" 2>/dev/null)
+		_n=${_n:-0}
 		[ "$_n" -gt 5 ] || die "$_src 内容异常（仅 $_n 行），拒绝覆盖现有数据"
+
+		# 落盘后逐行跑 badcidr：一行 "1.2.3.4/abc" 会在 cidr2range 里
+		# 被当成 /0，直接把整个 IPv4 塞进第一个集合，必须在这里拒绝。
+		_bad=$(awk -f "$LIB/badcidr.awk" "$WORK/raw.new/$_src.raw" 2>/dev/null | head -5)
+		if [ -n "$_bad" ]; then
+			printf '%s\n' "$_bad" >&2
+			die "$_src 含非法 CIDR，拒绝本次更新（现有数据未改动）"
+		fi
 	done
 
 	log "构建集合（互斥化）"
@@ -137,6 +146,24 @@ cmd_fetch() {
 	_chk() { [ -s "$WORK/out.new/$1.txt" ] && _ok=1; }
 	foreach_enabled _chk
 	[ "$_ok" -eq 1 ] || die "构建产物为空，拒绝覆盖"
+
+	# 熔断：单个集合地址数超过 IPv4 总量 50% 时拒绝本次更新。
+	# 正常运营商数据远低于该比例；出现这种结果通常意味着坏 CIDR 或源被污染。
+	_fetch_guard() {
+		_gf=$WORK/out.new/$1.txt
+		[ -s "$_gf" ] || return 0
+		if ! awk '
+			{
+				split($0, p, "/")
+				if (p[2] !~ /^[0-9]+$/) next
+				t += 2 ^ (32 - (p[2] + 0))
+			}
+			END { exit (t > 2147483648 ? 1 : 0) }
+		' "$_gf"; then
+			die "集合 $2 地址数超过 IPv4 总量的 50%，拒绝本次更新"
+		fi
+	}
+	foreach_enabled _fetch_guard
 
 	mkdir -p "$BASE/.history"
 	if [ -d "$DATA" ]; then

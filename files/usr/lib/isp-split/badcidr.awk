@@ -19,8 +19,13 @@
 		next
 	}
 
+	# 与 cidr2range.awk 保持一致：前缀必须是纯数字，不能靠 +0 转换
+	if (p[2] !~ /^[0-9]+$/) {
+		print NR ": " $0
+		next
+	}
 	len = p[2] + 0
-	if (len != p[2] || len < 0 || len > 32) {
+	if (len < 0 || len > 32) {
 		print NR ": " $0
 		next
 	}
