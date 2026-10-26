@@ -10,8 +10,11 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PKG=isp-split
-VER=0.1.0
-REL=1
+# 版本只从主 Makefile 读取，避免 build-ipk 与 PKG_VERSION/ISP_VERSION 漂移
+VER=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1 | tr -d '[:space:]')
+REL=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile" | head -1 | tr -d '[:space:]')
+[ -n "$VER" ] || { echo "无法从 $ROOT/Makefile 读取 PKG_VERSION" >&2; exit 1; }
+REL=${REL:-1}
 ARCH=all
 OUT=$ROOT/dist
 WORK=$(mktemp -d)
