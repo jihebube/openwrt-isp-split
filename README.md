@@ -99,6 +99,21 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 | [docs/FIRMWARE.md](docs/FIRMWARE.md) | 编译进自编译固件（buildroot / ImageBuilder） |
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计与原理：数据管线、与代理共存、与商业方案对比 |
 
+## 与 iKuai（爱快）的对比
+
+| 能力 | iKuai（商业） | 本项目 |
+|---|---|---|
+| 运营商网段分流 | ✅ | ✅ 10 类运营商约 1.3 万网段，每日自动更新 |
+| 多线路 DNS | ✅ | ✅ bind / mark 双模式，兼容代理接管 DNS |
+| 域名 / 设备钉线 | ✅ | ✅ `DOMAIN_SPLIT` + mwan3 源地址规则 |
+| 灰度 / 预演 / 回滚 | 部分 | ✅ 三级预检 + stage 灰度 + 一键还原 |
+| 开源可审计 | ❌ | ✅ MIT，纯 shell + awk，无黑盒 |
+| DPI 应用识别选线 | ✅ | ❌ 见下方说明 |
+
+**已追平**：运营商分流、多线路 DNS、域名/设备级钉线——日常"电信走电信、联通走联通、CDN 调度正确"的使用体验与 iKuai 一致。
+
+**唯一差距**：DPI 应用识别。开源侧（netifyd/nDPI、eBPF 方案等）目前无法把识别结果接入多 WAN 路由——DPI 要看多个包才敢下结论，而路由必须在连接首包打标，时序上矛盾。替代方案：把大流量应用的 CDN 域名加入 `DOMAIN_SPLIT` 钉线（域名即应用本体，比 DPI 更精准），配合 mwan3 按设备分线，可覆盖按应用调度的大部分收益。完整分析见 [docs/DESIGN.md](docs/DESIGN.md)。
+
 ## 已知限制
 
 1. 只处理直连流量；代理流量的出口由代理自身决定
