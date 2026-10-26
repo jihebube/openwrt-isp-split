@@ -31,6 +31,13 @@ ISP_CRON=${ISP_CRON:-"17 4 * * *"}
 PROBE_BYTES=${PROBE_BYTES:-33554432}
 PROBE_TIME=${PROBE_TIME:-25}
 
+# mwan3 reload 是异步的：命令返回时 nft 链可能还在重建。
+# 轮询间隔与次数可被配置/测试覆盖；默认最多等 15 秒。
+MWAN3_READY_TRIES=${MWAN3_READY_TRIES:-15}
+MWAN3_READY_DELAY=${MWAN3_READY_DELAY:-1}
+DNS_RETRY_TRIES=${DNS_RETRY_TRIES:-15}
+DNS_RETRY_DELAY=${DNS_RETRY_DELAY:-1}
+
 log() {
 	logger -t isp-split -- "$*" 2>/dev/null
 	echo "[isp-split] $*"
@@ -304,6 +311,19 @@ _fallback_counter() {
 cmd_apply() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
+
+	# mwan3 reload 返回后 nft 链可能仍在重建：此时 flush/add element 与
+	# DNS 旁路都会落到旧链上，随后被 mwan3 的 batch flush 掉。
+	# 先等 mwan3_output 真正就绪，再动集合。
+	_ap_waited=0
+	if ! _mwan3_output_ready; then
+		_ap_waited=1
+		log "等待 mwan3 重建完成…"
+		_mwan3_wait_ready ||
+			die "mwan3 在 ${MWAN3_READY_TRIES}s 内未就绪（mwan3_output 缺少 hook output 或 jump mwan3_rules），请检查 mwan3 日志后重试 apply"
+		log "mwan3 已就绪，继续 apply"
+	fi
+
 	# 集合由 wire 写入的 config ipset 在 mwan3 reload 时建立。
 	# apply 的 batch 只 flush/add element，不含 add set——集合缺失时
 	# nft 的报错是模糊的"批量加载失败"，这里给出明确指引。
@@ -333,7 +353,10 @@ cmd_apply() {
 	_fallback_counter
 	# 任何一次 mwan3 reload 都会 flush mwan3_output，DNS 旁路规则会丢；
 	# apply/refresh 是日常最常跑的入口，这里也重放一次。
-	_dns_bypass
+	# 失败不能再只打警告：apply 必须让调用方看到非 0，否则 cron/LuCI
+	# 会以为 DNS 旁路已恢复。
+	_dns_bypass 1 "$_ap_waited" ||
+		die "DNS 旁路规则恢复失败（mwan3 未就绪或 DNS_TABLE 配置错误，见上方日志）"
 	log "已生效"
 }
 
@@ -498,7 +521,10 @@ cmd_wire() {
 	log "规则已注入（备份: $WORK/mwan3.bak）"
 	/etc/init.d/mwan3 reload
 	_fallback_counter
-	_dns_bypass
+	# reload 刚返回时 mwan3_output 往往还没重建完，这里必须等/重试；
+	# 恢复失败要让 wire 以非 0 退出，否则 sync/install 会误报成功。
+	_dns_bypass 1 1 ||
+		die "DNS 旁路规则恢复失败（mwan3 未就绪或 DNS_TABLE 配置错误，见上方日志）"
 }
 
 # 只刷新数据并原子刷入，不重写 mwan3 配置、不 reload mwan3。
@@ -991,48 +1017,215 @@ dns_of_policy() {
 #
 # 同时要在 mwan3_output 链顶部给这些 DNS 服务器加 return，
 # 否则 mwan3 会按目标 IP 重新打标，把 DNS 查询抢到别的线路上。
+#
+# mwan3_output 是否已经重建完成：
+#   - 链存在
+#   - hook output 已挂上
+#   - 能看到 jump/goto mwan3_rules（mwan3 先建链、后填规则，只 list 成功不够）
+_mwan3_output_ready() {
+	_mo_out=$(nft list chain inet mwan3 mwan3_output 2>/dev/null) || return 1
+	printf '%s\n' "$_mo_out" | grep -q 'hook output' || return 1
+	printf '%s\n' "$_mo_out" |
+		grep -qE '(^|[[:space:]])(jump|goto)[[:space:]]+mwan3_rules([[:space:]]|$)' ||
+		return 1
+	return 0
+}
+
+# 轮询等待 mwan3 重建完成。0=就绪，1=超时。
+_mwan3_wait_ready() {
+	_mw_tries=${MWAN3_READY_TRIES:-15}
+	_mw_delay=${MWAN3_READY_DELAY:-1}
+	_mw_i=0
+	while [ "$_mw_i" -lt "$_mw_tries" ]; do
+		_mwan3_output_ready && return 0
+		_mw_i=$((_mw_i + 1))
+		[ "$_mw_i" -lt "$_mw_tries" ] && sleep "$_mw_delay"
+	done
+	return 1
+}
+
+# mwan3_output 中本工具 DNS 旁路规则条数（按唯一 comment 统计）
+_dns_rule_count() {
+	nft -a list chain inet mwan3 mwan3_output 2>/dev/null |
+		grep -c 'comment "isp-split-dns"' || true
+}
+
 # DNS 出线规则重放：mwan3 重建链后运行时插入的规则会丢失，
 # wire / apply / dns / init.d(开机) 都会调用本函数恢复。
 # bind 模式：return 旁路，出线由 dnsmasq 的 @接口 绑定决定
 # mark 模式：jump 到该 DNS 所属策略，由 mwan3 打标选路
+#
+# 参数：
+#   $1 = 1 时要求这次必须恢复成功（apply/wire 用）；0 时 mwan3 未运行可跳过（dns 用）
+#   $2 = 1 表示调用前刚经历 reload（成功时打印"已恢复"）
+# 返回：0 成功；1 mwan3 未就绪/重试耗尽；2 配置错误（重试无意义）
 _dns_bypass() {
-	nft list chain inet mwan3 mwan3_output >/dev/null 2>&1 || return 0
+	_db_required=${1:-0}
+	_db_recovered=${2:-0}
 
-	# 先按唯一 comment 删除所有旧规则：DNS_TABLE 改了策略/删了条目后，
-	# 旧规则不会残留；重复调用也不会越插越多。
-	_i=0
-	while [ "$_i" -lt 256 ]; do
-		_h=$(nft -a list chain inet mwan3 mwan3_output 2>/dev/null |
-			grep 'comment "isp-split-dns"' |
-			grep -oE '# handle [0-9]+' | head -1 | grep -oE '[0-9]+')
-		[ -n "$_h" ] || break
-		nft delete rule inet mwan3 mwan3_output handle "$_h" 2>/dev/null || break
-		_i=$((_i + 1))
-	done
-
-	_seen=" "
-	for row in ${DNS_TABLE:-}; do
-		_pol=${row%%:*}
-		_dns=${row#*:}
-		[ -n "$_dns" ] || continue
-		case "$_seen" in
-		*" $_pol:$_dns "*) continue ;;
+	# 先解析出去重后的条目并计算期望条数（每个条目 udp/tcp 各一条）。
+	_db_seen=" "
+	_db_expected=0
+	_db_rows=""
+	for _db_row in ${DNS_TABLE:-}; do
+		_db_pol=${_db_row%%:*}
+		_db_dns=${_db_row#*:}
+		[ -n "$_db_dns" ] || continue
+		case "$_db_seen" in
+		*" $_db_pol:$_db_dns "*) continue ;;
 		esac
-		_seen="$_seen $_pol:$_dns "
-		for proto in udp tcp; do
-			if [ "$DNS_MODE" = "mark" ]; then
-				nft insert rule inet mwan3 mwan3_output \
-					ip daddr "$_dns" "$proto" dport 53 counter comment "isp-split-dns" \
-					jump "mwan3_policy_$_pol" 2>/dev/null ||
-				log "警告：无法插入 DNS 打标规则 $_dns/$proto -> $_pol"
-			else
-				nft insert rule inet mwan3 mwan3_output \
-					ip daddr "$_dns" "$proto" dport 53 counter comment "isp-split-dns" \
-					return 2>/dev/null ||
-				log "警告：无法向 mwan3_output 插入 $_dns/$proto 的旁路规则"
-			fi
-		done
+		_db_seen="$_db_seen $_db_pol:$_db_dns "
+		_db_expected=$((_db_expected + 2))
+		_db_rows="$_db_rows $_db_pol:$_db_dns"
 	done
+
+	# 配置错误重试也不会变好，必须在等待/插入前就明确报错。
+	case "${DNS_MODE:-bind}" in
+	bind | mark) ;;
+	*)
+		log "错误：DNS_MODE='${DNS_MODE:-}' 无效（只能是 bind 或 mark），未恢复 DNS 旁路规则"
+		return 2
+		;;
+	esac
+	for _db_kv in $_db_rows; do
+		_db_dns=${_db_kv#*:}
+		if ! _valid_ipv4 "$_db_dns"; then
+			log "错误：DNS_TABLE 中的 '$_db_dns' 不是合法 IPv4（配置错误，未重试）"
+			return 2
+		fi
+	done
+
+	if ! nft list table inet mwan3 >/dev/null 2>&1; then
+		[ "$_db_required" = "1" ] &&
+			log "错误：table inet mwan3 不存在，无法恢复 DNS 旁路规则"
+		[ "$_db_required" = "1" ] && return 1
+		return 0
+	fi
+
+	# 没有 DNS 条目时只需清理旧规则，不必等待 mwan3 重建。
+	if [ "$_db_expected" -eq 0 ]; then
+		if _mwan3_output_ready; then
+			_db_i=0
+			while [ "$_db_i" -lt 256 ]; do
+				_db_h=$(nft -a list chain inet mwan3 mwan3_output 2>/dev/null |
+					grep 'comment "isp-split-dns"' |
+					grep -oE '# handle [0-9]+' | head -1 | grep -oE '[0-9]+')
+				[ -n "$_db_h" ] || break
+				nft delete rule inet mwan3 mwan3_output handle "$_db_h" 2>/dev/null || break
+				_db_i=$((_db_i + 1))
+			done
+		fi
+		return 0
+	fi
+
+	_db_tries=${DNS_RETRY_TRIES:-15}
+	_db_delay=${DNS_RETRY_DELAY:-1}
+	_db_attempt=0
+	_db_waited=$_db_recovered
+	_db_lasterr="未知错误"
+
+	while [ "$_db_attempt" -lt "$_db_tries" ]; do
+		_db_attempt=$((_db_attempt + 1))
+
+		# 链是否已就绪。未就绪时 list 可能成功但 insert 会 EBUSY，
+		# 或 insert 成功后被紧接着的 flush 覆盖，所以必须轮询。
+		if ! _mwan3_output_ready; then
+			_db_waited=1
+			_db_lasterr="mwan3_output 未就绪（缺少 hook output 或 jump mwan3_rules）"
+			[ "$_db_attempt" -lt "$_db_tries" ] && sleep "$_db_delay"
+			continue
+		fi
+
+		# mark 模式依赖策略子链；链不存在是配置错误，不应重试。
+		if [ "${DNS_MODE:-bind}" = "mark" ]; then
+			_db_badpol=0
+			for _db_kv in $_db_rows; do
+				_db_pol=${_db_kv%%:*}
+				if ! nft list chain inet mwan3 "mwan3_policy_$_db_pol" >/dev/null 2>&1; then
+					log "错误：DNS 打标目标 mwan3_policy_$_db_pol 不存在（配置错误，未重试）"
+					_db_badpol=1
+					break
+				fi
+			done
+			[ "$_db_badpol" = "1" ] && return 2
+		fi
+
+		# 先按唯一 comment 删除所有旧规则：DNS_TABLE 改了策略/删了条目后，
+		# 旧规则不会残留；重试时也不会越插越多。
+		_db_i=0
+		_db_del_fail=0
+		while [ "$_db_i" -lt 256 ]; do
+			_db_h=$(nft -a list chain inet mwan3 mwan3_output 2>/dev/null |
+				grep 'comment "isp-split-dns"' |
+				grep -oE '# handle [0-9]+' | head -1 | grep -oE '[0-9]+')
+			[ -n "$_db_h" ] || break
+			if ! nft delete rule inet mwan3 mwan3_output handle "$_db_h" 2>/dev/null; then
+				_db_del_fail=1
+				break
+			fi
+			_db_i=$((_db_i + 1))
+		done
+		if [ "$_db_del_fail" = "1" ]; then
+			_db_waited=1
+			_db_lasterr="删除旧 DNS 旁路规则失败（链正在重建）"
+			[ "$_db_attempt" -lt "$_db_tries" ] && sleep "$_db_delay"
+			continue
+		fi
+
+		_db_fail=0
+		for _db_kv in $_db_rows; do
+			_db_pol=${_db_kv%%:*}
+			_db_dns=${_db_kv#*:}
+			for _db_proto in udp tcp; do
+				if [ "${DNS_MODE:-bind}" = "mark" ]; then
+					_db_err=$(nft insert rule inet mwan3 mwan3_output \
+						ip daddr "$_db_dns" "$_db_proto" dport 53 counter comment "isp-split-dns" \
+						jump "mwan3_policy_$_db_pol" 2>&1)
+				else
+					_db_err=$(nft insert rule inet mwan3 mwan3_output \
+						ip daddr "$_db_dns" "$_db_proto" dport 53 counter comment "isp-split-dns" \
+						return 2>&1)
+				fi
+				_db_rc=$?
+				[ "$_db_rc" -eq 0 ] && continue
+				_db_lasterr=$_db_err
+				case "$_db_err" in
+				"" | *"Device or resource busy"* | *"Resource temporarily unavailable"* | \
+					*"No such file or directory"* | *"Interrupted system call"*)
+					_db_fail=1
+					;;
+				*)
+					log "错误：DNS 旁路规则 $_db_dns/$_db_proto 插入失败（配置错误，未重试）：$_db_err"
+					return 2
+					;;
+				esac
+				break 2
+			done
+		done
+
+		if [ "$_db_fail" = "1" ]; then
+			_db_waited=1
+			[ "$_db_attempt" -lt "$_db_tries" ] && sleep "$_db_delay"
+			continue
+		fi
+
+		# nft insert 返回 0 不代表规则最终还在：mwan3 可能正好在重建链，
+		# 前几条插进旧链后就随 flush 消失。必须回读校验条数。
+		_db_got=$(_dns_rule_count)
+		if [ "$_db_got" -eq "$_db_expected" ]; then
+			if [ "$_db_waited" = "1" ] || [ "$_db_attempt" -gt 1 ]; then
+				log "mwan3 重建后 DNS 旁路规则已恢复（$_db_expected 条，第 $_db_attempt 次尝试）"
+			fi
+			return 0
+		fi
+
+		_db_waited=1
+		_db_lasterr="插入后只看到 $_db_got/$_db_expected 条（链可能被 mwan3 重建覆盖）"
+		[ "$_db_attempt" -lt "$_db_tries" ] && sleep "$_db_delay"
+	done
+
+	log "错误：DNS 旁路规则未能恢复（已尝试 $_db_attempt 次：$_db_lasterr）"
+	return 1
 }
 
 # 检查 mwan3_output 里是否已有 DNS 旁路规则。
@@ -1133,7 +1326,17 @@ cmd_dns() {
 	done
 
 	# 3) 处理 DNS 查询的出线（幂等，mwan3 重启后重跑 wire/apply/dns 即恢复）
-	_dns_bypass
+	# dns 命令即使 mwan3 暂时未就绪也要把 dnsmasq 片段写出来，
+	# 所以 required=0；但配置错误必须立即失败，不能静默生成坏片段。
+	_dns_bypass 0
+	_db_rc=$?
+	if [ "$_db_rc" -eq 2 ]; then
+		# 配置错误时不要留下可能含坏 DNS 的 dnsmasq 片段
+		rm -f "$_out"
+		die "DNS 旁路规则配置错误，请修正 DNS_TABLE / DNS_MODE 后重试"
+	elif [ "$_db_rc" -ne 0 ]; then
+		log "警告：mwan3 尚未就绪，DNS 旁路规则未全部恢复；稍后执行 isp-split apply 可重试"
+	fi
 
 	if [ "$_n" -eq 0 ]; then
 		rm -f "$_out"

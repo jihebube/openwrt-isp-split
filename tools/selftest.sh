@@ -126,6 +126,140 @@ else
 	ng "badcidr 未识别坏前缀"
 fi
 
+echo "== 4. DNS 旁路：mwan3 reload 竞态恢复"
+mkdir -p "$TMP/fakebin"
+cat > "$TMP/fakebin/nft" <<'FAKE_NFT'
+#!/bin/sh
+S=${FAKE_NFT_STATE:?}
+mkdir -p "$S"
+[ "$1" = "-a" ] && shift
+cmd=$1; shift
+case "$cmd" in
+list)
+	case "$*" in
+	*"chain inet mwan3 mwan3_output"*)
+		p=0; [ -f "$S/polls" ] && p=$(cat "$S/polls")
+		p=$((p + 1)); echo "$p" > "$S/polls"
+		ready=0; [ -f "$S/ready" ] && ready=1
+		[ "$p" -ge "${FAKE_NFT_READY_AFTER:-3}" ] && ready=1 && : > "$S/ready"
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_output {"
+		echo "		type route hook output priority mangle; policy accept;"
+		if [ "$ready" = 1 ]; then
+			echo "		jump mwan3_rules"
+			if [ -f "$S/rules" ]; then
+				n=0
+				while IFS= read -r r; do
+					n=$((n + 1)); echo "		$r # handle $n"
+				done < "$S/rules"
+			fi
+		fi
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
+	*"chain inet mwan3 mwan3_rules"*)
+		echo "table inet mwan3 { chain mwan3_rules { } }"
+		exit 0
+		;;
+	*"table inet mwan3"*) exit 0 ;;
+	*"set inet mwan3"*) exit 0 ;;
+	*) exit 1 ;;
+	esac
+	;;
+insert)
+	[ -f "$S/ready" ] || {
+		echo "Error: Could not process rule: Device or resource busy" >&2
+		exit 1
+	}
+	echo "$*" | sed 's/comment isp-split-dns/comment "isp-split-dns"/' >> "$S/rules"
+	c=0; [ -f "$S/inserts" ] && c=$(cat "$S/inserts")
+	c=$((c + 1)); echo "$c" > "$S/inserts"
+	if [ -n "${FAKE_NFT_FLUSH_AFTER_INSERT:-}" ] && [ "$c" -eq "$FAKE_NFT_FLUSH_AFTER_INSERT" ]; then
+		rm -f "$S/ready"; echo 0 > "$S/polls"
+	fi
+	exit 0
+	;;
+delete)
+	h=""; for a in "$@"; do h=$a; done
+	[ -f "$S/rules" ] || exit 0
+	awk -v h="$h" 'NR != h' "$S/rules" > "$S/rules.new" && mv "$S/rules.new" "$S/rules"
+	exit 0
+	;;
+esac
+exit 1
+FAKE_NFT
+chmod +x "$TMP/fakebin/nft"
+cat > "$TMP/fakebin/logger" <<'FAKE_LOGGER'
+#!/bin/sh
+exit 0
+FAKE_LOGGER
+chmod +x "$TMP/fakebin/logger"
+
+cat > "$TMP/dns.conf" <<'DNS_CONF'
+DNS_TABLE="
+wan_only:223.5.5.5
+wanb_only:119.29.29.29
+"
+DNS_MODE="bind"
+DNS_CONF
+cat > "$TMP/dns-bad.conf" <<'DNS_BAD'
+DNS_TABLE="
+wan_only:not-an-ip
+"
+DNS_MODE="bind"
+DNS_BAD
+
+# 只取主脚本的函数定义（去掉 main 的 case），在隔离的 PATH 下直接调 _dns_bypass。
+sed '/^# ---------------------------------------------------------------- main$/,$d' \
+	"$ROOT/files/usr/sbin/isp-split" > "$TMP/isp-lib.sh"
+
+dns_case() {
+	_state=$1
+	_ready_after=$2
+	_flush_after=$3
+	_conf=$4
+	(
+		PATH="$TMP/fakebin:$PATH"
+		FAKE_NFT_STATE="$_state"
+		FAKE_NFT_READY_AFTER="$_ready_after"
+		FAKE_NFT_FLUSH_AFTER_INSERT="$_flush_after"
+		ISP_SPLIT_CONF="$_conf"
+		DNS_RETRY_TRIES=8
+		DNS_RETRY_DELAY=0
+		export PATH FAKE_NFT_STATE FAKE_NFT_READY_AFTER \
+			FAKE_NFT_FLUSH_AFTER_INSERT ISP_SPLIT_CONF DNS_RETRY_TRIES DNS_RETRY_DELAY
+		. "$TMP/isp-lib.sh"
+		_dns_bypass 1
+	)
+}
+
+rm -rf "$TMP/nft1"; mkdir -p "$TMP/nft1"
+if dns_case "$TMP/nft1" 3 2 "$TMP/dns.conf" >/dev/null 2>&1; then
+	_n=$(grep -c 'comment "isp-split-dns"' "$TMP/nft1/rules" 2>/dev/null || echo 0)
+	if [ "$_n" -eq 4 ]; then
+		ok "mwan3 重建竞态下 4 条 DNS 旁路规则全部恢复"
+	else
+		ng "mwan3 重建后 DNS 规则数异常: $_n（期望 4）"
+	fi
+else
+	ng "mwan3 重建竞态下 DNS 旁路恢复失败"
+fi
+
+rm -rf "$TMP/nft2"; mkdir -p "$TMP/nft2"
+if dns_case "$TMP/nft2" 999 0 "$TMP/dns.conf" >/dev/null 2>&1; then
+	ng "mwan3 始终未就绪时未返回失败"
+else
+	ok "mwan3 始终未就绪时明确失败（非 0）"
+fi
+
+rm -rf "$TMP/nft3"; mkdir -p "$TMP/nft3"
+if dns_case "$TMP/nft3" 1 0 "$TMP/dns-bad.conf" >/dev/null 2>&1; then
+	ng "非法 DNS 被当成成功"
+else
+	ok "DNS_TABLE 配置错误立即失败（非 0）"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]
