@@ -15,12 +15,6 @@
 		"write": {
 			"ubus": {
 				"file": [ "exec" ]
-			},
-			"file": {
-				"/usr/sbin/isp-split": [ "exec" ],
-				"/etc/isp-split.conf": [ "write" ],
-				"/etc/isp-split": [ "write" ],
-				"/etc/isp-split/*": [ "write" ]
 			}
 		}
 	}

@@ -1047,10 +1047,149 @@ conf_get() {
 		awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
 }
 
-# 安全重写某个 KEY 的值：写前备份、写后 sh -n 校验、失败自动回滚
+# ---- 配置字段白名单 ----
+# 配置文件会被 root source，sh -n 只查语法、不执行命令替换，不能当安全校验。
+# 因此每个字段在写入前都必须按白名单解析，绝不允许 $ ` " ' \ 空白 ; | 进入值里。
+_policy_list() {
+	uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p' | tr '\n' ' '
+}
+
+_valid_src() {
+	case "${1:-}" in "" | *[!A-Za-z0-9._-]*) return 1 ;; esac
+	return 0
+}
+
+_valid_name() {
+	case "${1:-}" in "" | *[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "${#1}" -le 15 ]
+}
+
+_valid_domain() {
+	case "${1:-}" in "" | *[!A-Za-z0-9._-]* | .* | *. | *..*) return 1 ;; esac
+	return 0
+}
+
+_valid_policy() {
+	case "${1:-}" in "" | *[!A-Za-z0-9_-]*) return 1 ;; esac
+	return 0
+}
+
+_valid_ipv4() {
+	_ip=${1:-}
+	case "$_ip" in
+	"" | *[!0-9.]* | .* | *. | *..*) return 1 ;;
+	esac
+	_old_ifs=$IFS
+	IFS=.
+	set -- $_ip
+	IFS=$_old_ifs
+	[ $# -eq 4 ] || return 1
+	for _oct in "$@"; do
+		case "$_oct" in "" | *[!0-9]*) return 1 ;; esac
+		[ "${#_oct}" -le 3 ] || return 1
+		[ "$_oct" -le 255 ] || return 1
+	done
+	return 0
+}
+
+# 校验某个 KEY 的完整值；失败直接 die（不写文件）
+_conf_validate() {
+	_key=$1
+	_val=$2
+	case "$_val" in
+	*'$'* | *'`'* | *'"'* | *"'"* | *'\'* | *';'* | *'|'*)
+		die "配置值含不允许的字符（\$ \` \" ' \\ ; |）"
+		;;
+	esac
+
+	_POLS=" $(_policy_list) "
+	case "$_key" in
+	ISP_TABLE)
+		_seen=" "
+		_old_ifs=$IFS
+		for _line in $_val; do
+			IFS=':'
+			set -- $_line
+			IFS=$_old_ifs
+			[ $# -eq 4 ] || die "行格式必须是 运营商:集合名:策略:0或1 —— 出错行: $_line"
+			_valid_src "$1" || die "运营商源名 '$1' 只能包含 [A-Za-z0-9._-]（出错行: $_line）"
+			_valid_name "$2" || die "集合名 '$2' 只能包含 [A-Za-z0-9_] 且不超过 15 字符（出错行: $_line）"
+			case " $_seen " in
+			*" $2 "*) die "集合名 '$2' 重复（出错行: $_line）" ;;
+			esac
+			_seen="$_seen $2"
+			_valid_policy "$3" || die "策略名 '$3' 含非法字符（出错行: $_line）"
+			case "$_POLS" in
+			*" $3 "*) ;;
+			*) die "mwan3 里不存在策略 '$3'，请先在 MultiWAN 管理器创建（出错行: $_line）" ;;
+			esac
+			case "$4" in
+			0 | 1) ;;
+			*) die "最后一列只能是 0（禁用）或 1（启用）—— 出错行: $_line" ;;
+			esac
+		done
+		IFS=$_old_ifs
+		;;
+	DNS_TABLE)
+		_old_ifs=$IFS
+		for _line in $_val; do
+			IFS=':'
+			set -- $_line
+			IFS=$_old_ifs
+			[ $# -eq 2 ] || die "格式必须是 策略:DNS地址 —— 出错行: $_line"
+			_valid_policy "$1" || die "策略名 '$1' 含非法字符（出错行: $_line）"
+			case "$_POLS" in
+			*" $1 "*) ;;
+			*) die "mwan3 里不存在策略 '$1'（出错行: $_line）" ;;
+			esac
+			_valid_ipv4 "$2" || die "DNS 地址必须是严格 IPv4（出错行: $_line）"
+		done
+		IFS=$_old_ifs
+		;;
+	DOMAIN_SPLIT)
+		_old_ifs=$IFS
+		for _line in $_val; do
+			IFS=':'
+			set -- $_line
+			IFS=$_old_ifs
+			[ $# -eq 2 ] || die "格式必须是 域名:策略 —— 出错行: $_line"
+			_valid_domain "$1" || die "域名 '$1' 只能包含 [A-Za-z0-9._-]（出错行: $_line）"
+			_valid_policy "$2" || die "策略名 '$2' 含非法字符（出错行: $_line）"
+			case "$_POLS" in
+			*" $2 "*) ;;
+			*) die "mwan3 里不存在策略 '$2'（出错行: $_line）" ;;
+			esac
+		done
+		IFS=$_old_ifs
+		;;
+	DNS_MODE)
+		case "$_val" in
+		bind | mark) ;;
+		*) die "DNS_MODE 只能是 bind 或 mark" ;;
+		esac
+		;;
+	*)
+		die "未知配置项 '$_key'"
+		;;
+	esac
+}
+
+# 安全重写某个 KEY 的值：写前校验并备份、写后 sh -n 校验、失败自动回滚
 _conf_write() {
 	_key=$1
 	_val=$2
+	case "$_key" in
+	isp_table) _key=ISP_TABLE ;;
+	dns_table) _key=DNS_TABLE ;;
+	domain_split) _key=DOMAIN_SPLIT ;;
+	dns_mode) _key=DNS_MODE ;;
+	*) die "未知配置项 '$_key'，可选：isp_table / dns_table / domain_split / dns_mode" ;;
+	esac
+
+	# 写入前必须通过白名单校验；失败即 die，绝不落盘
+	_conf_validate "$_key" "$_val"
+
 	_backup=$CONF.bak.$$
 	cp -f "$CONF" "$_backup" || die "无法备份配置"
 	awk -v key="$_key" -v val="$_val" '
@@ -1092,71 +1231,9 @@ conf_set() {
 	# 允许用 | 代替换行（前端传参更省事）
 	_val=$(printf '%s' "$_val" | tr '|' '\n')
 
-	case "$_key" in
-	isp_table)
-		_pols=" $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p' | tr '\n' ' ') "
-		_bad=""
-		_old_ifs=$IFS
-		for _line in $_val; do
-			IFS=':'
-			set -- $_line
-			IFS=$_old_ifs
-			if [ $# -ne 4 ]; then
-				_bad="行格式必须是 运营商:集合名:策略:0或1 —— 出错行: $_line"
-				break
-			fi
-			# 策略名不做白名单限制：只要在 mwan3 中真实存在即可
-			# （LuCI 下拉列出的就是 mwan3 的全部策略，含用户自定义的）
-			case " $_pols " in
-			*" $3 "*) ;;
-			*) _bad="mwan3 里不存在策略 '$3'，请先在 MultiWAN 管理器创建（出错行: $_line）" ;;
-			esac
-			[ -z "$_bad" ] || break
-			case "$4" in
-			0 | 1) ;;
-			*) _bad="最后一列只能是 0（禁用）或 1（启用）—— 出错行: $_line" ;;
-			esac
-			[ -z "$_bad" ] || break
-		done
-		[ -z "$_bad" ] || die "$_bad"
-		_conf_write ISP_TABLE "$_val"
-		;;
-	dns_table)
-		_old_ifs=$IFS
-		for _line in $_val; do
-			IFS=':'
-			set -- $_line
-			IFS=$_old_ifs
-			[ $# -eq 2 ] || die "格式必须是 策略:DNS地址 —— 出错行: $_line"
-			case "$2" in
-			*[0-9].[0-9]*.[0-9]*.[0-9]*) ;;
-			*) die "不像 IPv4 地址: $2" ;;
-			esac
-		done
-		_conf_write DNS_TABLE "$_val"
-		;;
-	domain_split)
-		_old_ifs=$IFS
-		for _line in $_val; do
-			IFS=':'
-			set -- $_line
-			IFS=$_old_ifs
-			[ $# -eq 2 ] || die "格式必须是 域名:策略 —— 出错行: $_line"
-			[ -n "$1" ] || die "域名不能为空"
-		done
-		_conf_write DOMAIN_SPLIT "$_val"
-		;;
-	dns_mode)
-		case "$_val" in
-		bind | mark) ;;
-		*) die "DNS_MODE 只能是 bind 或 mark" ;;
-		esac
-		_conf_write DNS_MODE "$_val"
-		;;
-	*)
-		die "未知配置项 '$_key'，可选：isp_table / dns_table / domain_split / dns_mode"
-		;;
-	esac
+	# _conf_write 内部会先调用 _conf_validate 做白名单校验；
+	# 校验失败直接 die，不会留下半写入的配置。
+	_conf_write "$_key" "$_val"
 
 	log "已更新 $_key。要让改动生效："
 	echo "  运营/策略映射 -> isp-split wire && isp-split apply"
