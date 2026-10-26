@@ -615,13 +615,29 @@ cmd_plan() {
 
 	echo
 	echo "未启用的运营商（其地址段不会被任何策略接管，落到兜底规则）:"
+	_dp_body=$(_mwan3_rules_body)
+	_dp_any=0
 	for row in $ISP_TABLE; do
 		_old_ifs=$IFS
 		IFS=':'
 		set -- $row
 		IFS=$_old_ifs
-		[ $# -ge 4 ] && [ "$4" = "0" ] && printf '  - %s\n' "$1"
+		[ $# -ge 4 ] || continue
+		[ "$4" = "0" ] || continue
+		_dp_any=1
+		_dp_res=""
+		nft list set inet mwan3 "$2" >/dev/null 2>&1 && _dp_res="$_dp_res nft集合"
+		printf '%s\n' "$_dp_body" | grep -q "@$2 " && _dp_res="$_dp_res nft规则"
+		uci -q get "mwan3.ipset_$2" >/dev/null 2>&1 && _dp_res="$_dp_res mwan3配置段"
+		if [ -n "$_dp_res" ]; then
+			printf '  - %s（集合 %s）: 检测到残留 ->%s\n' "$1" "$2" "$_dp_res"
+		else
+			printf '  - %s（集合 %s）: 当前 nft/mwan3 中无残留\n' "$1" "$2"
+		fi
 	done
+	[ "$_dp_any" = "1" ] || echo "  （无）"
+	echo "  说明: 未启用项不会被 apply 写入；残留的 nft 规则会在下次 wire 重写规则块时移除，"
+	echo "        mwan3 ipset 配置段与对应 nft 集合会在 uninstall 时清理。"
 
 	echo
 	echo "dnsmasq confdir（多线路 DNS 片段写入位置）:"
