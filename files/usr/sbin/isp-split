@@ -1141,6 +1141,13 @@ _conf_val() {
 		{
 			if (inb) {
 				if ($0 ~ /^"[[:space:]]*$/) { inb = 0; next }
+				# 多行值的收尾引号也可能跟在最后一行末尾：KEY="a\nb"
+				if ($0 ~ /"[[:space:]]*$/) {
+					sub(/"[[:space:]]*$/, "", $0)
+					out = (out == "" ? "" : out "\n") $0
+					inb = 0
+					next
+				}
 				out = (out == "" ? "" : out "\n") $0
 				next
 			}
