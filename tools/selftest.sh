@@ -525,6 +525,191 @@ else
 	ng "卸载清理异常：残留${_bug6_left:- 无}，uci 调用: $(tr '\n' ';' < "$TMP/bug6/uci.log" 2>/dev/null)"
 fi
 
+echo "== 8. verify/status 链形状判定（BUG-7 / BUG-8）"
+# 生产实机 mwan3_rules 的真实形状：用户 saddr 规则在链首、本工具
+# @isp 规则在中间、default 规则在链尾且是 mwan3 3.6 的间接跳转。
+mkdir -p "$TMP/bug78/fakebin"
+cat > "$TMP/bug78/fakebin/nft" <<'FAKE_NFT78'
+#!/bin/sh
+[ "$1" = "-a" ] && shift
+cmd=$1; shift
+case "$cmd" in
+list)
+	case "$*" in
+	"table inet mwan3") exit 0 ;;
+	"chain inet mwan3 mwan3_rules")
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_rules {"
+		sed 's/^/		/' "$FAKE_NFT_FIXTURE"
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
+	"chain inet mwan3 mwan3_rule_default_rule_v4")
+		[ -n "${FAKE_NFT_CHILD_FIXTURE:-}" ] || exit 1
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_rule_default_rule_v4 {"
+		sed 's/^/		/' "$FAKE_NFT_CHILD_FIXTURE"
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
+	"chain inet mwan3 mwan3_output") exit 0 ;;
+	"set inet mwan3 "*) exit 1 ;;
+	"counter inet mwan3 "*) exit 1 ;;
+	*) exit 0 ;;
+	esac
+	;;
+*) exit 1 ;;
+esac
+FAKE_NFT78
+chmod +x "$TMP/bug78/fakebin/nft"
+cat > "$TMP/bug78/fakebin/uci" <<'FAKE_UCI78'
+#!/bin/sh
+case "$*" in
+*"get mwan3.default_rule_v4.enabled"*)
+	if [ "${FAKE_UCI_DEFAULT_MODE:-}" = "missing" ]; then exit 1; fi
+	if [ "${FAKE_UCI_DEFAULT_MODE:-}" = "disabled" ]; then
+		echo 0
+	else
+		echo 1
+	fi
+	exit 0
+	;;
+*"get mwan3.default_rule_v4"*)
+	[ "${FAKE_UCI_DEFAULT_MODE:-}" = "missing" ] && exit 1
+	echo rule
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI78
+chmod +x "$TMP/bug78/fakebin/uci"
+cat > "$TMP/bug78/conf" <<'BUG78_CONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+cmcc:isp_cmcc:wanb_only:1
+cernet:isp_cernet:wan_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+BUG78_CONF
+
+_bug78_run() {
+	_fixture=$1
+	_child=$2
+	_mode=$3
+	shift 3
+	(
+		PATH="$TMP/bug78/fakebin:$PATH"
+		ISP_SPLIT_CONF="$TMP/bug78/conf"
+		ISP_SPLIT_BASE="$TMP/bug78/base"
+		FAKE_NFT_FIXTURE="$_fixture"
+		FAKE_NFT_CHILD_FIXTURE="$_child"
+		FAKE_UCI_DEFAULT_MODE="$_mode"
+		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE \
+			FAKE_NFT_FIXTURE FAKE_NFT_CHILD_FIXTURE FAKE_UCI_DEFAULT_MODE
+		. "$TMP/isp-lib.sh"
+		"$@"
+	)
+}
+
+_bug78_prod="$FIX/mwan3_rules.prod.nft"
+_bug78_child="$FIX/mwan3_rule_default_rule_v4.nft"
+_bug78_bad="$FIX/mwan3_rules.bad-order.nft"
+_bug78_direct="$FIX/mwan3_rules.direct.nft"
+_bug78_user="$FIX/mwan3_rules.user-policy.nft"
+
+# BUG-7：链首用户 saddr 规则不是 catch-all，4 条 @isp 规则必须全 ✓。
+_bug78_out=$(_bug78_run "$_bug78_prod" "$_bug78_child" present cmd_verify)
+_bug78_yes=$(printf '%s\n' "$_bug78_out" | grep -c '✓ @isp_')
+_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗')
+if [ "$_bug78_yes" -eq 4 ] && [ "$_bug78_no" -eq 0 ]; then
+	ok "真实链形状下 verify 4 条 @isp 规则全部 ✓"
+else
+	ng "真实链形状下 verify 结果异常: ${_bug78_yes} ✓ / ${_bug78_no} ✗（期望 4/0）"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# 用户自己带端口条件的直接 policy jump 不是 catch-all，不能把 @isp 规则
+# 误判到它之后（“纯 mark 条件”才属于无条件兜底）。
+_bug78_out=$(_bug78_run "$_bug78_user" "$_bug78_child" present cmd_verify)
+_bug78_yes=$(printf '%s\n' "$_bug78_out" | grep -c '✓ @isp_')
+_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗')
+if [ "$_bug78_yes" -eq 4 ] && [ "$_bug78_no" -eq 0 ]; then
+	ok "用户 tcp dport policy 规则不被误判为 catch-all"
+else
+	ng "用户 tcp dport policy 规则被误判: ${_bug78_yes} ✓ / ${_bug78_no} ✗（期望 4/0）"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# BUG-8：链尾是 ip daddr 0.0.0.0/0 jump mwan3_rule_default_rule_v4，
+# 且子链内确有 policy jump，status 不得再报“渲染异常”。
+_bug78_out=$(_bug78_run "$_bug78_prod" "$_bug78_child" present cmd_status)
+if ! printf '%s\n' "$_bug78_out" | grep -q '渲染异常' &&
+   printf '%s\n' "$_bug78_out" | grep -q '已参与负载均衡'; then
+	ok "间接跳转 default 形态下 status 不再误报渲染异常"
+else
+	ng "间接跳转 default 形态下 status 仍误报"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# 直接形态：ip daddr 0.0.0.0/0 ... jump mwan3_policy_<default> 同样通过。
+_bug78_out=$(_bug78_run "$_bug78_direct" "$_bug78_child" present cmd_status)
+if ! printf '%s\n' "$_bug78_out" | grep -q '渲染异常' &&
+   printf '%s\n' "$_bug78_out" | grep -q '已参与负载均衡'; then
+	ok "直接 policy jump default 形态下 status 正常识别"
+else
+	ng "直接 policy jump default 形态识别失败"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# 子链读不到时降级为警告，仍不能报“渲染异常”。
+_bug78_out=$(_bug78_run "$_bug78_prod" "" present cmd_status)
+if ! printf '%s\n' "$_bug78_out" | grep -q '渲染异常' &&
+   printf '%s\n' "$_bug78_out" | grep -q '未能确认子链内的 mark==0 policy jump'; then
+	ok "子链校验失败时降级为警告，不误报渲染异常"
+else
+	ng "子链校验失败时未按预期降级"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# 反例：规则真的排在 0.0.0.0/0 之后，仍必须报 ✗。
+_bug78_out=$(_bug78_run "$_bug78_bad" "$_bug78_child" present cmd_verify)
+_bug78_yes=$(printf '%s\n' "$_bug78_out" | grep -c '✓ @isp_')
+_bug78_no=$(printf '%s\n' "$_bug78_out" |
+	grep -c '✗ @isp_tel 位于第一条 catch-all 之后')
+if [ "$_bug78_yes" -eq 3 ] && [ "$_bug78_no" -eq 1 ]; then
+	ok "真正排在 0.0.0.0/0 之后的规则仍报 ✗（未削弱正确告警）"
+else
+	ng "catch-all 之后的规则告警异常: ${_bug78_yes} ✓ / ${_bug78_no} ✗（期望 3/1）"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# BUG-2 回归：enabled=0 仍走“已被禁用 + 启用命令”，不是渲染异常。
+_bug78_out=$(_bug78_run "$_bug78_prod" "$_bug78_child" disabled cmd_status)
+if printf '%s\n' "$_bug78_out" | grep -q '已被禁用（enabled=0）' &&
+   printf '%s\n' "$_bug78_out" | grep -q 'enabled=1' &&
+   ! printf '%s\n' "$_bug78_out" | grep -q '渲染异常'; then
+	ok "enabled=0 仍沿用 BUG-2 的禁用提示"
+else
+	ng "enabled=0 提示路径被破坏"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
+# 无 default_rule_v4 section：提示未配置，不报渲染异常。
+_bug78_out=$(_bug78_run "$_bug78_prod" "$_bug78_child" missing cmd_status)
+if printf '%s\n' "$_bug78_out" | grep -q '未配置 mwan3 的 default_rule_v4' &&
+   ! printf '%s\n' "$_bug78_out" | grep -q '渲染异常'; then
+	ok "未配置 default_rule_v4 时提示未配置，不误报渲染异常"
+else
+	ng "未配置 default_rule_v4 时提示异常"
+	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]

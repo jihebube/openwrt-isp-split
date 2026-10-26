@@ -881,32 +881,66 @@ cmd_status() {
 		echo "数据更新时间: $(date -d "@$(cat "$DATA/.stamp")" 2>/dev/null ||
 			date -r "$(cat "$DATA/.stamp")" 2>/dev/null || echo '未知')"
 	fi
-	# 兜底流量状态：按链尾实际规则形状判断，而不是 grep section 名。
-	# mwan3-nft 渲染用户规则时不带 comment/section 名，链里不会出现
-	# "default_rule" 字符串；它实际渲染为：
-	#   meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_<default>
-	_dr=0
-	_last=$(_mwan3_rules_body | grep -v '^[[:space:]]*$' | tail -1)
-	if printf '%s\n' "$_last" | grep -qE \
-		'meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_' &&
-	   ! printf '%s\n' "$_last" | grep -q '@isp_'; then
-		# 本工具的运营商规则也是 mark==0 + policy jump，不能把它误当成
-		# default 规则（default 规则不带 daddr @isp_）。
-		_dr=1
-	fi
-	if [ "$_dr" -gt 0 ]; then
-		echo "兜底流量: 已参与负载均衡（链尾 default 规则已渲染，走其 use_policy 指定的策略）"
+	# 兜底流量状态：先看 UCI 配置意图，再看链里实际渲染形状。
+	# mwan3-nft 3.6 对 rule 有两种渲染形态，必须都认：
+	#   直接： ip daddr 0.0.0.0/0 ... jump mwan3_policy_<default>
+	#   间接： ip daddr 0.0.0.0/0 ... jump mwan3_rule_default_rule_v4
+	#          （子链里才是 jump mwan3_policy_<default>）
+	# 旧逻辑只看链尾的 policy jump，间接形态会被误报为“渲染异常”。
+	_dr_exists=0
+	uci -q get mwan3.default_rule_v4 >/dev/null 2>&1 && _dr_exists=1
+	_dr_en=$(uci -q get mwan3.default_rule_v4.enabled 2>/dev/null)
+	if [ "$_dr_exists" = "0" ] && [ -z "${_dr_en:-}" ]; then
+		echo "提示: 未配置 mwan3 的 default_rule_v4（未命中集合的流量将走系统默认路由，不参与负载均衡）"
+	elif [ "${_dr_en:-}" = "0" ]; then
+		# enabled=0 是合法配置：沿用 BUG-2 的提示，不去查 mwan3 日志。
+		echo "提示: mwan3 的 default_rule_v4 已被禁用（enabled=0）"
+		echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
+		echo "      如需启用：uci set mwan3.default_rule_v4.enabled=1 && uci commit mwan3 && /etc/init.d/mwan3 reload"
 	else
-		echo
-		# 区分“用户故意禁用”和“配置存在但渲染失败”：两者的下一步操作
-		# 完全不同。enabled=0 是合法配置，不该让用户去查 mwan3 日志。
-		_dr_en=$(uci -q get mwan3.default_rule_v4.enabled 2>/dev/null)
-		if [ "${_dr_en:-}" = "0" ]; then
-			echo "提示: mwan3 的 default_rule_v4 已被禁用（enabled=0）"
-			echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
-			echo "      如需启用：uci set mwan3.default_rule_v4.enabled=1 && uci commit mwan3 && /etc/init.d/mwan3 reload"
+		_body=$(_mwan3_rules_body)
+		_dr=0
+		_dr_kind=""
+		_dr_child=""
+		_dr_direct=$(printf '%s\n' "$_body" | awk '
+			/ip daddr 0\.0\.0\.0\/0/ && /(jump|goto) mwan3_policy_/ { print; exit }
+			/^[[:space:]]*(meta nfproto ipv4[[:space:]]+)?meta mark (&|and) 0x0*3f00 == 0x0+/ &&
+			/(jump|goto) mwan3_policy_/ &&
+			!/ip (saddr|daddr)/ && !/@isp_/ { print; exit }
+		')
+		if [ -n "$_dr_direct" ]; then
+			_dr=1
+			_dr_kind=direct
 		else
-			echo "提示: mwan3 的 default 规则渲染异常（链尾没有 mark==0 的 policy jump）"
+			_dr_indirect=$(printf '%s\n' "$_body" |
+				grep -E 'ip daddr 0\.0\.0\.0/0 .*(jump|goto) mwan3_rule_default_rule_v4' |
+				head -1)
+			if [ -n "$_dr_indirect" ]; then
+				_dr=1
+				_dr_kind=indirect
+				_dr_child=$(printf '%s\n' "$_dr_indirect" |
+					grep -oE '(jump|goto) mwan3_rule_[A-Za-z0-9_]+' |
+					awk '{print $2}' | head -1)
+			fi
+		fi
+		if [ "$_dr" -gt 0 ]; then
+			if [ "$_dr_kind" = "indirect" ]; then
+				# 存在间接跳转即视为 default 已渲染；能读到子链时再确认
+				# 里面确实有 policy jump，读不到只降级为警告，不再误报异常。
+				if [ -n "$_dr_child" ] &&
+				   nft list chain inet mwan3 "$_dr_child" 2>/dev/null |
+					grep -qE 'meta mark (&|and) 0x0*3f00 == 0x0+ .*(jump|goto) mwan3_policy_'; then
+					echo "兜底流量: 已参与负载均衡（default 规则已渲染：$_dr_child 子链内 jump mwan3_policy_*）"
+				else
+					echo "兜底流量: default 规则已渲染（间接跳转 ${_dr_child:-mwan3_rule_default_rule_v4}）"
+					echo "警告: 未能确认子链内的 mark==0 policy jump（可能渲染不完整，请检查 mwan3 日志）"
+				fi
+			else
+				echo "兜底流量: 已参与负载均衡（default 规则已渲染，走其 use_policy 指定的策略）"
+			fi
+		else
+			echo
+			echo "提示: mwan3 的 default 规则渲染异常（链中既没有 0.0.0.0/0 直连 policy jump，也没有 jump mwan3_rule_default_rule_v4）"
 			echo "      未命中集合的流量将走系统默认路由（不参与负载均衡）。"
 			echo "      请检查 mwan3.default_rule_v4 是否存在、enabled 是否为 1，并查看 mwan3 日志。"
 		fi

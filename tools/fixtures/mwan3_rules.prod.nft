@@ -1,0 +1,9 @@
+ip saddr 192.168.50.9 meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_balanced
+ip saddr 192.168.50.147 meta mark & 0x00003f00 == 0x00000000 jump mwan3_rule_cfg0292bd
+ip daddr @isp_tel meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only
+ip daddr @isp_uni meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wanb_only
+ip daddr @isp_cmcc meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wanb_only
+ip daddr @isp_cernet meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"
+tcp dport 443 meta mark & 0x00003f00 == 0x00000000 jump mwan3_rule_https
+ip daddr 0.0.0.0/0 meta mark & 0x00003f00 == 0x00000000 jump mwan3_rule_default_rule_v4
