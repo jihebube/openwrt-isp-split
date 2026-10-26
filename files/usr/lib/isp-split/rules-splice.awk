@@ -8,7 +8,8 @@
 #   awk -v insert=<规则片段文件> -v anchor=<锚点正则> -f rules-splice.awk /etc/config/mwan3
 #
 # 行为：
-#   1. 删掉所有已存在的本工具规则块（节名以 isp_ 开头，或块内含 isp_split 标记）
+#   1. 只删掉带精确标记 option isp_split '1' 的本工具规则块
+#      （不再按 isp_ 前缀或注释里的 isp_split 字符串判定，避免误删用户规则）
 #   2. 在第一个匹配 anchor 的 rule 块之前插入 insert 文件内容
 #   3. 找不到锚点且 insert 非空时，输出警告到 stderr 并以 3 退出，
 #      绝不静默追加到链尾（追加在 catch-all 之后永远不命中）
@@ -18,18 +19,19 @@
 function blocktext(i,	e,	j,	t) {
 	e = (i < nb) ? bs[i + 1] - 1 : NR
 	t = ""
+	# 只拼接块内的 option/list 行。块间注释、空行不能算进前一个块，
+	# 否则一段含 isp_split 字样的注释就会把上面的用户规则误判成我们的。
 	for (j = bs[i]; j <= e; j++)
-		t = t " " line[j]
+		if (line[j] ~ /^[[:space:]]*(option|list)[[:space:]]/)
+			t = t " " line[j]
 	return t
 }
 
 function is_ours(i,	t) {
 	if (bt[i] != "rule")
 		return 0
-	if (bn[i] ~ /^isp_/)
-		return 1
 	t = blocktext(i)
-	if (t ~ /isp_split/)
+	if (t ~ /option[[:space:]]+isp_split[[:space:]]+['"]1['"]/)
 		return 1
 	return 0
 }
@@ -62,6 +64,7 @@ BEGIN {
 
 END {
 	for (i = 1; i <= nb; i++) {
+		gsub(/['\''"]/, "", bt[i])
 		gsub(/['\''"]/, "", bn[i])
 	}
 

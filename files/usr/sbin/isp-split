@@ -395,6 +395,9 @@ _wire_ipset() {
 	uci set "mwan3.$_sec.counters=1"
 	uci set "mwan3.$_sec.loadfile=$DATA/$_src.txt"
 	uci set "mwan3.$_sec.enabled=1"
+	# 精确标记：rules-splice/uninstall 只按它识别本工具的段，
+	# 不再按 isp_ 前缀误伤用户自己的 rule。
+	uci set "mwan3.$_sec.isp_split=1"
 }
 
 _write_rule() {
