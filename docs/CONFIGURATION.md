@@ -78,14 +78,16 @@ DNS_MODE="bind"
 
 执行 `isp-split dns` 后：
 
-1. 生成 `/etc/isp-split/dnsmasq.d/isp-split.conf`：
+1. 把 `isp-split.conf` 写进 dnsmasq 现有的 `confdir`（未显式设置时用默认的
+   `/tmp/dnsmasq.d`），不覆盖原值：
 
    ```
    server=/bilivideo.com/119.29.29.29@wan2
    ```
 
 2. 在 `inet mwan3 mwan3_output` 链顶部插入 DNS 出线规则（随 mwan3 重启丢失，`/etc/init.d/isp-split` 会在启动时自动重放）
-3. 把配置目录加入 dnsmasq 的 `confdir` 并重启 dnsmasq
+3. 重启 dnsmasq；卸载时按安装前记录的原值恢复 `confdir`（旧版本写入的
+   `/etc/isp-split/dnsmasq.d` 会被自动摘除，其余目录保留）
 
 ### DNS_MODE：bind 与 mark
 

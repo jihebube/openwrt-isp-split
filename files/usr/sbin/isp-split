@@ -533,6 +533,19 @@ cmd_plan() {
 	done
 
 	echo
+	echo "dnsmasq confdir（多线路 DNS 片段写入位置）:"
+	_cur=$(_dns_confdir_get)
+	_clean=$(_dns_confdir_clean "$_cur")
+	_confdir=$(_dns_confdir_target "$_clean")
+	if [ "$_clean" = "$_cur" ]; then
+		echo "  当前值: ${_cur:-（未设置，dnsmasq 默认 /tmp/dnsmasq.d）}"
+		echo "  将修改 confdir: 否（片段写入 $_confdir，不覆盖原值）"
+	else
+		echo "  当前值: ${_cur:-（未设置）}"
+		echo "  将修改 confdir: ${_clean:-（删除该项，回到默认 /tmp/dnsmasq.d）}"
+	fi
+
+	echo
 	echo "将会写入的 nft 集合声明（每个启用的运营商一个）:"
 	_p3() {
 		_src=$1
@@ -741,6 +754,7 @@ cmd_probe() {
 # ---------------------------------------------------------------- dns
 
 DNSDIR=${DNSDIR:-/etc/isp-split/dnsmasq.d}
+DNS_STATE=$BASE/state
 # 多线路 DNS 的出线方式：
 #   bind = server=/域名/IP@接口（dnsmasq 的 SO_BINDTODEVICE，只有 dnsmasq 支持）
 #   mark = server=/域名/IP + nft 给发往该 DNS 的 53 端口打对应策略的标
@@ -750,6 +764,63 @@ DNS_MODE=${DNS_MODE:-bind}
 # 统计"未命中任何运营商集合"的兜底流量（isp_fallback 计数器，status 里显示）
 COUNT_FALLBACK=${COUNT_FALLBACK:-1}
 DOMAINDIR=${DOMAIN_LIST_DIR:-${DOMAINDIR:-/etc/isp-split/domains}}
+
+# ---- dnsmasq confdir：只写现有目录，绝不整体覆盖 ----
+# 历史版本曾把 dhcp.@dnsmasq[0].confdir 直接改成 $DNSDIR，导致
+# OpenClash/adblock 等放在 /tmp/dnsmasq.d 的片段全部失效。现在改为：
+#   · 优先写到现有 confdir 的第一个目录（未设置时用 dnsmasq 默认 /tmp/dnsmasq.d）
+#   · 首次运行时把原值记到 $DNS_STATE，卸载时恢复
+#   · 若发现旧版本写入的 $DNSDIR，只把它从列表里摘掉，其余目录原样保留
+_dns_confdir_get() {
+	uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null || true
+}
+
+_dns_confdir_clean() {
+	_clean_in=${1:-}
+	_clean_out=""
+	for _clean_d in $_clean_in; do
+		[ "$_clean_d" = "$DNSDIR" ] && continue
+		_clean_out="${_clean_out:+$_clean_out }$_clean_d"
+	done
+	printf '%s\n' "$_clean_out"
+}
+
+_dns_confdir_set() {
+	if [ -n "${1:-}" ]; then
+		uci -q set "dhcp.@dnsmasq[0].confdir=$1" || return 1
+	else
+		uci -q delete dhcp.@dnsmasq[0].confdir 2>/dev/null || true
+	fi
+	uci -q commit dhcp
+}
+
+_dns_confdir_target() {
+	for _target_d in ${1:-}; do
+		printf '%s\n' "$_target_d"
+		return 0
+	done
+	printf '/tmp/dnsmasq.d\n'
+}
+
+_restore_dns_confdir() {
+	_state=$DNS_STATE/dnsmasq.confdir.orig
+	[ -f "$_state" ] || return 0
+	_orig=$(cat "$_state" 2>/dev/null || true)
+	_cur=$(_dns_confdir_get)
+	for _d in $_cur /tmp/dnsmasq.d "$DNSDIR"; do
+		rm -f "$_d/isp-split.conf" 2>/dev/null || true
+	done
+	if [ -n "$_orig" ]; then
+		if [ "$_cur" != "$_orig" ]; then
+			_dns_confdir_set "$_orig" && log "已恢复 dnsmasq confdir=$_orig"
+		fi
+	else
+		if [ -n "$_cur" ]; then
+			_dns_confdir_set "" && log "已恢复 dnsmasq confdir（默认 /tmp/dnsmasq.d）"
+		fi
+	fi
+	rm -f "$_state"
+}
 
 # 策略 -> 出接口设备名（策略取第一个成员）
 policy_device() {
@@ -817,8 +888,26 @@ _dns_bypass() {
 
 cmd_dns() {
 	need_nft
-	mkdir -p "$DNSDIR" "$DOMAINDIR"
-	_out=$DNSDIR/isp-split.conf
+	mkdir -p "$DNS_STATE" "$DOMAINDIR"
+
+	# 首次运行时记录原始 confdir；旧版本若把 confdir 改成了 $DNSDIR，
+	# 这里只摘掉 $DNSDIR，保留用户原有的其它目录。
+	_state=$DNS_STATE/dnsmasq.confdir.orig
+	_cur=$(_dns_confdir_get)
+	if [ ! -f "$_state" ]; then
+		_clean=$(_dns_confdir_clean "$_cur")
+		printf '%s\n' "$_clean" > "$_state" || die "无法保存 dnsmasq confdir 状态"
+		if [ "$_clean" != "$_cur" ]; then
+			_dns_confdir_set "$_clean" || die "无法迁移 dnsmasq confdir"
+			log "已从 confdir 移除旧版写入的 $DNSDIR（其余目录保留）"
+			_cur=$_clean
+		fi
+	fi
+
+	_confdir=$(_dns_confdir_target "$_cur")
+	mkdir -p "$_confdir" 2>/dev/null || die "无法创建 dnsmasq confdir: $_confdir"
+	_out=$_confdir/isp-split.conf
+	[ "$_confdir" = "$DNSDIR" ] || rm -f "$DNSDIR/isp-split.conf" 2>/dev/null || true
 
 	{
 		echo "# 本文件由 isp-split 生成，请勿手工修改"
@@ -897,21 +986,11 @@ cmd_dns() {
 		return 0
 	fi
 
-	# 4) 挂进 dnsmasq 的 conf-dir
-	_cur=$(uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null)
-	case " $_cur " in
-	*" $DNSDIR "*)
-		;;
-	*)
-		uci -q set dhcp.@dnsmasq[0].confdir="$DNSDIR"
-		uci -q commit dhcp
-		log "已把 $DNSDIR 加入 dnsmasq confdir"
-		;;
-	esac
-
+	# 4) 片段已经写进现有 confdir；不再改全局 confdir，避免覆盖
+	#    OpenClash/adblock 等已有目录。原值已记录，卸载时恢复。
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || log "警告：dnsmasq 重启失败"
 
-	log "已生成 $_n 条域名 DNS 规则 -> $_out"
+	log "已生成 $_n 条域名 DNS 规则 -> $_out（confdir: $_confdir，未覆盖原设置）"
 	[ "$_skip" -gt 0 ] && log "有 $_skip 组因缺配置被跳过"
 	echo
 	echo "生成的规则："
@@ -1264,6 +1343,9 @@ cmd_uninstall() {
 	done
 	uci -q commit mwan3
 	/etc/init.d/mwan3 reload >/dev/null 2>&1
+
+	# 恢复 dnsmasq confdir 原值（状态文件在 $BASE 里，必须先恢复再删目录）
+	_restore_dns_confdir
 
 	rm -rf "$BASE"
 	log "已卸载（nft 集合随 mwan3 reload 一并消失）"
