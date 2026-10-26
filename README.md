@@ -14,14 +14,14 @@
 - **运营商网段自动维护**：每日拉取 10 类运营商 IP 段（约 1.3 万条），互斥化后写入 mwan3 的 nftables 集合，无需手工维护
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
-- **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响
+- **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
 - **LuCI 界面**：状态页（命中计数 / 流量 / 策略）+ 配置页（策略映射 / DNS / 域名分流）
-- **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载零残留
+- **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置
 
 ## 环境要求
 
 - OpenWrt 23.05+（firewall4 / 纯 nftables）；在 OpenWrt 25.12.6 (x86_64) 完整验证
-- **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源的 `mwan3` 是 iptables 版，不兼容
+- **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源的 `mwan3` 是 iptables 版，不兼容。安装前可自查：`grep -c render_config_ipsets /lib/mwan3/mwan3.sh`，结果需 ≥ 1；为 0 时请改用 Kwrt 源中的 `mwan3-nft`，或从 [dl12345/mwan3 releases](https://github.com/dl12345/mwan3/releases) 安装 nft 版
 - `nftables`、`curl`；LuCI 页面为可选组件
 
 ## 快速开始
@@ -29,7 +29,7 @@
 ```sh
 # 1. 安装（二选一）
 sh scripts/install.sh --all                       # 从源码目录安装
-apk add --allow-untrusted ./isp-split_*.apk       # 或安装 Release 中的 apk 包
+apk add --allow-untrusted ./isp-split-*.apk       # 或安装 Release 中的 apk 包
 
 # 2. 预检与生效（前两步只读）
 isp-split plan      # 预演：将要做哪些改动
@@ -41,7 +41,9 @@ isp-split verify    # 核对规则渲染
 isp-split status    # 各集合命中计数与流量
 ```
 
-卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`，配置完全还原。
+安装后每日 04:17 自动更新数据（可用 `ISP_CRON` 修改）；以上命令纯命令行即可完成全部操作，LuCI 仅是可选便利。
+
+卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`，会还原 mwan3/dnsmasq 相关改动（配置与数据文件默认保留，可手动删除）。
 
 ## 工作原理
 
@@ -68,7 +70,7 @@ isp-split status    # 各集合命中计数与流量
 | `status` / `verify` / `probe` | 状态 / 渲染核对 / 分线测速 | 无 |
 | `export` | 导出给 mihomo / sing-box | 无 |
 | `stage` / `enable` | 灰度：先注入不渲染，确认后启用 | mwan3 |
-| `uninstall` | 卸载并完全还原 | 全部 |
+| `uninstall` | 卸载并还原 mwan3/dnsmasq 改动 | 全部 |
 
 ## 配置
 
@@ -102,12 +104,12 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 1. 只处理直连流量；代理流量的出口由代理自身决定
 2. CDN 调度依赖 DNS 解析路径，国内域名应走本地 dnsmasq 而非代理远程解析
 3. 数据来自 APNIC/WHOIS 派生，个别骨干段归类有误差
-4. 稳态性能开销接近零；每日一次全量加载约 800 ms（x86_64）
-5. `wire` 直接写 `/etc/config/mwan3`（文本级插入），在 LuCI 保存过 mwan3 后需重跑一次
+4. 稳态性能开销接近零；每日一次全量加载约 800 ms、典型 4 个启用集合约 2300 个元素（x86_64 实测示例，实际随数据源与启用项变化）
+5. `wire` 仍以文本级拼接写入 `/etc/config/mwan3`，但已有三重防护：锚点缺失直接报错（不会追加到链尾）、新文件先放临时目录用 UCI 解析校验、校验通过后原子覆盖并保留备份。在 LuCI 保存过 mwan3 后仍需重跑 `isp-split wire && isp-split apply`
 6. 更新源的 IP 可能落在某个集合里，该线路故障时 `fetch` 会失败
 7. 启用 `othernet` 集合会把公共 DNS 一并分走，该线路故障时导致解析失败（默认关闭）
 8. mwan3 原生的「域名 -> nftset」需要 dnsmasq-full（`no-nftset` 的基础镜像不支持）；本工具的多线路 DNS 不受此限制
-9. 兜底流量的负载均衡由 mwan3 的 `default_rule_v4` 决定，**缺省即启用并参与叠加**（实测：uci 无 enabled 字段时规则照常渲染）。只有当该规则被显式禁用或删除时，兜底流量才走系统默认路由（`status` 会提示）
+9. 兜底流量由 mwan3 的 `default_rule_v4` 决定：**缺省即启用**（mwan3 对 rule 的 `enabled` 缺省=启用）；只有显式禁用或删除该规则时，兜底流量才走系统默认路由（`status` 会提示）
 
 ## 路线图
 
