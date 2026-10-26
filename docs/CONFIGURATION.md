@@ -78,16 +78,28 @@ DNS_MODE="bind"
 
 执行 `isp-split dns` 后：
 
-1. 把 `isp-split.conf` 写进 dnsmasq 现有的 `confdir`（未显式设置时用默认的
-   `/tmp/dnsmasq.d`），不覆盖原值：
+1. 先探测 dnsmasq **实际加载**的 conf-dir，再把 `isp-split.conf` 写进去：
 
    ```
    server=/bilivideo.com/119.29.29.29@wan2
    ```
 
+   探测优先级：`/var/etc/dnsmasq.conf.*` 里的 `conf-dir=` 行（权威源）→
+   运行中 dnsmasq 的 `--conf-dir=` 参数 → UCI
+   `dhcp.@dnsmasq[0].confdir` → 默认 `/tmp/dnsmasq.d`。
+   解析时容忍尾斜杠、空格分隔的多个目录，以及 `conf-dir=<dir>,*.conf`
+   形式的扩展名过滤；多实例的配置会全部读取。
+
+   探测到运行配置（典型场景：OpenClash 接管 DNS，UCI confdir 为空，
+   实际目录是 `/tmp/dnsmasq.cfgXXXX.d`）时**不改写 UCI**，避免 OpenClash
+   关闭后残留一个改变 dnsmasq 加载路径的配置。只有 UCI 本身就是权威源
+   （无运行配置）时才沿用原来的 confdir 处理与状态记录逻辑。
+
 2. 在 `inet mwan3 mwan3_output` 链顶部插入 DNS 出线规则（随 mwan3 重启丢失，`/etc/init.d/isp-split` 会在启动时自动重放）
-3. 重启 dnsmasq；卸载时按安装前记录的原值恢复 `confdir`（旧版本写入的
-   `/etc/isp-split/dnsmasq.d` 会被自动摘除，其余目录保留）
+3. 重启 dnsmasq；卸载时按同一套探测结果清理所有可能目录里的
+   `isp-split.conf`。只有确实改过 UCI 时才有
+   `dnsmasq.confdir.orig` 状态文件，没改过就不动 UCI（旧版本写入的
+   `/etc/isp-split/dnsmasq.d` 仍会被自动摘除）
 
 ### DNS_MODE：bind 与 mark
 
@@ -114,7 +126,7 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 |---|---|---|
 | `ISP_MIRROR` | `https://ispip.clang.cn` | 数据源 |
 | `ISP_CRON` | `17 4 * * *` | 每日更新时间（cron 表达式） |
-| `DNSDIR` | `/etc/isp-split/dnsmasq.d` | dnsmasq 片段目录 |
+| `DNSDIR` | `/etc/isp-split/dnsmasq.d` | 旧版片段目录（仅用于迁移/清理，新版本不再写入） |
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
 | `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |

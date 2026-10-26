@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
 PKG_VERSION:=0.1.3
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk
@@ -78,6 +78,21 @@ if [ -f "$$_state" ]; then
 	uci -q commit dhcp 2>/dev/null || true
 	rm -f "$$_state"
 fi
+# BUG-6：OpenClash 接管时 dnsmasq 实际加载的是 /var/etc/dnsmasq.conf.*
+# 里 conf-dir= 指向的目录，必须按同一来源清理，不能只删 /tmp/dnsmasq.d。
+for _f in /var/etc/dnsmasq.conf.*; do
+	[ -f "$$_f" ] || continue
+	sed -n 's/^[[:space:]]*conf-dir=//p' "$$_f" 2>/dev/null |
+	while IFS= read -r _line; do
+		for _d in $$_line; do
+			_d=$${_d%%,*}
+			while [ "$$_d" != "/" ] && [ "$${_d%/}" != "$$_d" ]; do
+				_d=$${_d%/}
+			done
+			[ -n "$$_d" ] && rm -f "$$_d/isp-split.conf" 2>/dev/null || true
+		done
+	done
+done
 rm -f /tmp/dnsmasq.d/isp-split.conf /etc/isp-split/dnsmasq.d/isp-split.conf 2>/dev/null || true
 rm -rf /etc/isp-split 2>/dev/null || true
 exit 0

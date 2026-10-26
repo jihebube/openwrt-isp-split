@@ -427,6 +427,104 @@ else
 	ok "未知配置项退出码非 0"
 fi
 
+echo "== 7. dnsmasq 实际 conf-dir 探测（BUG-6）"
+# 模拟生产实机：UCI confdir 为空，但 /var/etc/dnsmasq.conf.cfgXXXX 里
+# 写着 conf-dir=/tmp/dnsmasq.cfgXXXX.d（OpenClash 接管 DNS 的形态）。
+mkdir -p "$TMP/bug6/fakebin" "$TMP/bug6/var/etc" \
+	"$TMP/bug6/run/cfg01411c.d" "$TMP/bug6/run/other.d" \
+	"$TMP/bug6/run/default.d" "$TMP/bug6/run/legacy.d" "$TMP/bug6/run/uci.d"
+cat > "$TMP/bug6/fakebin/uci" <<'FAKE_UCI'
+#!/bin/sh
+[ -n "${FAKE_UCI_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_UCI_LOG"
+if [ -n "${FAKE_UCI_CONFDIR:-}" ]; then
+	case "$*" in
+	*"get dhcp.@dnsmasq[0].confdir"*)
+		printf '%s\n' "$FAKE_UCI_CONFDIR"
+		exit 0
+		;;
+	esac
+fi
+exit 1
+FAKE_UCI
+chmod +x "$TMP/bug6/fakebin/uci"
+cat > "$TMP/bug6/conf" <<'BUG6_CONF'
+ISP_TABLE=""
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+BUG6_CONF
+cat > "$TMP/bug6/var/etc/dnsmasq.conf.cfg01411c" <<EOF
+# dnsmasq 实际运行配置（OpenClash 生成）
+conf-dir=$TMP/bug6/run/cfg01411c.d/
+conf-dir=$TMP/bug6/run/other.d,*.conf
+EOF
+
+_bug6_detect() {
+	# $1 = runtime glob；$2 = fake uci confdir
+	(
+		PATH="$TMP/bug6/fakebin:$TMP/fakebin:$PATH"
+		ISP_SPLIT_CONF="$TMP/bug6/conf"
+		ISP_SPLIT_BASE="$TMP/bug6/base"
+		DNSMASQ_CONF_GLOB="$1"
+		DNSMASQ_DEFAULT_DIR="$TMP/bug6/run/default.d"
+		DNSDIR="$TMP/bug6/run/legacy.d"
+		FAKE_UCI_CONFDIR="$2"
+		FAKE_UCI_LOG="$TMP/bug6/uci.log"
+		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB \
+			DNSMASQ_DEFAULT_DIR DNSDIR FAKE_UCI_CONFDIR FAKE_UCI_LOG
+		. "$TMP/isp-lib.sh"
+		_dns_confdir_detect >/dev/null
+		printf '%s|%s|%s\n' "$DNS_CONFDIR_SOURCE" "$DNS_CONFDIR_DIRS" \
+			"$(_dns_confdir_first "$DNS_CONFDIR_DIRS")"
+	)
+}
+
+_bug6_out=$(_bug6_detect "$TMP/bug6/var/etc/dnsmasq.conf.*" "")
+_bug6_expect="runtime|$TMP/bug6/run/cfg01411c.d $TMP/bug6/run/other.d|$TMP/bug6/run/cfg01411c.d"
+if [ "$_bug6_out" = "$_bug6_expect" ]; then
+	ok "UCI 为空时按实际运行配置选目录（含尾斜杠/多目录）: ${_bug6_out#*|}"
+else
+	ng "conf-dir 探测结果错误: $_bug6_out（期望: $_bug6_expect）"
+fi
+
+# 无 /var/etc 运行配置时，UCI 仍是权威源（测试机无 OpenClash 不回归）。
+_bug6_uci=$(_bug6_detect "$TMP/bug6/empty.dnsmasq.conf.*" "$TMP/bug6/run/uci.d")
+_bug6_uci_expect="uci|$TMP/bug6/run/uci.d|$TMP/bug6/run/uci.d"
+if [ "$_bug6_uci" = "$_bug6_uci_expect" ]; then
+	ok "无运行配置时回落到 UCI confdir"
+else
+	ng "UCI 回落结果错误: $_bug6_uci（期望: $_bug6_uci_expect）"
+fi
+
+# 卸载：探测路径下没有状态文件，也必须按探测结果删片段，且不碰 UCI。
+for _d in cfg01411c.d other.d default.d legacy.d; do
+	: > "$TMP/bug6/run/$_d/isp-split.conf"
+done
+rm -f "$TMP/bug6/uci.log"
+(
+	PATH="$TMP/bug6/fakebin:$TMP/fakebin:$PATH"
+	ISP_SPLIT_CONF="$TMP/bug6/conf"
+	ISP_SPLIT_BASE="$TMP/bug6/base"
+	DNSMASQ_CONF_GLOB="$TMP/bug6/var/etc/dnsmasq.conf.*"
+	DNSMASQ_DEFAULT_DIR="$TMP/bug6/run/default.d"
+	DNSDIR="$TMP/bug6/run/legacy.d"
+	FAKE_UCI_CONFDIR=""
+	FAKE_UCI_LOG="$TMP/bug6/uci.log"
+	export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB \
+		DNSMASQ_DEFAULT_DIR DNSDIR FAKE_UCI_CONFDIR FAKE_UCI_LOG
+	. "$TMP/isp-lib.sh"
+	_restore_dns_confdir
+)
+_bug6_left=""
+for _d in cfg01411c.d other.d default.d legacy.d; do
+	[ -e "$TMP/bug6/run/$_d/isp-split.conf" ] && _bug6_left="$_bug6_left $_d"
+done
+if [ -z "$_bug6_left" ] && ! grep -qE ' (set|delete|commit)( |$)' "$TMP/bug6/uci.log" 2>/dev/null; then
+	ok "卸载按探测结果清理全部片段，且未改写 UCI"
+else
+	ng "卸载清理异常：残留${_bug6_left:- 无}，uci 调用: $(tr '\n' ';' < "$TMP/bug6/uci.log" 2>/dev/null)"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]

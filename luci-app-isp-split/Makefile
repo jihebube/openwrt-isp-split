@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-isp-split
 PKG_VERSION:=0.1.3
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk

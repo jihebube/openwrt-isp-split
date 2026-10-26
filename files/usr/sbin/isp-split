@@ -667,16 +667,41 @@ cmd_plan() {
 
 	echo
 	echo "dnsmasq confdir（多线路 DNS 片段写入位置）:"
+	# 只读探测：不写 UCI、不写文件。
+	_dns_confdir_detect >/dev/null
 	_cur=$(_dns_confdir_get)
 	_clean=$(_dns_confdir_clean "$_cur")
-	_confdir=$(_dns_confdir_target "$_clean")
-	if [ "$_clean" = "$_cur" ]; then
-		echo "  当前值: ${_cur:-（未设置，dnsmasq 默认 /tmp/dnsmasq.d）}"
-		echo "  将修改 confdir: 否（片段写入 $_confdir，不覆盖原值）"
-	else
+	_confdir=$(_dns_confdir_first "$DNS_CONFDIR_DIRS")
+	case "$DNS_CONFDIR_SOURCE" in
+	runtime)
+		echo "  将写入 dnsmasq 实际加载目录: $_confdir"
+		echo "  探测自: $DNS_CONFDIR_DETAIL（运行配置优先于 UCI${_cur:+；UCI 当前值 $_cur}${_cur:-；UCI confdir 未设置}）"
+		if [ -z "$_cur" ]; then
+			echo "  说明: UCI confdir 未设置，dnsmasq 实际加载目录由运行配置决定"
+			echo "        （OpenClash 接管 DNS 时即为 /tmp/dnsmasq.<实例>.d）；不做改动。"
+		else
+			echo "  说明: 以运行配置为准，不改写 UCI confdir（避免 OpenClash 关闭后残留）。"
+		fi
+		;;
+	ps)
+		echo "  将写入 dnsmasq 实际加载目录: $_confdir"
+		echo "  探测自: 运行中的 dnsmasq 进程参数（--conf-dir，优先级高于 UCI）"
+		echo "  说明: 不改写 UCI confdir（UCI 当前值: ${_cur:-未设置}）。"
+		;;
+	uci)
 		echo "  当前值: ${_cur:-（未设置）}"
-		echo "  将修改 confdir: ${_clean:-（删除该项，回到默认 /tmp/dnsmasq.d）}"
-	fi
+		echo "  探测来源: UCI dhcp.@dnsmasq[0].confdir"
+		if [ "$_clean" != "$_cur" ]; then
+			echo "  将修改 confdir: ${_clean:-（删除该项，回到默认 $DNSMASQ_DEFAULT_DIR）}（移除旧版写入的 $DNSDIR）"
+		else
+			echo "  将修改 confdir: 否（片段写入 $_confdir，不覆盖原值）"
+		fi
+		;;
+	*)
+		echo "  当前值: 未设置；未发现 dnsmasq 实际运行配置"
+		echo "  将使用默认目录: $DNSMASQ_DEFAULT_DIR（不修改 UCI confdir）"
+		;;
+	esac
 
 	echo
 	echo "将会写入的 nft 集合声明（每个启用的运营商一个）:"
@@ -914,6 +939,11 @@ cmd_probe() {
 # ---------------------------------------------------------------- dns
 
 DNSDIR=${DNSDIR:-/etc/isp-split/dnsmasq.d}
+# dnsmasq 未显式配置 confdir 时的默认目录。允许覆盖仅用于离线自检。
+DNSMASQ_DEFAULT_DIR=${DNSMASQ_DEFAULT_DIR:-/tmp/dnsmasq.d}
+# dnsmasq 实际运行配置的 glob（OpenWrt 为 /var/etc/dnsmasq.conf.<uci section>）。
+# 允许覆盖仅用于离线自检；生产环境不要设置。
+DNSMASQ_CONF_GLOB=${DNSMASQ_CONF_GLOB:-/var/etc/dnsmasq.conf.*}
 DNS_STATE=$BASE/state
 # 多线路 DNS 的出线方式：
 #   bind = server=/域名/IP@接口（dnsmasq 的 SO_BINDTODEVICE，只有 dnsmasq 支持）
@@ -925,16 +955,32 @@ DNS_MODE=${DNS_MODE:-bind}
 COUNT_FALLBACK=${COUNT_FALLBACK:-1}
 DOMAINDIR=${DOMAIN_LIST_DIR:-${DOMAINDIR:-/etc/isp-split/domains}}
 
-# ---- dnsmasq confdir：只写现有目录，绝不整体覆盖 ----
+# ---- dnsmasq confdir：探测"实际加载目录"，绝不整体覆盖 ----
 # 历史版本曾把 dhcp.@dnsmasq[0].confdir 直接改成 $DNSDIR，导致
-# OpenClash/adblock 等放在 /tmp/dnsmasq.d 的片段全部失效。现在改为：
-#   · 优先写到现有 confdir 的第一个目录（未设置时用 dnsmasq 默认 /tmp/dnsmasq.d）
-#   · 首次运行时把原值记到 $DNS_STATE，卸载时恢复
-#   · 若发现旧版本写入的 $DNSDIR，只把它从列表里摘掉，其余目录原样保留
+# OpenClash/adblock 等放在 /tmp/dnsmasq.d 的片段全部失效。
+#
+# BUG-6：OpenClash 接管 DNS 时，UCI 的 confdir 可能为空，但 dnsmasq init
+# 生成的 /var/etc/dnsmasq.conf.cfgXXXX 里写着 conf-dir=/tmp/dnsmasq.cfgXXXX.d。
+# 只信 UCI 会把片段写进没人加载的 /tmp/dnsmasq.d，分线 DNS 静默失效。
+# 因此按以下优先级探测：
+#   a. /var/etc/dnsmasq.conf.* 里的 conf-dir= 行（权威源，可能有多个实例/目录）
+#   b. 运行中 dnsmasq 进程的 --conf-dir= 参数（busybox ps 取不到时跳过）
+#   c. UCI dhcp.@dnsmasq[0].confdir（兼容没有 /var/etc 的环境）
+#   d. 默认 $DNSMASQ_DEFAULT_DIR
+#
+# _dns_confdir_detect 设置三个全局变量并打印目录（每行一个）：
+#   DNS_CONFDIR_SOURCE = runtime | ps | uci | default
+#   DNS_CONFDIR_DETAIL = 来源细节（实际运行配置文件 / ps / uci）
+#   DNS_CONFDIR_DIRS   = 空格分隔的目录列表
+#
+# 重要：探测到 runtime/ps 目录时，dns 子命令不再改写 UCI confdir。
+# OpenClash 关闭后 UCI 里若残留一个"看起来合理"的 confdir，反而会改变
+# dnsmasq 的加载路径。UCI 只在它本身就是权威源时（有值且无运行配置）才处理。
 _dns_confdir_get() {
 	uci -q get dhcp.@dnsmasq[0].confdir 2>/dev/null || true
 }
 
+# 去掉旧版本写入的 $DNSDIR，其余目录原样保留。
 _dns_confdir_clean() {
 	_clean_in=${1:-}
 	_clean_out=""
@@ -943,6 +989,143 @@ _dns_confdir_clean() {
 		_clean_out="${_clean_out:+$_clean_out }$_clean_d"
 	done
 	printf '%s\n' "$_clean_out"
+}
+
+# 解析一个 conf-dir= 的值：容忍尾斜杠、空格分隔的多个目录、逗号后的
+# 文件扩展名过滤（dnsmasq 的 conf-dir=<dir>[,<ext>...] 语法），并去重。
+_dns_confdir_parse() {
+	_parse_out=""
+	for _parse_tok in ${1:-}; do
+		_parse_dir=${_parse_tok%%,*}
+		case "$_parse_dir" in
+		\"*\") _parse_dir=${_parse_dir#\"}; _parse_dir=${_parse_dir%\"} ;;
+		\'*\') _parse_dir=${_parse_dir#\'}; _parse_dir=${_parse_dir%\'} ;;
+		esac
+		while [ "$_parse_dir" != "/" ] && [ "${_parse_dir%/}" != "$_parse_dir" ]; do
+			_parse_dir=${_parse_dir%/}
+		done
+		[ -n "$_parse_dir" ] || continue
+		case " $_parse_out " in
+		*" $_parse_dir "*) continue ;;
+		esac
+		_parse_out="${_parse_out:+$_parse_out }$_parse_dir"
+	done
+	printf '%s\n' "$_parse_out"
+}
+
+_dns_confdir_detect_emit() {
+	for _emit_d in ${DNS_CONFDIR_DIRS:-}; do
+		printf '%s\n' "$_emit_d"
+	done
+}
+
+_dns_confdir_detect() {
+	DNS_CONFDIR_SOURCE=""
+	DNS_CONFDIR_DETAIL=""
+	DNS_CONFDIR_DIRS=""
+
+	# a) 权威源：dnsmasq 实际运行配置。glob 可能匹配多个实例，逐个读。
+	_dcd_dirs=""
+	_dcd_files=""
+	for _dcd_f in $DNSMASQ_CONF_GLOB; do
+		[ -f "$_dcd_f" ] || continue
+		_dcd_file_used=0
+		while IFS= read -r _dcd_line || [ -n "$_dcd_line" ]; do
+			_dcd_line=$(printf '%s' "$_dcd_line" | tr -d '\r' |
+				sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+			case "$_dcd_line" in
+			conf-dir=*) _dcd_val=${_dcd_line#conf-dir=} ;;
+			*) continue ;;
+			esac
+			# 容忍行尾注释（目录名里出现 # 的极端情况不支持）。
+			_dcd_val=${_dcd_val%%#*}
+			_dcd_parsed=$(_dns_confdir_parse "$_dcd_val")
+			for _dcd_d in $_dcd_parsed; do
+				case " $_dcd_dirs " in
+				*" $_dcd_d "*) continue ;;
+				esac
+				_dcd_dirs="${_dcd_dirs:+$_dcd_dirs }$_dcd_d"
+				_dcd_file_used=1
+			done
+		done < "$_dcd_f"
+		[ "$_dcd_file_used" = "1" ] || continue
+		_dcd_files="${_dcd_files:+$_dcd_files }$_dcd_f"
+	done
+	if [ -n "$_dcd_dirs" ]; then
+		DNS_CONFDIR_SOURCE=runtime
+		DNS_CONFDIR_DETAIL=$_dcd_files
+		DNS_CONFDIR_DIRS=$_dcd_dirs
+		_dns_confdir_detect_emit
+		return 0
+	fi
+
+	# b) 兜底：运行中的 dnsmasq 进程参数。busybox ps 默认截断命令行，
+	#    "ps w" 在 OpenWrt 上能取到完整参数；取不到就继续往下走。
+	_dcd_ps=$(ps w 2>/dev/null || ps 2>/dev/null || true)
+	if [ -n "$_dcd_ps" ]; then
+		_dcd_ps_vals=$(printf '%s\n' "$_dcd_ps" | awk '
+			/dnsmasq/ {
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^--conf-dir=/) print substr($i, 12)
+					else if ($i == "--conf-dir" && i < NF) print $(i + 1)
+				}
+			}')
+		_dcd_parsed=$(_dns_confdir_parse "$_dcd_ps_vals")
+		if [ -n "$_dcd_parsed" ]; then
+			DNS_CONFDIR_SOURCE=ps
+			DNS_CONFDIR_DETAIL="ps dnsmasq --conf-dir"
+			DNS_CONFDIR_DIRS=$_dcd_parsed
+			_dns_confdir_detect_emit
+			return 0
+		fi
+	fi
+
+	# c) UCI。注意：即使值里只有旧版的 $DNSDIR，也要让 source=uci，
+	#    这样 cmd_dns 能按现状逻辑把旧目录从 UCI 里摘掉（可能摘成空列表）。
+	_dcd_uci=$(_dns_confdir_get)
+	if [ -n "$_dcd_uci" ]; then
+		DNS_CONFDIR_SOURCE=uci
+		DNS_CONFDIR_DETAIL="uci dhcp.@dnsmasq[0].confdir"
+		DNS_CONFDIR_DIRS=$(_dns_confdir_clean "$_dcd_uci")
+		_dns_confdir_detect_emit
+		return 0
+	fi
+
+	# d) 都没有：dnsmasq 默认目录。
+	DNS_CONFDIR_SOURCE=default
+	DNS_CONFDIR_DETAIL="dnsmasq 默认目录"
+	DNS_CONFDIR_DIRS=$DNSMASQ_DEFAULT_DIR
+	_dns_confdir_detect_emit
+}
+
+# 探测结果里的第一个目录就是写入目标；列表为空时回落默认目录。
+_dns_confdir_first() {
+	_first_list=${1:-${DNS_CONFDIR_DIRS:-}}
+	for _first_d in $_first_list; do
+		printf '%s\n' "$_first_d"
+		return 0
+	done
+	printf '%s\n' "$DNSMASQ_DEFAULT_DIR"
+}
+
+# 兼容旧调用点：参数为目录列表，缺省用最近一次探测结果。
+_dns_confdir_target() {
+	_dns_confdir_first "${1:-}"
+}
+
+# 所有可能残留 isp-split.conf 的目录：探测结果 + UCI 当前值 + 默认目录
+# + 旧版目录。去重后输出。卸载/重写时用它做彻底清理。
+_dns_confdir_candidates() {
+	_cand_out=""
+	for _cand_d in ${DNS_CONFDIR_DIRS:-} $(_dns_confdir_get) \
+		"$DNSMASQ_DEFAULT_DIR" "$DNSDIR"; do
+		[ -n "$_cand_d" ] || continue
+		case " $_cand_out " in
+		*" $_cand_d "*) continue ;;
+		esac
+		_cand_out="${_cand_out:+$_cand_out }$_cand_d"
+	done
+	printf '%s\n' "$_cand_out"
 }
 
 _dns_confdir_set() {
@@ -954,29 +1137,28 @@ _dns_confdir_set() {
 	uci -q commit dhcp
 }
 
-_dns_confdir_target() {
-	for _target_d in ${1:-}; do
-		printf '%s\n' "$_target_d"
-		return 0
-	done
-	printf '/tmp/dnsmasq.d\n'
-}
-
 _restore_dns_confdir() {
 	_state=$DNS_STATE/dnsmasq.confdir.orig
+
+	# 无论有没有状态文件，都按探测结果把所有可能被 dnsmasq 加载的目录
+	# 清一遍。探测路径（OpenClash）下 cmd_dns 不再写状态文件，不能因为
+	# 状态文件不存在就跳过清理。
+	_dns_confdir_detect >/dev/null 2>&1
+	for _d in $(_dns_confdir_candidates); do
+		rm -f "$_d/isp-split.conf" 2>/dev/null || true
+	done
+
+	# 只有真的改过 UCI 才有状态文件；没改过就不碰 UCI。
 	[ -f "$_state" ] || return 0
 	_orig=$(cat "$_state" 2>/dev/null || true)
 	_cur=$(_dns_confdir_get)
-	for _d in $_cur /tmp/dnsmasq.d "$DNSDIR"; do
-		rm -f "$_d/isp-split.conf" 2>/dev/null || true
-	done
 	if [ -n "$_orig" ]; then
 		if [ "$_cur" != "$_orig" ]; then
 			_dns_confdir_set "$_orig" && log "已恢复 dnsmasq confdir=$_orig"
 		fi
 	else
 		if [ -n "$_cur" ]; then
-			_dns_confdir_set "" && log "已恢复 dnsmasq confdir（默认 /tmp/dnsmasq.d）"
+			_dns_confdir_set "" && log "已恢复 dnsmasq confdir（默认 $DNSMASQ_DEFAULT_DIR）"
 		fi
 	fi
 	rm -f "$_state"
@@ -1243,24 +1425,50 @@ cmd_dns() {
 	need_nft
 	mkdir -p "$DNS_STATE" "$DOMAINDIR"
 
-	# 首次运行时记录原始 confdir；旧版本若把 confdir 改成了 $DNSDIR，
-	# 这里只摘掉 $DNSDIR，保留用户原有的其它目录。
-	_state=$DNS_STATE/dnsmasq.confdir.orig
+	# 先探测 dnsmasq 真正加载的目录。runtime/ps 是权威源；只有落到 UCI
+	# 时才沿用"首次记录原值、迁移旧版 $DNSDIR"的现状逻辑。
+	_dns_confdir_detect >/dev/null
 	_cur=$(_dns_confdir_get)
-	if [ ! -f "$_state" ]; then
+	_state=$DNS_STATE/dnsmasq.confdir.orig
+	_uci_note="未改写 UCI confdir"
+	case "$DNS_CONFDIR_SOURCE" in
+	uci)
 		_clean=$(_dns_confdir_clean "$_cur")
-		printf '%s\n' "$_clean" > "$_state" || die "无法保存 dnsmasq confdir 状态"
 		if [ "$_clean" != "$_cur" ]; then
-			_dns_confdir_set "$_clean" || die "无法迁移 dnsmasq confdir"
+			# 只有真的要改 UCI 时才写状态文件；没改过就什么都不留，
+			# 卸载时也不会去碰 UCI。
+			_new_state=0
+			if [ ! -f "$_state" ]; then
+				printf '%s\n' "$_clean" > "$_state" ||
+					die "无法保存 dnsmasq confdir 状态"
+				_new_state=1
+			fi
+			if ! _dns_confdir_set "$_clean"; then
+				[ "$_new_state" = "0" ] || rm -f "$_state"
+				die "无法迁移 dnsmasq confdir"
+			fi
 			log "已从 confdir 移除旧版写入的 $DNSDIR（其余目录保留）"
 			_cur=$_clean
+			DNS_CONFDIR_DIRS=$_clean
+			_uci_note="已迁移 UCI confdir"
 		fi
-	fi
+		;;
+	*)
+		# runtime/ps/default：OpenClash 等接管时 UCI 是摆设，
+		# 不改写它，也不为"未发生的修改"留状态文件。
+		;;
+	esac
 
-	_confdir=$(_dns_confdir_target "$_cur")
+	_confdir=$(_dns_confdir_first "$DNS_CONFDIR_DIRS")
 	mkdir -p "$_confdir" 2>/dev/null || die "无法创建 dnsmasq confdir: $_confdir"
 	_out=$_confdir/isp-split.conf
-	[ "$_confdir" = "$DNSDIR" ] || rm -f "$DNSDIR/isp-split.conf" 2>/dev/null || true
+
+	# 旧版本可能把片段留在 /tmp/dnsmasq.d 或旧 $DNSDIR；换目录时清掉
+	# 所有候选位置里的旧片段，避免 dnsmasq 同时加载两份规则。
+	for _old_dir in $(_dns_confdir_candidates); do
+		[ "$_old_dir" = "$_confdir" ] && continue
+		rm -f "$_old_dir/isp-split.conf" 2>/dev/null || true
+	done
 
 	{
 		echo "# 本文件由 isp-split 生成，请勿手工修改"
@@ -1349,11 +1557,11 @@ cmd_dns() {
 		return 0
 	fi
 
-	# 4) 片段已经写进现有 confdir；不再改全局 confdir，避免覆盖
-	#    OpenClash/adblock 等已有目录。原值已记录，卸载时恢复。
+	# 4) 片段已经写进探测到的目录；runtime/ps 路径不改 UCI，避免覆盖
+	#    OpenClash/adblock 等接管配置。卸载时按同一探测结果清理。
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || log "警告：dnsmasq 重启失败"
 
-	log "已生成 $_n 条域名 DNS 规则 -> $_out（confdir: $_confdir，未覆盖原设置）"
+	log "已生成 $_n 条域名 DNS 规则 -> $_out（confdir: $_confdir，来源: $DNS_CONFDIR_SOURCE，$_uci_note）"
 	[ "$_skip" -gt 0 ] && log "有 $_skip 组因缺配置被跳过"
 	echo
 	echo "生成的规则："
