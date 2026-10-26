@@ -36,7 +36,7 @@ chmod 755 "$WORK/data/usr/sbin/isp-split" \
 cat > "$WORK/control/control" <<EOF
 Package: $PKG
 Version: $VER-$REL
-Depends: mwan3, nftables, curl
+Depends: nftables, curl
 Source: https://github.com/jihebube/openwrt-isp-split
 SourceName: $PKG
 License: MIT
