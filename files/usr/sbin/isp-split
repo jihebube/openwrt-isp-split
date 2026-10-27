@@ -1977,12 +1977,19 @@ cmd_conf() {
 # 需要把同一份数据交给 mihomo / sing-box。
 #
 #   mihomo / OpenClash : rule-provider，behavior=ipcidr，format=yaml
-#   sing-box           : rule_set，type=local，format=source（JSON 数组）
+#   sing-box           : rule_set，type=local，format=source
+#                        （必须是 {"version":1,"rules":[{"ip_cidr":[...]}]}）
 cmd_export() {
 	_fmt=${1:-}
 	_dir=${2:-}
 	[ -n "$_fmt" ] || die "用法: isp-split export <mihomo|singbox|text> <输出目录>"
 	[ -n "$_dir" ] || die "用法: isp-split export <mihomo|singbox|text> <输出目录>"
+	# 先校验格式再建目录：旧写法先 mkdir 后报错，一次手误就留下空目录，
+	# 而且格式非法时报的是"没有可导出的数据"，完全指错方向。
+	case "$_fmt" in
+	mihomo | singbox | text) ;;
+	*) die "未知格式 '$_fmt'，可选 mihomo / singbox / text" ;;
+	esac
 	mkdir -p "$_dir" || die "无法创建 $_dir"
 
 	_n=0
@@ -2006,8 +2013,15 @@ cmd_export() {
 			;;
 		singbox)
 			_out="$_dir/isp-$_src.json"
-			awk 'NR > 1 { printf ",\n" } { printf "\"%s\"", $0 } END { print "" }' "$_f" |
-				{ printf '[\n'; cat; printf '\n]\n'; } > "$_out"
+			# sing-box 的 source 格式是对象，不是裸数组：
+			#   {"version":1,"rules":[{"ip_cidr":["10.0.0.0/8", ...]}]}
+			# 裸 JSON 字符串数组是 mihomo/Clash 的 payload 格式，
+			# sing-box 读它会直接报 decode rule-set 启动失败。
+			{
+				printf '{\n  "version": 1,\n  "rules": [\n    { "ip_cidr": [\n'
+				awk 'NR > 1 { printf ",\n" } { printf "      \"%s\"", $0 }' "$_f"
+				printf '\n    ] }\n  ]\n}\n'
+			} > "$_out"
 			;;
 		text)
 			_out="$_dir/isp-$_src.txt"
@@ -2079,8 +2093,9 @@ sing-box 用法：
   }
 }
 
-注意：sing-box 的 local source 规则集要求 JSON 字符串数组，
-本工具导出的正是该格式。
+注意：sing-box 的 local source 规则集是对象格式
+      {"version":1,"rules":[{"ip_cidr":[...]}]}，本工具导出的正是该格式。
+      裸 JSON 数组（mihomo 的 payload 格式）sing-box 不接受。
 EOF
 		;;
 	esac
