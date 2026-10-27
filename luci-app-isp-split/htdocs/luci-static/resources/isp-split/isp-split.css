@@ -14,7 +14,9 @@
 	--isp-card-bg-2: var(--background-color-medium, rgba(128, 128, 128, 0.12));
 	--isp-border: var(--border-color-low, rgba(128, 128, 128, 0.28));
 	--isp-border-strong: var(--border-color-medium, rgba(128, 128, 128, 0.45));
-	--isp-muted: var(--text-color-low, rgba(128, 128, 128, 0.95));
+	/* 次要文字用 --text-color-medium：原来的 --text-color-low 是主题里的边框/禁用色
+	   （浅色 #bfbfbf、深色 #404040），深色主题下正文对比度只有 1.5:1，几乎看不见。 */
+	--isp-muted: var(--text-color-medium, rgba(128, 128, 128, 0.95));
 	--isp-text: var(--text-color-high, inherit);
 	--isp-primary: var(--primary-color-high, currentColor);
 	--isp-ok: var(--success-color-high, currentColor);
