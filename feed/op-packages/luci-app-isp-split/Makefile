@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-isp-split
-PKG_VERSION:=0.1.5
-PKG_RELEASE:=2
+PKG_VERSION:=0.2.0
+PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=jihebube <jihebube@users.noreply.github.com>
@@ -29,6 +29,9 @@ endef
 
 define Package/luci-app-isp-split/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/isp-split
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/isp-split
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/isp-split/isp-split.css \
+		$(1)/www/luci-static/resources/isp-split/isp-split.css
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/isp-split/overview.js \
 		$(1)/www/luci-static/resources/view/isp-split/overview.js
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/isp-split/config.js \

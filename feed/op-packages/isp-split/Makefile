@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
-PKG_VERSION:=0.1.5
-PKG_RELEASE:=2
+PKG_VERSION:=0.2.0
+PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=jihebube <jihebube@users.noreply.github.com>
@@ -64,8 +64,12 @@ case "$${1:-}" in
 	upgrade|pre-upgrade|*upgrade*) exit 0 ;;
 esac
 if [ -f /etc/crontabs/root ]; then
-	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron.$$$$ 2>/dev/null || true
-	mv /tmp/.ispcron.$$$$ /etc/crontabs/root 2>/dev/null || true
+	# mktemp 而不是 /tmp/.ispcron.$$：PID 可预测，符号链接能抢占（SEC-1）
+	_cron_tmp=$$(mktemp /etc/.isp-split-cron.XXXXXX) || _cron_tmp=""
+	if [ -n "$$_cron_tmp" ]; then
+		grep -v 'isp-split' /etc/crontabs/root > "$$_cron_tmp" 2>/dev/null || true
+		mv -f "$$_cron_tmp" /etc/crontabs/root 2>/dev/null || rm -f "$$_cron_tmp"
+	fi
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 fi
 nft delete counter inet mwan3 isp_fallback >/dev/null 2>&1 || true
@@ -119,6 +123,7 @@ define Package/isp-split/install
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/range2cidr.awk $(1)/usr/lib/isp-split/range2cidr.awk
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/rules-splice.awk $(1)/usr/lib/isp-split/rules-splice.awk
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/badcidr.awk $(1)/usr/lib/isp-split/badcidr.awk
+	$(INSTALL_DATA) ./files/usr/lib/isp-split/ispdiff.awk $(1)/usr/lib/isp-split/ispdiff.awk
 	$(INSTALL_CONF) ./files/etc/isp-split.conf $(1)/etc/isp-split.conf
 endef
 

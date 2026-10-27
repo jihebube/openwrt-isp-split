@@ -1,0 +1,660 @@
+/*
+ * openwrt-isp-split — LuCI 页面样式（原生 CSS，无框架、无外链）
+ *
+ * 配色原则：
+ *   · 背景/边框/文字全部走 LuCI 主题变量（--background-color-*、--border-color-*、
+ *     --text-color-*、--primary-color-*），深浅色主题自动跟随；
+ *   · 只有"运营商身份色"（电信蓝/联通红/移动绿/教育网紫）是固定色相，
+ *     统一收敛成 --isp-accent-* 变量，主题作者可以在 theme 里覆盖；
+ *   · 阴影只用中性黑（透明度很低），两种主题下都不会突兀。
+ */
+
+.isp-app {
+	--isp-card-bg: var(--background-color-high, rgba(128, 128, 128, 0.07));
+	--isp-card-bg-2: var(--background-color-medium, rgba(128, 128, 128, 0.12));
+	--isp-border: var(--border-color-low, rgba(128, 128, 128, 0.28));
+	--isp-border-strong: var(--border-color-medium, rgba(128, 128, 128, 0.45));
+	--isp-muted: var(--text-color-low, rgba(128, 128, 128, 0.95));
+	--isp-text: var(--text-color-high, inherit);
+	--isp-primary: var(--primary-color-high, currentColor);
+	--isp-ok: var(--success-color-high, currentColor);
+	--isp-warn: var(--warn-color-high, currentColor);
+	--isp-bad: var(--error-color-high, currentColor);
+
+	--isp-accent-tel: #2f6fd0;
+	--isp-accent-uni: #d0362f;
+	--isp-accent-cmcc: #2e9e5b;
+	--isp-accent-cernet: #8a5cd6;
+	--isp-accent-other: #8a8a8a;
+
+	--isp-radius: 14px;
+	--isp-shadow: 0 1px 2px rgba(0, 0, 0, 0.10), 0 4px 12px rgba(0, 0, 0, 0.06);
+}
+
+.isp-app * {
+	box-sizing: border-box;
+}
+
+/* ---------------------------------------------------------------- 头部 */
+
+.isp-hero {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 10px;
+	margin: 0 0 14px 0;
+}
+
+.isp-hero h2 {
+	margin: 0;
+	font-size: 1.35rem;
+	font-weight: 600;
+	color: var(--isp-text);
+}
+
+.isp-hero .isp-sub {
+	flex: 1 1 260px;
+	min-width: 200px;
+	color: var(--isp-muted);
+	font-size: 0.86rem;
+	line-height: 1.45;
+}
+
+.isp-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	align-items: center;
+}
+
+.isp-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 10px;
+	border-radius: 999px;
+	background: var(--isp-card-bg-2);
+	border: 1px solid var(--isp-border);
+	font-size: 0.78rem;
+	color: var(--isp-muted);
+	white-space: nowrap;
+}
+
+.isp-pill .isp-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--isp-ok);
+}
+
+.isp-pill.is-paused .isp-dot {
+	background: var(--isp-warn);
+}
+
+/* ---------------------------------------------------------------- 卡片网格 */
+
+.isp-cards {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 12px;
+	margin-bottom: 12px;
+}
+
+.isp-grid-2 {
+	display: grid;
+	grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+	gap: 12px;
+	margin-bottom: 12px;
+}
+
+.isp-grid-3 {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 12px;
+	margin-bottom: 12px;
+}
+
+.isp-card {
+	position: relative;
+	background: var(--isp-card-bg);
+	border: 1px solid var(--isp-border);
+	border-radius: var(--isp-radius);
+	box-shadow: var(--isp-shadow);
+	padding: 14px 16px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.isp-card > h3 {
+	margin: 0 0 10px 0;
+	font-size: 0.92rem;
+	font-weight: 600;
+	color: var(--isp-muted);
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+/* 运营商卡片：顶部身份色条 */
+.isp-card-op {
+	padding-top: 18px;
+}
+
+.isp-card-op::before {
+	content: "";
+	position: absolute;
+	inset: 0 0 auto 0;
+	height: 4px;
+	background: var(--isp-accent, var(--isp-accent-other));
+}
+
+.isp-card-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 6px;
+}
+
+.isp-op-name {
+	font-size: 0.98rem;
+	font-weight: 600;
+	color: var(--isp-text);
+	letter-spacing: 0.02em;
+}
+
+.isp-op-ico {
+	display: inline-flex;
+	color: var(--isp-accent, var(--isp-accent-other));
+	opacity: 0.9;
+}
+
+.isp-big {
+	display: inline-block;
+	font-size: 1.9rem;
+	line-height: 1.15;
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	color: var(--isp-text);
+}
+
+.isp-unit {
+	margin-left: 6px;
+	font-size: 0.76rem;
+	color: var(--isp-muted);
+}
+
+.isp-op-sub {
+	margin-top: 4px;
+	font-size: 0.8rem;
+	color: var(--isp-muted);
+	font-variant-numeric: tabular-nums;
+}
+
+.isp-route {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 10px;
+	font-size: 0.8rem;
+	color: var(--isp-muted);
+}
+
+.isp-route .isp-arrows {
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	font-size: 1rem;
+	line-height: 1;
+	color: var(--isp-accent, var(--isp-accent-other));
+}
+
+.isp-meter {
+	margin-top: 10px;
+	height: 6px;
+	border-radius: 999px;
+	background: var(--isp-card-bg-2);
+	overflow: hidden;
+}
+
+.isp-meter > i {
+	display: block;
+	height: 100%;
+	min-width: 2px;
+	border-radius: 999px;
+	background: var(--isp-accent, var(--isp-accent-other));
+	opacity: 0.85;
+	transition: width 0.4s ease;
+}
+
+/* ---------------------------------------------------------------- 列表 / 表格 */
+
+.isp-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.isp-line {
+	display: grid;
+	grid-template-columns: 10px minmax(64px, auto) 1fr auto;
+	gap: 10px;
+	align-items: center;
+	padding: 8px 10px;
+	border-radius: 10px;
+	background: var(--isp-card-bg-2);
+	border: 1px solid transparent;
+	min-width: 0;
+}
+
+.isp-line .isp-dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	background: var(--isp-muted);
+}
+
+.isp-line.is-online .isp-dot {
+	background: var(--isp-ok);
+	box-shadow: 0 0 0 3px rgba(46, 158, 91, 0.18);
+}
+
+.isp-line.is-offline .isp-dot {
+	background: var(--isp-bad);
+}
+
+.isp-line .isp-line-name {
+	font-weight: 600;
+	color: var(--isp-text);
+	font-size: 0.88rem;
+	white-space: nowrap;
+}
+
+.isp-line .isp-line-track {
+	font-size: 0.78rem;
+	color: var(--isp-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.isp-line .isp-line-pct {
+	font-size: 0.78rem;
+	color: var(--isp-muted);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.isp-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.82rem;
+}
+
+.isp-table th {
+	text-align: left;
+	font-weight: 500;
+	color: var(--isp-muted);
+	padding: 4px 8px 6px 0;
+	border-bottom: 1px solid var(--isp-border);
+	white-space: nowrap;
+}
+
+.isp-table td {
+	padding: 6px 8px 6px 0;
+	border-bottom: 1px solid var(--isp-border);
+	color: var(--isp-text);
+	vertical-align: middle;
+}
+
+.isp-table tr:last-child td {
+	border-bottom: none;
+}
+
+.isp-table .num {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
+.isp-tag {
+	display: inline-block;
+	padding: 1px 8px;
+	border-radius: 999px;
+	font-size: 0.72rem;
+	background: var(--isp-card-bg-2);
+	color: var(--isp-muted);
+	white-space: nowrap;
+}
+
+/* 长的说明性标签（如出线方式解释）允许换行，避免窄屏把页面撑宽 */
+.isp-btn-row .isp-tag {
+	white-space: normal;
+	max-width: 100%;
+	line-height: 1.45;
+}
+
+.isp-tag.is-ok {
+	color: var(--isp-ok);
+}
+
+.isp-tag.is-warn {
+	color: var(--isp-warn);
+}
+
+.isp-tag.is-bad {
+	color: var(--isp-bad);
+}
+
+.isp-empty {
+	color: var(--isp-muted);
+	font-size: 0.84rem;
+	padding: 8px 0;
+}
+
+.isp-time {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 18px;
+	font-size: 0.82rem;
+	color: var(--isp-muted);
+}
+
+.isp-time .isp-tag {
+	margin-left: 6px;
+}
+
+.isp-time b {
+	color: var(--isp-text);
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- 操作区 */
+
+.isp-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin: 4px 0 10px 0;
+}
+
+.isp-actions .cbi-button {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.isp-ico {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.isp-out {
+	max-height: 22em;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-all;
+	font-family: var(--font-mono, monospace);
+	font-size: 12px;
+	line-height: 1.5;
+	padding: 10px 12px;
+	border-radius: 10px;
+	border: 1px solid var(--isp-border);
+	background: var(--isp-card-bg);
+	color: var(--isp-text);
+	margin: 0;
+}
+
+/* ---------------------------------------------------------------- 表单（配置页） */
+
+.isp-section {
+	background: var(--isp-card-bg);
+	border: 1px solid var(--isp-border);
+	border-radius: var(--isp-radius);
+	box-shadow: var(--isp-shadow);
+	padding: 14px 16px 16px;
+	margin-bottom: 12px;
+}
+
+.isp-section > h3 {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 0 0 4px 0;
+	font-size: 1rem;
+	font-weight: 600;
+	color: var(--isp-text);
+}
+
+.isp-section > .isp-desc {
+	margin: 0 0 12px 0;
+	font-size: 0.82rem;
+	line-height: 1.5;
+	color: var(--isp-muted);
+}
+
+.isp-form-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.84rem;
+}
+
+.isp-form-table th {
+	text-align: left;
+	font-weight: 500;
+	color: var(--isp-muted);
+	padding: 0 8px 6px 0;
+	border-bottom: 1px solid var(--isp-border);
+	white-space: nowrap;
+}
+
+.isp-form-table td {
+	padding: 6px 8px 6px 0;
+	border-bottom: 1px solid var(--isp-border);
+	vertical-align: top;
+}
+
+.isp-form-table tr:last-child td {
+	border-bottom: none;
+}
+
+.isp-form-table input[type="text"],
+.isp-form-table select {
+	width: 100%;
+	min-width: 90px;
+}
+
+.isp-err {
+	display: none;
+	margin-top: 3px;
+	font-size: 0.76rem;
+	line-height: 1.35;
+	color: var(--isp-bad);
+}
+
+.isp-err.is-on {
+	display: block;
+}
+
+.isp-row-actions {
+	display: inline-flex;
+	gap: 4px;
+	align-items: center;
+	white-space: nowrap;
+}
+
+.isp-icon-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 30px;
+	height: 30px;
+	padding: 0;
+	border-radius: 8px;
+	border: 1px solid var(--isp-border);
+	background: var(--isp-card-bg-2);
+	color: var(--isp-text);
+	cursor: pointer;
+}
+
+.isp-icon-btn:hover:not(:disabled) {
+	border-color: var(--isp-border-strong);
+}
+
+.isp-icon-btn:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+
+.isp-icon-btn.is-danger {
+	color: var(--isp-bad);
+}
+
+.isp-switch {
+	position: relative;
+	display: inline-block;
+	width: 40px;
+	height: 22px;
+	vertical-align: middle;
+}
+
+.isp-switch input {
+	position: absolute;
+	opacity: 0;
+	width: 100%;
+	height: 100%;
+	margin: 0;
+	cursor: pointer;
+}
+
+.isp-switch span {
+	position: absolute;
+	inset: 0;
+	border-radius: 999px;
+	background: var(--isp-card-bg-2);
+	border: 1px solid var(--isp-border);
+	transition: background 0.2s ease;
+	pointer-events: none;
+}
+
+.isp-switch span::after {
+	content: "";
+	position: absolute;
+	top: 2px;
+	left: 2px;
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: var(--isp-muted);
+	transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.isp-switch input:checked + span {
+	background: var(--isp-primary);
+	border-color: transparent;
+}
+
+.isp-switch input:checked + span::after {
+	transform: translateX(18px);
+	background: var(--background-color-high, #fff);
+}
+
+.isp-btn-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 10px;
+}
+
+.isp-test-result {
+	font-size: 0.78rem;
+	line-height: 1.35;
+	color: var(--isp-muted);
+	min-height: 1em;
+}
+
+.isp-test-result.is-ok {
+	color: var(--isp-ok);
+}
+
+.isp-test-result.is-bad {
+	color: var(--isp-bad);
+}
+
+.isp-footer-actions {
+	position: sticky;
+	bottom: 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	padding: 10px 0;
+	background: var(--background-color-high, transparent);
+	z-index: 2;
+}
+
+/* ---------------------------------------------------------------- 响应式 */
+
+@media (max-width: 1100px) {
+	.isp-cards {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+
+	.isp-grid-3 {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+
+@media (max-width: 820px) {
+	.isp-grid-2,
+	.isp-grid-3 {
+		grid-template-columns: minmax(0, 1fr);
+	}
+}
+
+@media (max-width: 620px) {
+	.isp-cards {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.isp-big {
+		font-size: 1.7rem;
+	}
+
+	.isp-line {
+		grid-template-columns: 10px 1fr;
+		row-gap: 2px;
+	}
+
+	.isp-line .isp-line-pct {
+		grid-column: 2;
+	}
+
+	/* 表单表格在窄屏改成两块：上半行是标签，下半行是输入 */
+	.isp-form-table thead {
+		display: none;
+	}
+
+	.isp-form-table tr {
+		display: block;
+		padding: 8px 0;
+		border-bottom: 1px solid var(--isp-border);
+	}
+
+	.isp-form-table td {
+		display: block;
+		border: none;
+		padding: 2px 0;
+	}
+
+	.isp-form-table td::before {
+		content: attr(data-th);
+		display: block;
+		font-size: 0.72rem;
+		color: var(--isp-muted);
+		margin-bottom: 2px;
+	}
+}

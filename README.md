@@ -12,11 +12,12 @@
 ## 特性
 
 - **运营商网段自动维护**：每日拉取 10 类运营商 IP 段（约 1.3 万条），互斥化后写入 mwan3 的 nftables 集合，无需手工维护
+- **多数据源骨架（0.2.0 新增）**：主源 + 校验源，逐源独立下载与闸门；校验源只跑日 diff，分歧超阈值（Jaccard < 90%）时**拒绝更新并留档差异段**，校验源连续失效 3 天自动升级为拒绝更新
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
-- **LuCI 界面**：状态页（命中计数 / 流量 / 策略）+ 配置页（策略映射 / DNS / 域名分流）
-- **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置
+- **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮），深浅色与移动端自适应
+- **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
 
 ## 环境要求
 
@@ -56,6 +57,24 @@ isp-split status    # 各集合命中计数与流量
 
 卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`，会还原 mwan3/dnsmasq 相关改动（配置与数据文件默认保留，可手动删除）。
 
+## 界面
+
+状态页（浅色 / 深色 / 移动端）：
+
+| 浅色 | 深色 |
+|---|---|
+| ![状态页-浅色](tools/screenshots/overview-desktop-light.png) | ![状态页-深色](tools/screenshots/overview-desktop-dark.png) |
+
+配置页（策略映射 / 多线路 DNS / 域名分流，含"保存前预检"）：
+
+| 浅色 | 预检输出 |
+|---|---|
+| ![配置页-浅色](tools/screenshots/config-desktop-light.png) | ![预检](tools/screenshots/config-preflight-light.png) |
+
+移动端：`tools/screenshots/overview-mobile-light.png`、`tools/screenshots/config-mobile-light.png`
+
+截图来自测试 VM 上的 LuCI 真页面（OpenWrt 25.12.6 / luci-theme-bootstrap），不是设计稿。
+
 ## 工作原理
 
 ```
@@ -78,7 +97,11 @@ isp-split status    # 各集合命中计数与流量
 | `refresh` | fetch + apply（日常定时任务） | nft |
 | `sync` | fetch + wire + apply（首次部署） | 全部 |
 | `dns` | 生成多线路 DNS 配置 | dnsmasq |
-| `status` / `verify` / `probe` | 状态 / 渲染核对 / 分线测速 | 无 |
+| `status` / `health` | 集合统计 / 数据源健康度 + 双线状态 | 无 |
+| `diff` | 用存档重算主源 vs 校验源的分歧（超阈值退出码 3） | 无 |
+| `verify` / `probe` | 渲染核对 / 分线测速 | 无 |
+| `dnstest <策略>` | 测一条线路的 DNS 是否可用 | 无 |
+| `conf check` / `conf preview` | 只校验配置 / 预演未保存的改动 | 无 |
 | `export` | 导出给 mihomo / sing-box | 无 |
 | `stage` / `enable` | 灰度：先注入不渲染，确认后启用 | mwan3 |
 | `uninstall` | 卸载并还原 mwan3/dnsmasq 改动 | 全部 |
@@ -101,6 +124,21 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 
 生效方式：策略映射改动执行 `isp-split wire && isp-split apply`；DNS 改动执行 `isp-split dns`；也可在 LuCI 配置页操作。完整字段说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
+多数据源（0.2.0 默认只声明不启用校验，0.2.1 才默认开启）：
+
+```sh
+ISP_SOURCES="
+clang:primary:https://ispip.clang.cn
+yfgao:verify:https://china-operator-ip.yfgao.com
+"
+ISP_SOURCE_FILES="
+yfgao:chinatelecom=chinanet,unicom_cnc=unicom,cmcc=cmcc,cernet=cernet
+"
+ISP_VERIFY_ENABLE=0   # 改成 1 即启用日 diff；分歧超阈值会拒绝更新（退出码 3）
+```
+
+`ISP_SOURCES` 留空 = 与 0.1.x 完全一致的单源行为，老配置无需改动。
+
 ## 文档
 
 | 文档 | 内容 |
@@ -118,6 +156,7 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 | 多线路 DNS | ✅ | ✅ bind / mark 双模式，兼容代理接管 DNS |
 | 域名 / 设备钉线 | ✅ | ✅ `DOMAIN_SPLIT` + mwan3 源地址规则 |
 | 灰度 / 预演 / 回滚 | 部分 | ✅ 三级预检 + stage 灰度 + 一键还原 |
+| 数据源质量校验 | ❌ | ✅ 主源 + 校验源日 diff（Jaccard 阈值 + 差异段留档） |
 | 开源可审计 | ❌ | ✅ MIT，纯 shell + awk，无黑盒 |
 | DPI 应用识别选线 | ✅ | ❌ 见下方说明 |
 
@@ -140,6 +179,8 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 
 ## 路线图
 
+- [ ] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），并默认开启 `ISP_VERIFY_ENABLE=1`
+      （0.2.0 只建骨架：主源仍是 clang，校验源默认不启用）
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）

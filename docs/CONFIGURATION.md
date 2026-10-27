@@ -132,6 +132,114 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
 | `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |
+| `ISP_SOURCES` | 空 = 单源 | 多数据源声明，见下节；留空时完全退回 0.1.x 的单源行为 |
+| `ISP_SOURCE_FILES` | 空 | 每源文件名映射（不同源的同一运营商文件名不同） |
+| `ISP_VERIFY_ENABLE` | `0` | 是否启用校验源（0 = 不下载不校验，0.2.1 才会默认开启） |
+| `ISP_DIFF_MAX_JACCARD_DROP` | `90` | 与校验源的 Jaccard 低于此值就拒绝本次更新 |
+| `ISP_DIFF_MAX_DELTA_PCT` | `3` | 单个运营商地址数的日变化上限（%，仅校验源启用时生效） |
+| `ISP_SOURCE_MAX_FAIL_DAYS` | `3` | 校验源连续失败多少天后升级为"拒绝更新" |
+
+---
+
+## 多数据源（v0.2.0）
+
+0.2.0 只建**骨架**：主源仍是 `ispip.clang.cn`，校验源只声明不启用。
+默认配置长这样：
+
+```sh
+ISP_SOURCES="
+clang:primary:https://ispip.clang.cn
+yfgao:verify:https://china-operator-ip.yfgao.com
+"
+ISP_SOURCE_FILES="
+clang:chinatelecom=chinatelecom,unicom_cnc=unicom_cnc,cmcc=cmcc,cernet=cernet
+yfgao:chinatelecom=chinanet,unicom_cnc=unicom,cmcc=cmcc,cernet=cernet
+"
+ISP_VERIFY_ENABLE=0
+```
+
+### ISP_SOURCES：源声明
+
+格式：每行一条 `<名字>:<角色>:<镜像基址>`。
+
+| 角色 | 含义 | 是否参与合成 |
+|---|---|---|
+| `primary` | 出数据的主源，**必须且只能有一个** | 是 |
+| `verify` | 只用来跑日 diff 的校验源 | 否 |
+| `audit` | 低频审计源（同样只跑 diff） | 否 |
+
+- 基址必须是 `https://host[:port][/path]`，不能带查询串；确需明文 HTTP 时
+  显式设 `ISP_SPLIT_ALLOW_HTTP=1`（不建议）。
+- **留空 `ISP_SOURCES` = 单源兼容模式**：仍按 `ISP_MIRROR/<源名>.txt` 拉取，
+  行为与 0.1.x 完全一致，老配置升级不需要改任何东西。
+
+### ISP_SOURCE_FILES：文件名映射
+
+不同源对同一个运营商的叫法不一样：clang 上叫 `chinatelecom.txt`，
+yfgao 上叫 `chinanet.txt`。这里**只认显式声明，不猜**：
+
+```
+<源名>:<ISP_TABLE 里的源名>=<该源上的文件名>,<源名2>...
+```
+
+- 值写不带 `.txt` 的名字（`chinatelecom=chinanet`）；写全名（`foo.dat`）时原样使用。
+- **主源**没写到的源名按历史命名 `<源名>.txt` 处理（0.1.x 兼容路径）。
+- **校验源/审计源**只在上面的映射里出现；没列出的运营商不会去下载，也不会参与 diff。
+
+### 行为矩阵
+
+| 场景 | `fetch` 行为 | 退出码 | 数据 |
+|---|---|---|---|
+| 老配置（无 `ISP_SOURCES`） | 与 0.1.x 相同，单源 | 0 | 更新 |
+| 主源正常、校验源正常、Jaccard ≥ 阈值 | 正常更新，Jaccard 记入 `state/` | 0 | 更新 |
+| 主源正常、校验源**下载失败** | 降级：继续用主源，`status` 标「降级 n/3 天」 | 0 | 更新 |
+| 校验源**连续失败 ≥ 3 天** | 拒绝在无校验的情况下更新 | **3** | 保留旧数据 |
+| 分歧 Jaccard < 90% | 拒绝更新 + `quarantine/<日期>/` 留档差异段 | **3** | 保留旧数据 |
+| 单运营商日变化 > 3%（仅校验启用时） | 拒绝更新 | **3** | 保留旧数据 |
+| **主源**下载失败 | 冻结（不自动换源，换源=换口径） | 1 | 保留旧数据 |
+
+放行：确认数据无误后用 `ISP_SPLIT_FORCE_FETCH=1 isp-split fetch`（同时放行 Jaccard、
+日变化与连续失败三道闸门）。
+
+### 目录与状态
+
+| 路径 | 内容 |
+|---|---|
+| `$BASE/raw/<源名>/` | 每个源最近一次成功拉取的原始文件（diff 的比较基准） |
+| `$BASE/state/sources.tsv` | 每源 `名字 角色 最后成功 连续失败 Jaccard 备注` |
+| `$BASE/state/last-diff` | 最近一次 diff 的最小 Jaccard 与时间 |
+| `$BASE/quarantine/<YYYYMMDD>/` | 被拒绝那次的差异段：`<源>.<运营商>.only-primary.txt` / `.only-verify.txt` / `summary.tsv` |
+
+### 相关命令
+
+```sh
+isp-split diff          # 用存档重算主源 vs 校验源的分歧（不联网；超阈值返回 3）
+isp-split diff --no-save  # 同上，但不写 quarantine
+isp-split health        # 源健康度 + 双线状态（--json 给 LuCI 用）
+isp-split status        # 集合统计 + 数据源健康度区块
+```
+
+### 许可红线（重要）
+
+| 源 | 许可 | 能否随固件/ipk 分发 |
+|---|---|---|
+| `gaoyifan/china-operator-ip` | MIT | ✅ |
+| `ispip.clang.cn` | **无许可证**，仅免责声明 | ❌ 只做运行时下载，仓库与包内**不含**任何 clang 数据 |
+
+仓库和安装包只带**空的示例配置与文件映射**，所有运营商数据都是设备自己运行时下载的。
+不要把自己抓下来的 `$BASE/data/*.txt` 打包分发——那属于源站数据的再分发。
+
+### Jaccard 是什么、为什么用 90%
+
+Jaccard = 两个集合交集地址数 / 并集地址数。实测（见 FIX12 设计文档）：
+
+| 对比 | Jaccard |
+|---|---|
+| clang 默认变体 vs yfgao（同属主流口径） | 95.7%–96.9% |
+| clang 默认 vs clang `_apnic` 变体（口径不同） | 64.6%–87.9% |
+
+所以 90% 落在"正常波动"和"口径切错"之间：低于它就说明某一方的归属规则变了，
+这时候**保留旧数据**比"生成一份可能错的集合"安全（分流错了会把几十 M 地址导到错误的线）。
 
 ### 下载与熔断（v0.1.5 安全加固）
 
