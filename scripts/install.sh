@@ -93,6 +93,9 @@ install_luci() {
 	L=$ROOT/luci-app-isp-split
 	[ -d "$L" ] || { say "找不到 $L，跳过 LuCI"; return 0; }
 	mkdir -p /www/luci-static/resources/view/isp-split /usr/share/luci/menu.d /usr/share/rpcd/acl.d
+	mkdir -p /www/luci-static/resources/isp-split
+	cp -f "$L/htdocs/luci-static/resources/isp-split/"*.css \
+		/www/luci-static/resources/isp-split/ 2>/dev/null || true
 	cp -f "$L/htdocs/luci-static/resources/view/isp-split/"*.js \
 		/www/luci-static/resources/view/isp-split/
 	cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split.json" /usr/share/luci/menu.d/
