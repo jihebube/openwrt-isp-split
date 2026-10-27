@@ -401,6 +401,52 @@ _state_put() {
 	return 0
 }
 
+# 清理 state/sources.tsv 里已经不在 ISP_SOURCES 中的残留行。
+#
+# 典型场景：0.1.x 单源时代留下 `ispip primary`，用户后来改成双源，
+# 旧行会一直躺在文件里（status/health 虽然只遍历声明过的源，但数据本身是脏的，
+# 排查时也很容易被误读）。这里在 fetch/status/health 入口做一次幂等清理：
+#   · 只保留当前 ISP_SOURCES（空则为兼容模式的 ispip）声明过的源；
+#   · 顺带丢掉字段数不足 6 的坏行；
+#   · 没有任何变化时不动文件（status 每 10 秒轮询，不必反复写 flash）。
+_state_prune() {
+	[ -f "$SOURCE_STATE" ] || return 0
+	_sp_decl=" "
+	for _sp_row in $(_source_rows); do
+		_sp_name=${_sp_row%%:*}
+		[ -n "$_sp_name" ] && _sp_decl="$_sp_decl$_sp_name "
+	done
+	[ "$_sp_decl" != "  " ] || return 0
+
+	mkdir -p "$STATE_DIR" || return 1
+	_sp_tmp=$(mktemp "$STATE_DIR/.sources.prune.XXXXXX" 2>/dev/null) || return 1
+	_sp_rem=$(mktemp "$STATE_DIR/.sources.removed.XXXXXX" 2>/dev/null) ||
+		{ rm -f "$_sp_tmp"; return 1; }
+	awk -F "$(printf '\t')" -v keep="$_sp_decl" -v rem="$_sp_rem" '
+		NF >= 6 {
+			if (index(keep, " " $1 " ") > 0) print
+			else print $1 > rem
+		}' "$SOURCE_STATE" > "$_sp_tmp" || {
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 1
+	}
+
+	if cmp -s "$_sp_tmp" "$SOURCE_STATE"; then
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 0
+	fi
+
+	_sp_removed=$(tr '\n' ' ' < "$_sp_rem" 2>/dev/null)
+	mv -f "$_sp_tmp" "$SOURCE_STATE" 2>/dev/null || {
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 1
+	}
+	rm -f "$_sp_rem"
+	[ -n "${_sp_removed:-}" ] &&
+		log "已清理 state/sources.tsv 中不在 ISP_SOURCES 的残留源: ${_sp_removed% }" >&2
+	return 0
+}
+
 _ts_text() {
 	case "${1:-}" in
 	"" | 0 | *[!0-9]*) printf '%s' "-"; return 0 ;;
@@ -686,6 +732,7 @@ _delta_check() { # <源名> <新目录>
 # 源健康度区块（status / plan 共用）
 _sources_report() {
 	_source_check_all
+	_state_prune
 	echo "数据源健康度:"
 	printf '  %-8s %-8s %-16s %6s %9s  %s\n' "源" "角色" "最后成功" "失败" "Jaccard" "状态"
 	for _sr_row in $(_source_rows); do
@@ -822,6 +869,7 @@ cmd_fetch() {
 
 	# 源声明先校验，再联网：非法 URL/角色不该等到下载一半才发现。
 	_source_check_all
+	_state_prune
 	case "${ISP_SOURCE_MAX_FAIL_DAYS:-}" in
 	"" | 0 | *[!0-9]*)
 		die "ISP_SOURCE_MAX_FAIL_DAYS 必须是正整数（当前: '${ISP_SOURCE_MAX_FAIL_DAYS:-}'）"
@@ -1097,6 +1145,7 @@ cmd_diff() {
 	*) die "用法: isp-split diff [--no-save]" ;;
 	esac
 	_source_check_all
+	_state_prune
 	_p=$(_primary_source_name)
 	[ -d "$RAW_ARCHIVE/$_p" ] ||
 		die "还没有主源存档（$RAW_ARCHIVE/$_p）。先运行 isp-split fetch 拉一份数据"
@@ -1865,6 +1914,7 @@ cmd_status_json() {
 # 与 status --json（nft 统计）分开放，是为了让后者的数组形状保持不变。
 cmd_health_json() {
 	_source_check_all
+	_state_prune
 	printf '{"sources":['
 	_sfj=1
 	for _row in $(_source_rows); do

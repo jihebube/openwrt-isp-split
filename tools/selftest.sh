@@ -1398,6 +1398,44 @@ else
 		sed 's/^/    /'
 fi
 
+# --- 12.3 sources.tsv 残留清理（单源 -> 双源切换） ---
+# 先用老配置跑一次，留下单源时代的 ispip 行；再切到双源，旧行必须消失。
+rm -rf "$MS/base-stale"
+_ms_run "$MS/legacy.conf" "$MS/base-stale" fetch >/dev/null 2>&1
+if grep -q '^ispip	' "$MS/base-stale/state/sources.tsv" 2>/dev/null; then
+	ok "残留清理前置：单源 fetch 写入 ispip 行"
+else
+	ng "残留清理前置失败：sources.tsv 里没有 ispip"
+fi
+if _ms_run "$MS/ms.conf" "$MS/base-stale" fetch >"$MS/stale.log" 2>&1; then
+	if grep -q '^ispip	' "$MS/base-stale/state/sources.tsv" 2>/dev/null; then
+		ng "切到双源后 ispip 残留仍在 sources.tsv"
+	else
+		ok "切到双源后 sources.tsv 的 ispip 残留被清理"
+	fi
+else
+	ng "残留清理场景的 fetch 失败"
+	sed 's/^/    /' "$MS/stale.log" 2>/dev/null
+fi
+
+# 再手动塞一条已不在配置里的源，确认 status/health 读路径也会清掉它。
+printf 'oldisp\tprimary\t1700000000\t2\t\tstale\n' \
+	>> "$MS/base-stale/state/sources.tsv"
+_ms_stale_json=$(_ms_run "$MS/ms.conf" "$MS/base-stale" health --json 2>/dev/null)
+if printf '%s' "$_ms_stale_json" | grep -q '"name":"oldisp"' ||
+	grep -q '^oldisp	' "$MS/base-stale/state/sources.tsv" 2>/dev/null; then
+	ng "health 读路径未清理 stale 源 oldisp"
+else
+	ok "health 读路径清理 stale 源，且不再显示"
+fi
+if grep -q '^yfgao	' "$MS/base-stale/state/sources.tsv" 2>/dev/null &&
+	grep -q '^clang	' "$MS/base-stale/state/sources.tsv" 2>/dev/null; then
+	ok "残留清理保留当前声明的 yfgao/clang 行"
+else
+	ng "残留清理误删了当前源"
+	sed 's/^/    /' "$MS/base-stale/state/sources.tsv" 2>/dev/null
+fi
+
 # --- 12.4 老配置单源兼容（必须与 0.1.x 一致） ---
 rm -rf "$MS/base-legacy"
 if _ms_run "$MS/legacy.conf" "$MS/base-legacy" fetch >"$MS/legacy.log" 2>&1 &&
