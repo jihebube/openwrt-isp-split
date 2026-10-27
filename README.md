@@ -20,9 +20,20 @@
 
 ## 环境要求
 
-- OpenWrt 23.05+（firewall4 / 纯 nftables）；在 OpenWrt 25.12.6 (x86_64) 完整验证
+- OpenWrt 23.05+（firewall4 / 纯 nftables）；25.12（x86_64）完整验证，其余平台见下表
 - **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源的 `mwan3` 是 iptables 版，不兼容。安装前可自查：`grep -c render_config_ipsets /lib/mwan3/mwan3.sh`，结果需 ≥ 1；为 0 时请改用 Kwrt 源中的 `mwan3-nft`，或从 [dl12345/mwan3 releases](https://github.com/dl12345/mwan3/releases) 安装 nft 版
 - `nftables`、`curl`；LuCI 页面为可选组件
+
+## 平台验证状态
+
+| 平台 | 状态 |
+|---|---|
+| OpenWrt/Kwrt 25.12（x86_64） | ✅ 完整验证（双 PPPoE 生产环境长期运行 + VM 回归） |
+| OpenWrt 24.10（x86_64） | ✅ CI 双 SDK 构建，未真机长测 |
+| ARM / MIPS 软路由（MT7981、IPQ 等） | ⚠️ 理论兼容（纯 shell/awk，无架构相关代码），欢迎实测反馈 |
+| 官方固件直装 | ⚠️ 需先替换 iptables 版 mwan3 为 nft 版（见上方自查命令） |
+
+> 内存参考：4 个启用集合（约 2300 元素）占内核内存约 350 kB；x86_64 全量加载约 800 ms。建议 128 MB 以上内存设备使用；更低配设备请先 `isp-split selftest` 看加载耗时。
 
 ## 快速开始
 
@@ -131,6 +142,12 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）
+
+## 反馈与适配
+
+- 平台兼容问题（ARM/MIPS、非 Kwrt 固件）请开 issue 并附：`sh tools/router-preflight.sh` 输出、`nft --version`、内存大小
+- 数据源（ispip.clang.cn）归属误差请到其项目反馈，本仓库只负责分流逻辑
+- 欢迎提交 PR；shell 请保持 busybox ash 兼容（禁止 bash 专属语法），改动请跑 `sh tools/selftest.sh`
 
 ## 许可
 
