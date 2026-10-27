@@ -26,6 +26,14 @@ CFG_MWAN3=${ISP_SPLIT_MWAN3:-/etc/config/mwan3}
 [ -f "$CONF" ] || { echo "缺少 $CONF" >&2; exit 1; }
 . "$CONF"
 
+# 配置文件常被 Windows 编辑器/网页粘贴保存成 CRLF。sh 的 source 不在乎，
+# 但 ISP_TABLE 的最后一列会变成 "1\r"，`[ "$4" = "1" ]` 永远不成立：
+# plan 只剩一张空表、status 只剩兜底行、apply 报"没有启用的运营商"，
+# 而真正的原因（行尾多了一个 \r）完全看不出来。这里在入口统一去掉。
+ISP_TABLE=$(printf '%s' "${ISP_TABLE:-}" | tr -d '\r')
+DNS_TABLE=$(printf '%s' "${DNS_TABLE:-}" | tr -d '\r')
+DOMAIN_SPLIT=$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')
+
 ISP_ANCHOR=${ISP_ANCHOR:-'dest_port|src_port|default_rule|https|internet'}
 ISP_CRON=${ISP_CRON:-"17 4 * * *"}
 PROBE_BYTES=${PROBE_BYTES:-33554432}
@@ -52,6 +60,17 @@ need_nft() {
 	command -v nft >/dev/null 2>&1 || die "未找到 nft 命令"
 	nft list table inet mwan3 >/dev/null 2>&1 ||
 		die "table inet mwan3 不存在，请确认 mwan3-nft 已启动"
+}
+
+# work 目录（临时批处理/备份文件的家）是否真的可写。
+# 用子 shell 试探：ash 里特殊内建命令 `:` 的重定向失败会直接终止脚本，
+# 那样错误信息只有一行 "can't create ...: Read-only file system"，
+# 而且 wire 可能已经 commit 了 UCI 段。
+_work_writable() {
+	mkdir -p "$WORK" || return 1
+	( : > "$WORK/.write-test" ) 2>/dev/null || return 1
+	rm -f "$WORK/.write-test"
+	return 0
 }
 
 # 统计一个集合里的元素个数
@@ -122,7 +141,7 @@ fetch_one() {
 # ---------------------------------------------------------------- fetch
 
 cmd_fetch() {
-	mkdir -p "$WORK"
+	mkdir -p "$WORK" || die "无法创建 $WORK"
 	rm -rf "$WORK/raw.new" "$WORK/out.new"
 	mkdir -p "$WORK/raw.new"
 
@@ -175,7 +194,9 @@ cmd_fetch() {
 	mkdir -p "$BASE/.history"
 	if [ -d "$DATA" ]; then
 		_ts=$(date +%Y%m%d-%H%M%S)
-		cp -a "$DATA" "$BASE/.history/$_ts"
+		# 快照失败（磁盘满）时必须中止：否则新数据写坏了也没有东西可回滚。
+		cp -a "$DATA" "$BASE/.history/$_ts" ||
+			die "无法创建历史快照（磁盘空间不足？），现有数据未改动"
 		# 只保留最近 3 份历史快照
 		_cnt=$(ls -1d "$BASE/.history"/*/ 2>/dev/null | wc -l | tr -d ' ')
 		if [ "$_cnt" -gt 3 ]; then
@@ -185,11 +206,37 @@ cmd_fetch() {
 		fi
 	fi
 
-	mkdir -p "$DATA"
-	rm -f "$DATA"/*.txt
-	cp "$WORK/out.new"/*.txt "$DATA/"
+	# 先在暂存目录里准备好整套数据并校验，最后整体替换目录。
+	# 旧写法是 `rm -f $DATA/*.txt` + `cp`：磁盘满时 cp 写一半失败没人看，
+	# 现场留下"半套数据 + 旧 .stamp"，fetch 照样打印"数据已更新"并返回 0，
+	# 下一次 apply 就会把没拷全的集合静默清空。
+	_new=$WORK/data.new
+	rm -rf "$_new"
+	mkdir -p "$_new" || die "无法创建暂存目录 $_new"
+	cp "$WORK/out.new"/*.txt "$_new/" ||
+		{ rm -rf "$_new"; die "写入新数据失败（磁盘空间不足？），现有数据未改动"; }
+	date +%s > "$_new/.stamp" ||
+		{ rm -rf "$_new"; die "无法写入数据时间戳，现有数据未改动"; }
 
-	date +%s > "$DATA/.stamp"
+	_chk_new() {
+		[ -s "$_new/$1.txt" ] || {
+			rm -rf "$_new"
+			die "构建产物 $1.txt 为空或缺失，拒绝覆盖现有数据"
+		}
+	}
+	foreach_enabled _chk_new
+
+	_old=$BASE/data.old
+	rm -rf "$_old"
+	if [ -d "$DATA" ]; then
+		mv "$DATA" "$_old" || { rm -rf "$_new"; die "无法替换数据目录，现有数据未改动"; }
+	fi
+	if ! mv "$_new" "$DATA"; then
+		[ -d "$_old" ] && mv "$_old" "$DATA"
+		die "无法替换数据目录，已恢复原数据"
+	fi
+	rm -rf "$_old"
+
 	log "数据已更新：$(wc -l "$DATA"/*.txt | tail -1)"
 }
 
@@ -344,7 +391,7 @@ cmd_apply() {
 	if ! nft list set inet mwan3 "$_fs" >/dev/null 2>&1; then
 		die "nft 中不存在集合 $_fs —— 集合由 wire 创建。先执行: isp-split wire（或 isp-split sync）"
 	fi
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	_gen_batch "$WORK/batch.nft" mwan3
 	[ -s "$WORK/batch.nft" ] || die "没有可应用的集合"
 
@@ -365,7 +412,7 @@ cmd_apply() {
 cmd_check() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	_gen_batch "$WORK/batch.nft" mwan3
 	[ -s "$WORK/batch.nft" ] || die "没有可应用的集合"
 
@@ -405,7 +452,7 @@ cmd_check() {
 cmd_selftest() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	log "在独立表 inet isptest 中实测加载（inet mwan3 不受影响）"
 
 	nft delete table inet isptest 2>/dev/null
@@ -470,7 +517,9 @@ _write_rule() {
 
 cmd_wire() {
 	need_nft
-	mkdir -p "$WORK"
+	# 先确认 work 目录可写再动 UCI：否则可能 commit 了 ipset 段之后才发现
+	# 写不了规则片段，留下半套配置。
+	_work_writable || die "work 目录不可写（$WORK）：无法写入规则片段，配置未改动"
 
 	# 1. 集合声明
 	_wire_all() { _wire_ipset "$1" "$2"; }
@@ -478,9 +527,15 @@ cmd_wire() {
 	uci -q commit mwan3
 
 	# 2. 规则片段
-	: > "$WORK/rules.txt"
+	: > "$WORK/rules.txt" || die "无法写入 $WORK/rules.txt（work 目录不可写？）"
 	_write_all() { _write_rule "$1" "$2" "$3"; }
 	foreach_enabled _write_all
+
+	# 一条规则都没有时，splice 会把配置文件里现有的 isp-split 规则块整段删掉。
+	# 这是合法操作（用户可能把运营商全禁用了），但必须说出来，不能只打印
+	# "规则已注入" 让人以为一切正常。
+	[ -s "$WORK/rules.txt" ] ||
+		log "警告：ISP_TABLE 中没有启用的运营商，本次规则块为空（已有 isp-split 规则将被移除）"
 
 	# 校验策略是否存在，避免生成指向不存在策略的规则
 	for row in $ISP_TABLE; do
@@ -496,7 +551,8 @@ cmd_wire() {
 	done
 
 	# 4. 插入到正确位置
-	cp "$CFG_MWAN3" "$WORK/mwan3.bak"
+	cp "$CFG_MWAN3" "$WORK/mwan3.bak" ||
+		die "无法备份 $CFG_MWAN3 到 $WORK/mwan3.bak，配置未改动"
 	awk -v insert="$WORK/rules.txt" -v anchor="$ISP_ANCHOR" \
 		-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" ||
 		die "规则注入失败（锚点缺失或配置不可写），配置未改动"
@@ -1623,8 +1679,11 @@ cmd_dns() {
 
 # 取配置项的原始值（支持 KEY="单行" 与 KEY="\n多行\n"）
 _conf_val() {
+	# 第二个参数可指定文件（写入后回读校验用），默认读 $CONF。
+	# 逐行去掉 CR：CRLF 保存的配置会让值尾多一个 \r。
 	awk -v key="$1" '
 		{
+			sub(/\r$/, "")
 			if (inb) {
 				if ($0 ~ /^"[[:space:]]*$/) { inb = 0; next }
 				# 多行值的收尾引号也可能跟在最后一行末尾：KEY="a\nb"
@@ -1650,7 +1709,7 @@ _conf_val() {
 			}
 		}
 		END { print out }
-	' "$CONF"
+	' "${2:-$CONF}"
 }
 
 conf_get() {
@@ -1728,8 +1787,13 @@ _conf_validate() {
 	case "$_key" in
 	ISP_TABLE)
 		_seen=" "
+		_rows=0
 		_old_ifs=$IFS
+		# 关掉路径名展开：值里若出现 * ? [，`for _line in $_val` 会拿
+		# 当前目录的文件名去替换，等于校验的和写入的不是同一份内容。
+		set -f
 		for _line in $_val; do
+			_rows=$((_rows + 1))
 			IFS=':'
 			set -- $_line
 			IFS=$_old_ifs
@@ -1750,10 +1814,16 @@ _conf_validate() {
 			*) die "最后一列只能是 0（禁用）或 1（启用）—— 出错行: $_line" ;;
 			esac
 		done
+		set +f
 		IFS=$_old_ifs
+		# 空表等于把工具废掉：wire 会注入空规则块（连带删掉现有规则），
+		# apply 之后每次都报"没有启用的运营商"。这种值一律拒绝。
+		[ "$_rows" -gt 0 ] ||
+			die "ISP_TABLE 不能为空：至少保留一行 运营商:集合名:策略:0|1"
 		;;
 	DNS_TABLE)
 		_old_ifs=$IFS
+		set -f
 		for _line in $_val; do
 			IFS=':'
 			set -- $_line
@@ -1766,10 +1836,12 @@ _conf_validate() {
 			esac
 			_valid_ipv4 "$2" || die "DNS 地址必须是严格 IPv4（出错行: $_line）"
 		done
+		set +f
 		IFS=$_old_ifs
 		;;
 	DOMAIN_SPLIT)
 		_old_ifs=$IFS
+		set -f
 		for _line in $_val; do
 			IFS=':'
 			set -- $_line
@@ -1782,6 +1854,7 @@ _conf_validate() {
 			*) die "mwan3 里不存在策略 '$2'（出错行: $_line）" ;;
 			esac
 		done
+		set +f
 		IFS=$_old_ifs
 		;;
 	DNS_MODE)
@@ -1811,35 +1884,78 @@ _conf_write() {
 	# 写入前必须通过白名单校验；失败即 die，绝不落盘
 	_conf_validate "$_key" "$_val"
 
+	# 写临时文件 + 回读校验 + 原子 rename。
+	# 旧实现有两个坑：
+	#   1) awk 只在遇到 `KEY="` 时才替换，键不存在（用户删掉了某段、
+	#      或用了单引号/无引号写法）就原样输出，于是什么都没写，
+	#      但仍然打印"已更新"并返回 0 —— 静默丢配置；
+	#   2) 直接重定向覆盖正式文件，写到一半失败（磁盘满）可能留下
+	#      一份语法合法但被截断的配置，sh -n 查不出来。
 	_backup=$CONF.bak.$$
+	_tmp=$CONF.tmp.$$
 	cp -f "$CONF" "$_backup" || die "无法备份配置"
+	# 临时文件先复制原文件再原地截断重写：这样模式/属主跟原文件一致
+	# （rename 会把临时文件的权限带过去；OpenWrt 没有 stat，不能靠 chmod 复制）
+	cp -f "$CONF" "$_tmp" || die "无法创建临时配置文件"
+
 	awk -v key="$_key" -v val="$_val" '
+		function emit(v,	n, i, L) {
+			n = split(v, L, "\n")
+			# 单行值保持单行；多行值写成 KEY="\n...\n"，与默认配置一致
+			if (n <= 1) { print key "=\"" v "\""; return }
+			print key "=\""
+			for (i = 1; i <= n; i++) if (L[i] != "") print L[i]
+			print "\""
+		}
 		{
+			sub(/\r$/, "")
 			if (inb) {
-				if ($0 ~ /^"[[:space:]]*$/) { inb = 0 }
+				# 旧值的续行：直到收尾引号（可能是独立一行，
+				# 也可能跟在最后一行内容末尾 KEY="a\nb"）
+				if ($0 ~ /"[[:space:]]*$/) { inb = 0 }
 				next
 			}
-			if (index($0, key "=\"") == 1) {
-				if ($0 ~ /"/ && substr($0, length(key) + 3) ~ /"[[:space:]]*$/) {
-					print key "=\"" val "\""
+			if (index($0, key "=") == 1) {
+				found = 1
+				rest = substr($0, length(key) + 2)
+				# 单行写法：KEY="值" / KEY='值' / KEY=值
+				if (rest ~ /^".*"[[:space:]]*$/ || rest !~ /^"/) {
+					emit(val)
 					next
 				}
-				print key "=\""
-				n = split(val, L, "\n")
-				for (i = 1; i <= n; i++) if (L[i] != "") print L[i]
-				print "\""
+				# 其余是以 " 开头但没在同一行收尾的多行写法：
+				# 输出新值后跳过旧值的续行
+				emit(val)
 				inb = 1
 				next
 			}
 			print
 		}
-	' "$_backup" > "$CONF" || { cp -f "$_backup" "$CONF"; rm -f "$_backup"; die "写入失败，已回滚"; }
+		END { if (!found) emit(val) }
+	' "$_backup" > "$_tmp" ||
+		{ rm -f "$_tmp" "$_backup"; die "写入失败，已回滚"; }
 
-	if ! sh -n "$CONF" 2>/dev/null; then
-		cp -f "$_backup" "$CONF"
-		rm -f "$_backup"
+	if ! sh -n "$_tmp" 2>/dev/null; then
+		rm -f "$_tmp" "$_backup"
 		die "改动后的配置语法不合法，已回滚（原文件已恢复）"
 	fi
+
+	# 回读校验：文件里读出来的必须就是刚才写入的值。
+	# 这一步是"静默不生效"的最后一道防线。
+	# 空行不参与比较：写入时会丢掉空行（word splitting 本来也忽略它们），
+	# 否则"表里带一个空行"这种正常输入会被误判成写入失败。
+	_got=$(_conf_val "$_key" "$_tmp" | awk 'NF')
+	_want=$(printf '%s\n' "$_val" | awk 'NF')
+	if [ "$_got" != "$_want" ]; then
+		rm -f "$_tmp" "$_backup"
+		die "写入后校验失败（$_key 的内容与预期不一致），已回滚，原文件未改动"
+	fi
+
+	mv -f "$_tmp" "$CONF" || {
+		rm -f "$_tmp" "$_backup"
+		cp -f "$_backup" "$CONF" 2>/dev/null
+		die "替换配置失败，已回滚"
+	}
 	rm -f "$_backup"
 }
 
@@ -1881,12 +1997,19 @@ cmd_conf() {
 # 需要把同一份数据交给 mihomo / sing-box。
 #
 #   mihomo / OpenClash : rule-provider，behavior=ipcidr，format=yaml
-#   sing-box           : rule_set，type=local，format=source（JSON 数组）
+#   sing-box           : rule_set，type=local，format=source
+#                        （必须是 {"version":1,"rules":[{"ip_cidr":[...]}]}）
 cmd_export() {
 	_fmt=${1:-}
 	_dir=${2:-}
 	[ -n "$_fmt" ] || die "用法: isp-split export <mihomo|singbox|text> <输出目录>"
 	[ -n "$_dir" ] || die "用法: isp-split export <mihomo|singbox|text> <输出目录>"
+	# 先校验格式再建目录：旧写法先 mkdir 后报错，一次手误就留下空目录，
+	# 而且格式非法时报的是"没有可导出的数据"，完全指错方向。
+	case "$_fmt" in
+	mihomo | singbox | text) ;;
+	*) die "未知格式 '$_fmt'，可选 mihomo / singbox / text" ;;
+	esac
 	mkdir -p "$_dir" || die "无法创建 $_dir"
 
 	_n=0
@@ -1910,8 +2033,15 @@ cmd_export() {
 			;;
 		singbox)
 			_out="$_dir/isp-$_src.json"
-			awk 'NR > 1 { printf ",\n" } { printf "\"%s\"", $0 } END { print "" }' "$_f" |
-				{ printf '[\n'; cat; printf '\n]\n'; } > "$_out"
+			# sing-box 的 source 格式是对象，不是裸数组：
+			#   {"version":1,"rules":[{"ip_cidr":["10.0.0.0/8", ...]}]}
+			# 裸 JSON 字符串数组是 mihomo/Clash 的 payload 格式，
+			# sing-box 读它会直接报 decode rule-set 启动失败。
+			{
+				printf '{\n  "version": 1,\n  "rules": [\n    { "ip_cidr": [\n'
+				awk 'NR > 1 { printf ",\n" } { printf "      \"%s\"", $0 }' "$_f"
+				printf '\n    ] }\n  ]\n}\n'
+			} > "$_out"
 			;;
 		text)
 			_out="$_dir/isp-$_src.txt"
@@ -1983,8 +2113,9 @@ sing-box 用法：
   }
 }
 
-注意：sing-box 的 local source 规则集要求 JSON 字符串数组，
-本工具导出的正是该格式。
+注意：sing-box 的 local source 规则集是对象格式
+      {"version":1,"rules":[{"ip_cidr":[...]}]}，本工具导出的正是该格式。
+      裸 JSON 数组（mihomo 的 payload 格式）sing-box 不接受。
 EOF
 		;;
 	esac
@@ -1997,9 +2128,41 @@ EOF
 cmd_rollback() {
 	_last=$(ls -1d "$BASE/.history"/*/ 2>/dev/null | sort | tail -1)
 	[ -n "$_last" ] || die "没有可回滚的历史数据"
+
+	# 快照可能是空的、或上次 fetch 被磁盘满/断电打断只拷了一半。
+	# 旧写法先 rm 掉现有数据再 cp，cp 失败被忽略，接着 apply 会把所有集合
+	# flush 成空集，最后打印"已生效"返回 0 —— 一次 rollback 静默清空分流。
+	# 因此先把快照拷到暂存目录校验，确认无误后才原子替换。
+	mkdir -p "$WORK" 2>/dev/null || true
+	_stage=$WORK/rollback.new
+	rm -rf "$_stage"
+	mkdir -p "$_stage" || die "无法创建回滚暂存目录 $_stage"
+	if ! cp "$_last"*.txt "$_stage/" 2>/dev/null; then
+		rm -rf "$_stage"
+		die "历史快照 $_last 为空或已损坏（没有 .txt），拒绝回滚；现有数据未改动"
+	fi
+	_chk_rb() {
+		[ -s "$_stage/$1.txt" ] || {
+			rm -rf "$_stage"
+			die "历史快照缺少 $1.txt（快照不完整），拒绝回滚；现有数据未改动"
+		}
+	}
+	foreach_enabled _chk_rb
+
+	_old=$BASE/data.old
+	rm -rf "$_old"
+	if [ -d "$DATA" ]; then
+		mv "$DATA" "$_old" || { rm -rf "$_stage"; die "无法替换数据目录，现有数据未改动"; }
+	fi
+	if ! mv "$_stage" "$DATA"; then
+		[ -d "$_old" ] && mv "$_old" "$DATA"
+		die "回滚替换失败，已恢复原数据"
+	fi
+	rm -rf "$_old"
+	# 快照里带 .stamp 就沿用，status 才能显示这份数据的真实时间
+	[ -f "$_last/.stamp" ] && cp "$_last/.stamp" "$DATA/.stamp" 2>/dev/null
+
 	log "回滚到 $_last"
-	rm -f "$DATA"/*.txt
-	cp "$_last"*.txt "$DATA/"
 	cmd_apply
 }
 
