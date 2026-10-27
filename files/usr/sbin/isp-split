@@ -62,6 +62,17 @@ need_nft() {
 		die "table inet mwan3 不存在，请确认 mwan3-nft 已启动"
 }
 
+# work 目录（临时批处理/备份文件的家）是否真的可写。
+# 用子 shell 试探：ash 里特殊内建命令 `:` 的重定向失败会直接终止脚本，
+# 那样错误信息只有一行 "can't create ...: Read-only file system"，
+# 而且 wire 可能已经 commit 了 UCI 段。
+_work_writable() {
+	mkdir -p "$WORK" || return 1
+	( : > "$WORK/.write-test" ) 2>/dev/null || return 1
+	rm -f "$WORK/.write-test"
+	return 0
+}
+
 # 统计一个集合里的元素个数
 #
 # 坑：带 flags interval 的集合，nft list set 输出的是区间格式
@@ -380,7 +391,7 @@ cmd_apply() {
 	if ! nft list set inet mwan3 "$_fs" >/dev/null 2>&1; then
 		die "nft 中不存在集合 $_fs —— 集合由 wire 创建。先执行: isp-split wire（或 isp-split sync）"
 	fi
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	_gen_batch "$WORK/batch.nft" mwan3
 	[ -s "$WORK/batch.nft" ] || die "没有可应用的集合"
 
@@ -401,7 +412,7 @@ cmd_apply() {
 cmd_check() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	_gen_batch "$WORK/batch.nft" mwan3
 	[ -s "$WORK/batch.nft" ] || die "没有可应用的集合"
 
@@ -441,7 +452,7 @@ cmd_check() {
 cmd_selftest() {
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
-	mkdir -p "$WORK"
+	_work_writable || die "work 目录不可写（$WORK），未做任何改动"
 	log "在独立表 inet isptest 中实测加载（inet mwan3 不受影响）"
 
 	nft delete table inet isptest 2>/dev/null
@@ -506,7 +517,9 @@ _write_rule() {
 
 cmd_wire() {
 	need_nft
-	mkdir -p "$WORK"
+	# 先确认 work 目录可写再动 UCI：否则可能 commit 了 ipset 段之后才发现
+	# 写不了规则片段，留下半套配置。
+	_work_writable || die "work 目录不可写（$WORK）：无法写入规则片段，配置未改动"
 
 	# 1. 集合声明
 	_wire_all() { _wire_ipset "$1" "$2"; }
@@ -514,9 +527,15 @@ cmd_wire() {
 	uci -q commit mwan3
 
 	# 2. 规则片段
-	: > "$WORK/rules.txt"
+	: > "$WORK/rules.txt" || die "无法写入 $WORK/rules.txt（work 目录不可写？）"
 	_write_all() { _write_rule "$1" "$2" "$3"; }
 	foreach_enabled _write_all
+
+	# 一条规则都没有时，splice 会把配置文件里现有的 isp-split 规则块整段删掉。
+	# 这是合法操作（用户可能把运营商全禁用了），但必须说出来，不能只打印
+	# "规则已注入" 让人以为一切正常。
+	[ -s "$WORK/rules.txt" ] ||
+		log "警告：ISP_TABLE 中没有启用的运营商，本次规则块为空（已有 isp-split 规则将被移除）"
 
 	# 校验策略是否存在，避免生成指向不存在策略的规则
 	for row in $ISP_TABLE; do
@@ -532,7 +551,8 @@ cmd_wire() {
 	done
 
 	# 4. 插入到正确位置
-	cp "$CFG_MWAN3" "$WORK/mwan3.bak"
+	cp "$CFG_MWAN3" "$WORK/mwan3.bak" ||
+		die "无法备份 $CFG_MWAN3 到 $WORK/mwan3.bak，配置未改动"
 	awk -v insert="$WORK/rules.txt" -v anchor="$ISP_ANCHOR" \
 		-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" ||
 		die "规则注入失败（锚点缺失或配置不可写），配置未改动"
