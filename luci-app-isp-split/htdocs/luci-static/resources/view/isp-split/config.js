@@ -102,12 +102,23 @@ function isSetName(s) {
 
 return view.extend({
 	load: function() {
-		return run(['conf', 'get']);
+		/* 配置字段走 conf get；数据源健康度走 health --json。
+		   health 失败不能拖垮整个配置页：捕获后渲染成“读取失败”。 */
+		return Promise.all([
+			run(['conf', 'get']),
+			fs.exec(CMD, ['health', '--json']).catch(function() { return null; })
+		]);
 	},
 
 	render: function(res) {
 		var self = this;
-		var out = (res && res.stdout) || '';
+		var out = (res && res[0] && res[0].stdout) || '';
+		var health = null;
+		try {
+			health = JSON.parse(((res[1] && res[1].stdout) || '').trim() || 'null');
+		} catch (e) {
+			health = null;
+		}
 
 		var model = {
 			mode: 'bind',
@@ -513,6 +524,77 @@ return view.extend({
 			}
 		}, [ svgIcon('plus'), E('span', {}, [_('添加域名')]) ]);
 
+		/* ============================================================ 四、数据源（只读） */
+
+		/* 数据源地址是 root 路径的下载入口，配置页不开放编辑：
+		   一个非法 URL 就能让 root 去拉任意内容。这里只展示现状，
+		   修改方式指向 CONFIGURATION.md 的「多数据源」一节。 */
+		var srcTbody = E('tbody', {});
+		var srcRows = (health && health.sources) || [];
+		var verifyEnabled = !!(health && health.verify_enabled);
+
+		function srcRoleText(role) {
+			if (role === 'primary')
+				return _('主源');
+			if (role === 'verify')
+				return _('校验源');
+			if (role === 'audit')
+				return _('审计源');
+			return role || '—';
+		}
+
+		function renderSources() {
+			while (srcTbody.firstChild)
+				srcTbody.removeChild(srcTbody.firstChild);
+
+			if (!srcRows.length) {
+				srcTbody.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 6, 'data-th': '' }, [
+						E('div', { 'class': 'isp-empty' }, [
+							health
+								? _('没有数据源信息。')
+								: _('读取数据源状态失败，请检查 isp-split health --json。')
+						])
+					])
+				]));
+				return;
+			}
+
+			srcRows.forEach(function(s) {
+				var tag = 'isp-tag is-ok';
+				var text = _('正常');
+				if (s.status === 'disabled') {
+					tag = 'isp-tag';
+					text = _('未启用校验');
+				} else if (s.max_fail && s.fail_days >= s.max_fail) {
+					tag = 'isp-tag is-bad';
+					text = _('拒绝更新') + ' ' + s.fail_days + '/' + s.max_fail;
+				} else if (s.fail_days > 0) {
+					tag = 'isp-tag is-warn';
+					text = _('降级') + ' ' + s.fail_days + '/' + s.max_fail;
+				}
+
+				srcTbody.appendChild(E('tr', {}, [
+					E('td', { 'data-th': _('源') }, [ s.label || s.name ]),
+					E('td', { 'data-th': _('角色') }, [
+						E('span', { 'class': 'isp-tag' }, [ srcRoleText(s.role) ])
+					]),
+					E('td', { 'data-th': _('状态') }, [
+						E('span', { 'class': tag }, [ text ])
+					]),
+					E('td', { 'data-th': _('最近 Jaccard') }, [
+						s.jaccard != null ? (s.jaccard + '%') : '—'
+					]),
+					E('td', { 'data-th': _('最后成功') }, [ s.last_ok_text || '—' ]),
+					E('td', { 'data-th': _('连续失败') }, [
+						String(s.fail_days || 0)
+					])
+				]));
+			});
+		}
+
+		renderSources();
+
 		/* ============================================================ 保存 / 预检 */
 
 		function values() {
@@ -714,6 +796,45 @@ return view.extend({
 					domTbody
 				]),
 				E('div', { 'class': 'isp-btn-row' }, [ addDomBtn ])
+			]),
+
+			/* ---- 数据源（只读） ---- */
+			E('section', { 'class': 'isp-section' }, [
+				E('h3', {}, [ _('数据源'), E('span', { 'class': 'isp-tag' }, [ _('只读') ]) ]),
+				E('p', { 'class': 'isp-desc' }, [
+					_('主源出数据，校验源只跑日 diff；分歧超阈值会拒绝更新并保留旧数据。'),
+					_('为避免把非法 URL 写进 root 路径，本页只展示、不开放编辑。')
+				]),
+				E('div', { 'class': 'isp-btn-row' }, [
+					E('span', {
+						'class': 'isp-tag' + (verifyEnabled ? ' is-ok' : '')
+					}, [ verifyEnabled ? _('校验已启用') : _('校验未启用') ]),
+					E('span', { 'class': 'isp-tag' }, [
+						_('源声明来自 ISP_SOURCES')
+					])
+				]),
+				E('table', { 'class': 'isp-form-table' }, [
+					E('thead', {}, [
+						E('tr', {}, [
+							E('th', {}, [_('源')]),
+							E('th', {}, [_('角色')]),
+							E('th', {}, [_('状态')]),
+							E('th', {}, [_('最近 Jaccard')]),
+							E('th', {}, [_('最后成功')]),
+							E('th', {}, [_('连续失败')])
+						])
+					]),
+					srcTbody
+				]),
+				E('div', { 'class': 'isp-note' }, [
+					_('修改数据源请编辑 /etc/isp-split.conf 的 ISP_SOURCES / ISP_SOURCE_FILES，'),
+					E('a', {
+						'href': 'https://github.com/jihebube/openwrt-isp-split/blob/main/docs/CONFIGURATION.md',
+						'target': '_blank',
+						'rel': 'noopener'
+					}, [ _('配置文档') ]),
+					_(' 的「多数据源」一节有完整字段说明与降级行为表。')
+				])
 			]),
 
 			E('div', { 'class': 'isp-footer-actions' }, [
