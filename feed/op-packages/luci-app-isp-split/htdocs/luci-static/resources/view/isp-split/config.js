@@ -13,7 +13,17 @@
 var CMD = '/usr/sbin/isp-split';
 
 function run(args) {
-	return fs.exec(CMD, args);
+	return fs.exec(CMD, args).then(function(res) {
+		// fs.exec 不管退出码都会 resolve。旧实现直接返回结果，
+		// 于是 conf set 校验失败 / wire 失败时页面照样弹"已保存并生效"，
+		// 错误只藏在下面的日志框里。这里把非 0 转成 reject。
+		if (res && res.code) {
+			var out = ((res.stdout || '') + (res.stderr || '')).trim();
+			throw new Error('isp-split ' + args.join(' ') +
+				' 失败（退出码 ' + res.code + '）' + (out ? '：' + out : ''));
+		}
+		return res;
+	});
 }
 
 return view.extend({

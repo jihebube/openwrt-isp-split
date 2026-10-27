@@ -23,7 +23,16 @@ function fmtBytes(n) {
 
 return view.extend({
 	exec: function(args) {
-		return fs.exec('/usr/sbin/isp-split', args);
+		// fs.exec 不会因退出码非 0 而 reject：旧实现把 wire/apply 的失败
+		// 也显示成"已完成"（绿色通知），用户以为改动生效了。
+		return fs.exec('/usr/sbin/isp-split', args).then(function(res) {
+			if (res && res.code) {
+				var out = ((res.stdout || '') + (res.stderr || '')).trim();
+				throw new Error('isp-split ' + args.join(' ') +
+					' 失败（退出码 ' + res.code + '）' + (out ? '：' + out : ''));
+			}
+			return res;
+		});
 	},
 
 	setOut: function(text) {
