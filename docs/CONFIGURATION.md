@@ -126,12 +126,30 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ISP_MIRROR` | `https://ispip.clang.cn` | 数据源 |
-| `ISP_CRON` | `17 4 * * *` | 每日更新时间（cron 表达式） |
+| `ISP_MIRROR` | `https://ispip.clang.cn` | 数据源，必须是 `https://` |
+| `ISP_CRON` | `17 4 * * *` | 每日更新时间（只能是 5 段 cron 时间字段） |
 | `DNSDIR` | `/etc/isp-split/dnsmasq.d` | 旧版片段目录（仅用于迁移/清理，新版本不再写入） |
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
 | `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |
+
+### 下载与熔断（v0.1.4 安全加固）
+
+`fetch` 对源数据有三道闸门，都是为了防"数据被污染 → 流量被导到错误出口"：
+
+| 闸门 | 默认 | 说明 |
+|---|---|---|
+| 协议 | 只接受 `https://` | 明文 HTTP 会被中间人改写；确实需要时设环境变量 `ISP_SPLIT_ALLOW_HTTP=1` |
+| 单文件体积 | 4 MiB | 正常数据 < 300 KB；可用 `ISP_SPLIT_MAX_RAW_BYTES` 调整 |
+| 总量/增幅 | 25% IPv4 / 2 倍 | 单集合 50% 只是第一道；另外要求所有集合合计不超过 25%，且与上一份数据相比不翻倍 |
+
+命中熔断时 `fetch` 会拒绝本次更新并保留现有数据，**不会**动线上集合。确认源站确实大改版（例如新增运营商）后可显式放行：
+
+```sh
+ISP_SPLIT_FORCE_FETCH=1 isp-split fetch
+```
+
+`$BASE/data/.sets` 记录上一次启用的运营商列表；表结构变化（启用/停用某个运营商）会跳过"增幅"比较，只保留绝对上限。
 
 ---
 

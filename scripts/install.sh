@@ -117,9 +117,15 @@ remove_luci() {
 add_cron() {
 	mkdir -p /etc/crontabs
 	touch /etc/crontabs/root
-	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron 2>/dev/null || true
-	echo "17 4 * * * /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split" >> /tmp/.ispcron
-	mv /tmp/.ispcron /etc/crontabs/root
+	# 不要用固定的 /tmp/.ispcron：/tmp 世界可写，低权用户可以先把这个名字
+	# 做成指向任意文件的符号链接，root 的两次重定向就会写穿过去
+	# （详见 isp-split 主脚本里 _cron_rewrite 的说明）。
+	# mktemp 用 O_EXCL 建文件，抢不到名字；临时文件放在 /etc 下，
+	# 与目标同文件系统，rename 才是原子的。
+	_cron_tmp=$(mktemp /etc/.isp-split-cron.XXXXXX) || die "无法创建 crontab 临时文件"
+	grep -v 'isp-split' /etc/crontabs/root > "$_cron_tmp" 2>/dev/null || true
+	echo "17 4 * * * /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split" >> "$_cron_tmp"
+	mv -f "$_cron_tmp" /etc/crontabs/root || { rm -f "$_cron_tmp"; die "无法更新 crontab"; }
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 	say "已启用每日 04:17 自动更新数据（refresh，不改 mwan3 配置）"
 }

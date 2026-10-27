@@ -858,6 +858,243 @@ else
 	ng "CRLF 配置解析异常: 读到 $_bug9_n 行（期望 2）"
 fi
 
+echo "== 10. 安全回归（SEC-1 ~ SEC-9）"
+
+# 统一的“跑一个子命令”入口：隔离的 PATH + 独立 BASE/CONF。
+_sec_run() {
+	(
+		PATH="$TMP/fakebin:$PATH"
+		ISP_SPLIT_CONF="$1"
+		ISP_SPLIT_BASE="$2"
+		ISP_SPLIT_CRONTAB="${3:-$TMP/sec/crontabs/root}"
+		DNSMASQ_SERVICE=/bin/true
+		DNS_RETRY_TRIES=1
+		DNS_RETRY_DELAY=0
+		MWAN3_READY_TRIES=1
+		MWAN3_READY_DELAY=0
+		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_CRONTAB \
+			DNSMASQ_SERVICE DNS_RETRY_TRIES DNS_RETRY_DELAY \
+			MWAN3_READY_TRIES MWAN3_READY_DELAY
+		shift 3 2>/dev/null || true
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		"$@"
+	)
+}
+mkdir -p "$TMP/sec/crontabs"
+printf 'ISP_TABLE="a:isp_a:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' \
+	> "$TMP/cron.conf"
+
+# SEC-1：crontab 中转文件不能跟随符号链接（旧实现写穿到 /tmp/.ispcron 目标）
+printf 'SENTINEL\n' > "$TMP/sec/cron-victim"
+ln -sf "$TMP/sec/cron-victim" "$TMP/sec/crontabs/root"
+printf '0 4 * * * /bin/true # isp-split\n' > "$TMP/sec/other"
+if _sec_run "$TMP/cron.conf" "$TMP/sec/base" "$TMP/sec/crontabs/root" \
+	_cron_rewrite '17 4 * * * /usr/sbin/isp-split refresh # isp-split' >/dev/null 2>&1; then
+	if [ "$(cat "$TMP/sec/cron-victim")" = "SENTINEL" ] &&
+		[ ! -L "$TMP/sec/crontabs/root" ] &&
+		grep -q 'isp-split refresh' "$TMP/sec/crontabs/root"; then
+		ok "crontab 改写不跟随符号链接（SEC-1）"
+	else
+		ng "crontab 改写仍然写穿了符号链接（SEC-1）"
+	fi
+else
+	ng "_cron_rewrite 执行失败（SEC-1）"
+fi
+
+# SEC-2：ISP_CRON 只能是 5 段 cron 时间字段（它会原样进 crontab）
+if _sec_run "$TMP/cron.conf" "$TMP/sec/base" "$TMP/sec/crontabs/root" \
+	_cron_expr_ok '* * * * * root id > /tmp/x' >/dev/null 2>&1; then
+	ng "ISP_CRON 中夹带命令仍被接受（SEC-2）"
+elif _sec_run "$TMP/cron.conf" "$TMP/sec/base" "$TMP/sec/crontabs/root" \
+	_cron_expr_ok '17 4 * * *' >/dev/null 2>&1; then
+	ok "ISP_CRON 只接受 5 段时间字段（SEC-2）"
+else
+	ng "合法 ISP_CRON 被误判为非法（SEC-2）"
+fi
+
+# SEC-3：dnsmasq conf-dir 只接受 root 属主且组/他人不可写的目录，
+#        且伪造的 ps 行（参数里带 dnsmasq --conf-dir=...）不能被采信
+mkdir -p "$TMP/sec/world" "$TMP/sec/evil/run"
+chmod 777 "$TMP/sec/world"
+if _sec_run "$TMP/cron.conf" "$TMP/sec/base" "$TMP/sec/crontabs/root" \
+	_dns_dir_ok "$TMP/sec/world" >/dev/null 2>&1; then
+	ng "组/他人可写的 conf-dir 被当成可信目录（SEC-3）"
+else
+	ok "组/他人可写的 conf-dir 被拒绝（SEC-3）"
+fi
+if _sec_run "$TMP/cron.conf" "$TMP/sec/base" "$TMP/sec/crontabs/root" \
+	_dns_dir_ok relative/dir >/dev/null 2>&1; then
+	ng "相对路径 conf-dir 被接受（SEC-3）"
+else
+	ok "相对路径 conf-dir 被拒绝（SEC-3）"
+fi
+cat > "$TMP/sec/fakebin-ps" <<EOF
+#!/bin/sh
+echo "  999 root 1234 S sh -c sleep 60"
+echo "  998 root 1234 S dnsmasq --conf-dir=$TMP/sec/evil"
+EOF
+chmod +x "$TMP/sec/fakebin-ps"
+mkdir -p "$TMP/sec/psbin"
+cp "$TMP/sec/fakebin-ps" "$TMP/sec/psbin/ps"
+if _sec_detect=$(
+	PATH="$TMP/sec/psbin:$TMP/fakebin:$PATH"
+	ISP_SPLIT_CONF="$TMP/cron.conf"
+	ISP_SPLIT_BASE="$TMP/sec/base"
+	DNSMASQ_CONF_GLOB="$TMP/sec/no-such-conf.*"
+	DNSMASQ_DEFAULT_DIR="$TMP/sec/default.d"
+	export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	_dns_confdir_detect >/dev/null
+	printf '%s' "$DNS_CONFDIR_SOURCE"
+); then
+	if [ "$_sec_detect" = "ps" ]; then
+		ng "伪造的 ps 行仍被采信为 dnsmasq conf-dir（SEC-3）"
+	else
+		ok "伪造的 ps 行不再影响 conf-dir 探测（SEC-3）"
+	fi
+fi
+
+# SEC-4：只接受 https 镜像；单文件体积有上限
+printf 'ISP_TABLE="a:isp_a:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\nISP_MIRROR="http://mirror.test"\n' \
+	> "$TMP/sec/http.conf"
+if _sec_run "$TMP/sec/http.conf" "$TMP/sec/base4" "$TMP/sec/crontabs/root" \
+	cmd_fetch >/dev/null 2>&1; then
+	ng "明文 HTTP 镜像仍被接受（SEC-4）"
+else
+	ok "明文 HTTP 镜像被拒绝（SEC-4）"
+fi
+mkdir -p "$TMP/sec/mirror" "$TMP/sec/secbin"
+cat > "$TMP/sec/secbin/uclient-fetch" <<'FAKE_FETCH'
+#!/bin/sh
+out=""
+url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-O) out=$2; shift 2 ;;
+	-q) shift ;;
+	-T) shift 2 ;;
+	*) url=$1; shift ;;
+	esac
+done
+[ -n "$out" ] || exit 1
+cp "$SEC_MIRROR/${url##*/}" "$out"
+FAKE_FETCH
+chmod +x "$TMP/sec/secbin/uclient-fetch"
+printf 'https://mirror.test\n' > "$TMP/sec/mirror-url"
+printf 'ISP_TABLE="a:isp_a:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' > "$TMP/sec/fetch.conf"
+awk 'BEGIN { for (i = 0; i < 5000; i++) printf "%01024d\n", i }' > "$TMP/sec/mirror/a.txt"
+if SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
+	ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base4" \
+	ISP_MIRROR="https://mirror.test" \
+	sh "$ROOT/files/usr/sbin/isp-split" fetch >/dev/null 2>&1; then
+	ng "超大源文件仍被接受（SEC-4）"
+else
+	ok "超大源文件被拒绝（SEC-4）"
+fi
+
+# SEC-5：分步投毒熔断（总量上限 + 相对上一份的增幅）
+printf '1.0.0.0/8\n2.0.0.0/8\n3.0.0.0/8\n4.0.0.0/8\n5.0.0.0/8\n6.0.0.0/8\n' \
+	> "$TMP/sec/mirror/a.txt"
+_sec_fetch() {
+	SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
+		ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base5" \
+		ISP_MIRROR="https://mirror.test" \
+		sh "$ROOT/files/usr/sbin/isp-split" fetch
+}
+if _sec_fetch >/dev/null 2>&1 && [ -f "$TMP/sec/base5/data/.sets" ]; then
+	ok "首次 fetch 写入 .sets（SEC-5 前置）"
+else
+	ng "首次 fetch 失败或未写 .sets（SEC-5 前置）"
+fi
+i=1
+: > "$TMP/sec/mirror/a.txt"
+while [ $i -le 18 ]; do
+	echo "$i.0.0.0/8" >> "$TMP/sec/mirror/a.txt"
+	i=$((i + 1))
+done
+if _sec_fetch >/dev/null 2>&1; then
+	ng "地址数翻三倍的更新仍被接受（SEC-5）"
+else
+	ok "地址数翻三倍的更新被拒绝（SEC-5）"
+fi
+if ISP_SPLIT_FORCE_FETCH=1 SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
+	ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base5" \
+	ISP_MIRROR="https://mirror.test" \
+	sh "$ROOT/files/usr/sbin/isp-split" fetch >/dev/null 2>&1; then
+	ok "ISP_SPLIT_FORCE_FETCH=1 可显式放行（SEC-5）"
+else
+	ng "ISP_SPLIT_FORCE_FETCH=1 未生效（SEC-5）"
+fi
+
+# SEC-6：读取侧复校验——非法集合名/策略名进不了 nft/uci 参数
+printf 'ISP_TABLE="a:isp_a;flushruleset:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' \
+	> "$TMP/sec/inject.conf"
+if _sec_run "$TMP/sec/inject.conf" "$TMP/sec/base6" "$TMP/sec/crontabs/root" \
+	cmd_plan >/dev/null 2>&1; then
+	ng "非法集合名（含 ;）仍被 cmd_plan 接受（SEC-6）"
+else
+	ok "非法集合名被读取侧拒绝（SEC-6）"
+fi
+printf 'ISP_TABLE="a:isp_a:wan_only;id:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' \
+	> "$TMP/sec/inject2.conf"
+if _sec_run "$TMP/sec/inject2.conf" "$TMP/sec/base6" "$TMP/sec/crontabs/root" \
+	cmd_export text "$TMP/sec/export6" >/dev/null 2>&1; then
+	ng "非法策略名仍被 cmd_export 接受（SEC-6）"
+else
+	ok "非法策略名被 cmd_export 拒绝（SEC-6）"
+fi
+
+# SEC-7：export 不得写入系统目录；目标位置的符号链接不被跟随
+mkdir -p "$TMP/sec/export7/data"
+printf '1.2.3.0/24\n' > "$TMP/sec/export7/data/a.txt"
+printf 'ISP_TABLE="a:isp_a:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' \
+	> "$TMP/sec/export7/conf"
+if _sec_run "$TMP/sec/export7/conf" "$TMP/sec/export7" "$TMP/sec/crontabs/root" \
+	cmd_export text /etc/init.d >/dev/null 2>&1; then
+	ng "export 仍允许写入 /etc/init.d（SEC-7）"
+else
+	ok "export 拒绝写入系统目录（SEC-7）"
+fi
+_mkdir_out=$TMP/sec/export7/out
+mkdir -p "$_mkdir_out"
+printf 'SENTINEL7\n' > "$TMP/sec/export7/victim.txt"
+ln -sf "$TMP/sec/export7/victim.txt" "$_mkdir_out/isp-a.txt"
+if _sec_run "$TMP/sec/export7/conf" "$TMP/sec/export7" "$TMP/sec/crontabs/root" \
+	cmd_export text "$_mkdir_out" >/dev/null 2>&1 &&
+	[ "$(cat "$TMP/sec/export7/victim.txt")" = "SENTINEL7" ] &&
+	[ ! -L "$_mkdir_out/isp-a.txt" ]; then
+	ok "export 不跟随目标符号链接（SEC-7）"
+else
+	ng "export 仍会写穿符号链接（SEC-7）"
+fi
+
+# SEC-8：表值里的通配符会让 `for row in $ISP_TABLE` 拿文件名当配置行
+printf 'ISP_TABLE="a:isp_a:wan_only:1 *"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE="bind"\n' \
+	> "$TMP/sec/glob.conf"
+mkdir -p "$TMP/sec/globcwd"
+: > "$TMP/sec/globcwd/attacker:isp_pwn:wan_only:1"
+if ( cd "$TMP/sec/globcwd" && ISP_SPLIT_CONF="$TMP/sec/glob.conf" \
+	ISP_SPLIT_BASE="$TMP/sec/base8" sh "$ROOT/files/usr/sbin/isp-split" plan ) \
+	>/dev/null 2>&1; then
+	ng "含通配符的 ISP_TABLE 仍被接受（SEC-8）"
+else
+	ok "含通配符的 ISP_TABLE 在入口被拒绝（SEC-8）"
+fi
+
+# SEC-9：BASE 会被 rm -rf，必须挡住 "/" 与相对路径
+if ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE=/ \
+	sh "$ROOT/files/usr/sbin/isp-split" status >/dev/null 2>&1; then
+	ng "ISP_SPLIT_BASE=/ 仍被接受（SEC-9）"
+else
+	ok "ISP_SPLIT_BASE=/ 被拒绝（SEC-9）"
+fi
+if ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE=relative \
+	sh "$ROOT/files/usr/sbin/isp-split" status >/dev/null 2>&1; then
+	ng "相对路径 ISP_SPLIT_BASE 仍被接受（SEC-9）"
+else
+	ok "相对路径 ISP_SPLIT_BASE 被拒绝（SEC-9）"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]

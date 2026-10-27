@@ -62,8 +62,12 @@ case "$${1:-}" in
 	upgrade|pre-upgrade|*upgrade*) exit 0 ;;
 esac
 if [ -f /etc/crontabs/root ]; then
-	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron.$$$$ 2>/dev/null || true
-	mv /tmp/.ispcron.$$$$ /etc/crontabs/root 2>/dev/null || true
+	# mktemp 而不是 /tmp/.ispcron.$$：PID 可预测，符号链接能抢占（SEC-1）
+	_cron_tmp=$$(mktemp /etc/.isp-split-cron.XXXXXX) || _cron_tmp=""
+	if [ -n "$$_cron_tmp" ]; then
+		grep -v 'isp-split' /etc/crontabs/root > "$$_cron_tmp" 2>/dev/null || true
+		mv -f "$$_cron_tmp" /etc/crontabs/root 2>/dev/null || rm -f "$$_cron_tmp"
+	fi
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 fi
 nft delete counter inet mwan3 isp_fallback >/dev/null 2>&1 || true

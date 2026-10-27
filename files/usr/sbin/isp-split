@@ -18,10 +18,26 @@ ISP_VERSION="0.1.4"
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
+# BASE 会被 cp/写文件，也会在 uninstall 里被 `rm -rf`。它可以从环境变量
+# 覆盖（离线自检用），所以先挡住危险值：空、根、相对路径、含 ".."。
+case "$BASE" in
+"" | "/" | "." | ".." | *..*)
+	echo "ISP_SPLIT_BASE 非法: '$BASE'" >&2
+	exit 1
+	;;
+/*) ;;
+*)
+	echo "ISP_SPLIT_BASE 必须是绝对路径: '$BASE'" >&2
+	exit 1
+	;;
+esac
 DATA=$BASE/data
 WORK=$BASE/work
 LIB=${ISP_SPLIT_LIB:-/usr/lib/isp-split}
 CFG_MWAN3=${ISP_SPLIT_MWAN3:-/etc/config/mwan3}
+# crontab 文件与 dnsmasq 服务脚本：允许覆盖仅用于离线自检。
+CRONTAB=${ISP_SPLIT_CRONTAB:-/etc/crontabs/root}
+DNSMASQ_SERVICE=${DNSMASQ_SERVICE:-/etc/init.d/dnsmasq}
 
 [ -f "$CONF" ] || { echo "缺少 $CONF" >&2; exit 1; }
 . "$CONF"
@@ -37,6 +53,10 @@ DOMAIN_SPLIT=$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')
 ISP_ANCHOR=${ISP_ANCHOR:-'dest_port|src_port|default_rule|https|internet'}
 ISP_CRON=${ISP_CRON:-"17 4 * * *"}
 PROBE_BYTES=${PROBE_BYTES:-33554432}
+# 单个源文件的体积上限（默认 4 MiB）。正常数据 < 300 KB；
+# 镜像被劫持或换源换错时，一个超大响应会直接写满 overlay（/etc 就在
+# overlay 上），路由器连重启都可能起不来。
+MAX_RAW_BYTES=${ISP_SPLIT_MAX_RAW_BYTES:-4194304}
 PROBE_TIME=${PROBE_TIME:-25}
 
 # mwan3 reload 是异步的：命令返回时 nft 链可能还在重建。
@@ -63,13 +83,13 @@ need_nft() {
 }
 
 # work 目录（临时批处理/备份文件的家）是否真的可写。
-# 用子 shell 试探：ash 里特殊内建命令 `:` 的重定向失败会直接终止脚本，
-# 那样错误信息只有一行 "can't create ...: Read-only file system"，
-# 而且 wire 可能已经 commit 了 UCI 段。
+# 用 mktemp 探路而不是固定名字 .write-test：固定名字在可写目录里
+# （例如把 BASE 指到 /tmp 下的测试/容器场景）能被低权用户预先做成
+# 符号链接，root 的 `: > 文件` 会顺着链接把目标截断。
 _work_writable() {
 	mkdir -p "$WORK" || return 1
-	( : > "$WORK/.write-test" ) 2>/dev/null || return 1
-	rm -f "$WORK/.write-test"
+	_wt=$(mktemp "$WORK/.write-test.XXXXXX" 2>/dev/null) || return 1
+	rm -f "$_wt"
 	return 0
 }
 
@@ -107,8 +127,26 @@ count_set_elements() {
 # 按 ISP_TABLE 顺序输出运营商源名
 priority_list() {
 	for row in $ISP_TABLE; do
+		case "$row" in \#*) continue ;; esac
+		_row_check_row "$row"
 		printf '%s ' "${row%%:*}"
 	done
+}
+
+# 已启用集合的源名列表（空格分隔）。用来说明"运营商表有没有变化"：
+# 启用/停用某个运营商会合法地改变地址总量，增幅熔断要跳过这种情况。
+_enabled_src_list() {
+	_el=""
+	for row in $ISP_TABLE; do
+		_old_ifs=$IFS
+		IFS=':'
+		set -- $row
+		IFS=$_old_ifs
+		[ $# -ge 4 ] || continue
+		[ "$4" = "1" ] || continue
+		_el="${_el:+$_el }$1"
+	done
+	printf '%s\n' "$_el"
 }
 
 # 遍历启用的运营商，逐行回调：cb <源名> <集合名> <策略>
@@ -119,7 +157,10 @@ foreach_enabled() {
 		IFS=':'
 		set -- $row
 		IFS=$_old_ifs
-		[ $# -ge 4 ] || continue
+		case "$row" in \#*) continue ;; esac
+		[ $# -ge 4 ] ||
+			die "ISP_TABLE 行格式错误（应为 源:集合:策略:0|1）: $row"
+		_row_check "$1" "$2" "$3" "$4"
 		[ "$4" = "1" ] || continue
 		$_cb "$1" "$2" "$3"
 	done
@@ -142,14 +183,37 @@ fetch_one() {
 
 cmd_fetch() {
 	mkdir -p "$WORK" || die "无法创建 $WORK"
+
+	# 数据源协议：只接受 https。明文 HTTP 下任何人都能在链路上把运营商
+	# 网段整段换掉（把某个集合指向别人的地址段 = 把流量导到特定出口），
+	# 而本工具没有任何签名/摘要校验来兜底。确实需要 http 镜像时显式
+	# 设 ISP_SPLIT_ALLOW_HTTP=1。
+	case "$ISP_MIRROR" in
+	https://*) ;;
+	http://*)
+		[ "${ISP_SPLIT_ALLOW_HTTP:-0}" = "1" ] ||
+			die "ISP_MIRROR 是明文 HTTP（$ISP_MIRROR）：数据可被中间人替换。改用 https://，或确认风险后设 ISP_SPLIT_ALLOW_HTTP=1"
+		log "警告：ISP_MIRROR 使用明文 HTTP（已按 ISP_SPLIT_ALLOW_HTTP=1 放行），数据完整性无保证"
+		;;
+	*)
+		die "ISP_MIRROR 必须形如 https://host（当前: $ISP_MIRROR）"
+		;;
+	esac
+
 	rm -rf "$WORK/raw.new" "$WORK/out.new"
 	mkdir -p "$WORK/raw.new"
 
 	for row in $ISP_TABLE; do
+		case "$row" in \#*) continue ;; esac
+		_row_check_row "$row"
 		_src=${row%%:*}
 		log "下载 $_src"
 		fetch_one "$ISP_MIRROR/$_src.txt" "$WORK/raw.new/$_src.raw" ||
 			die "$_src 下载失败，保留现有数据不动"
+		_sz=$(wc -c < "$WORK/raw.new/$_src.raw" 2>/dev/null | tr -d ' ')
+		if [ "${_sz:-0}" -gt "$MAX_RAW_BYTES" ]; then
+			die "$_src 下载体积 ${_sz} 字节，超过上限 $MAX_RAW_BYTES 字节，拒绝本次更新"
+		fi
 		_n=$(grep -c '[0-9]' "$WORK/raw.new/$_src.raw" 2>/dev/null)
 		_n=${_n:-0}
 		[ "$_n" -gt 5 ] || die "$_src 内容异常（仅 $_n 行），拒绝覆盖现有数据"
@@ -191,6 +255,46 @@ cmd_fetch() {
 	}
 	foreach_enabled _fetch_guard
 
+	# 熔断（续）：单集合 50% 只挡得住"一步到位"的投毒，两种方式能绕过：
+	#   1) 把 60% 的地址平分给 3 个集合，每个都不到 50%；
+	#   2) 先给正常数据，再每天放大一点，永远不触发 50%。
+	# 这里补两条上限：总量绝对值（25% IPv4）与相对上一份数据的增幅（2 倍）。
+	# 运营商表变化时跳过增幅比较——启用/停用运营商会合法地改变总量。
+	# 两条都能用 ISP_SPLIT_FORCE_FETCH=1 显式放行（源站大改版时的逃生口）。
+	_addr_total=0
+	_addr_add() {
+		[ -s "$1" ] || return 0
+		_at_v=$(awk '
+			{
+				split($0, p, "/")
+				if (p[2] !~ /^[0-9]+$/) next
+				t += 2 ^ (32 - (p[2] + 0))
+			}
+			END { printf "%.0f", t }
+		' "$1" 2>/dev/null)
+		_addr_total=$((_addr_total + ${_at_v:-0}))
+	}
+	_addr_new() { _addr_add "$WORK/out.new/$1.txt"; }
+	_addr_old() { _addr_add "$DATA/$1.txt"; }
+
+	_addr_total=0
+	foreach_enabled _addr_new
+	_new_total=$_addr_total
+	_addr_total=0
+	foreach_enabled _addr_old
+	_old_total=$_addr_total
+
+	_force=${ISP_SPLIT_FORCE_FETCH:-0}
+	if [ "$_new_total" -gt 1073741824 ] && [ "$_force" != "1" ]; then
+		die "所有集合合计 $_new_total 个地址，超过 IPv4 总量的 25%，拒绝本次更新（疑似源数据被污染；确认数据无误可设 ISP_SPLIT_FORCE_FETCH=1 再试）"
+	fi
+	_sets_prev=$(cat "$DATA/.sets" 2>/dev/null || true)
+	if [ "$_old_total" -gt 0 ] && [ -n "$_sets_prev" ] &&
+		[ "$_sets_prev" = "$(_enabled_src_list)" ] &&
+		[ "$_new_total" -gt $((_old_total * 2)) ] && [ "$_force" != "1" ]; then
+		die "本次数据地址数比上一份翻倍以上（$_old_total -> $_new_total），拒绝本次更新（疑似分步投毒；确认数据无误可设 ISP_SPLIT_FORCE_FETCH=1 再试）"
+	fi
+
 	mkdir -p "$BASE/.history"
 	if [ -d "$DATA" ]; then
 		_ts=$(date +%Y%m%d-%H%M%S)
@@ -217,6 +321,9 @@ cmd_fetch() {
 		{ rm -rf "$_new"; die "写入新数据失败（磁盘空间不足？），现有数据未改动"; }
 	date +%s > "$_new/.stamp" ||
 		{ rm -rf "$_new"; die "无法写入数据时间戳，现有数据未改动"; }
+	# 记录本次启用的运营商，下次 fetch 用它判断"表变了没有"
+	_enabled_src_list > "$_new/.sets" ||
+		{ rm -rf "$_new"; die "无法写入运营商列表，现有数据未改动"; }
 
 	_chk_new() {
 		[ -s "$_new/$1.txt" ] || {
@@ -382,7 +489,9 @@ cmd_apply() {
 		IFS=':'
 		set -- $_row
 		IFS=$_old_ifs
-		[ $# -ge 4 ] || continue
+		case "$_row" in \#*) continue ;; esac
+		[ $# -ge 4 ] || die "ISP_TABLE 行格式错误（应为 源:集合:策略:0|1）: $_row"
+		_row_check "$1" "$2" "$3" "$4"
 		[ "$4" = "1" ] || continue
 		_fs=$2
 		break
@@ -538,17 +647,11 @@ cmd_wire() {
 		log "警告：ISP_TABLE 中没有启用的运营商，本次规则块为空（已有 isp-split 规则将被移除）"
 
 	# 校验策略是否存在，避免生成指向不存在策略的规则
-	for row in $ISP_TABLE; do
-		_old_ifs=$IFS
-		IFS=':'
-		set -- $row
-		IFS=$_old_ifs
-		[ $# -ge 4 ] && [ "$4" = "1" ] || continue
-		_pol=$3
-		if ! uci -q get "mwan3.$_pol" >/dev/null 2>&1; then
-			die "mwan3 中不存在策略 '$_pol'，请先在 MultiWAN 管理器里创建，或修改 $CONF"
-		fi
-	done
+	_pol_exists() {
+		uci -q get "mwan3.$3" >/dev/null 2>&1 ||
+			die "mwan3 中不存在策略 '$3'，请先在 MultiWAN 管理器里创建，或修改 $CONF"
+	}
+	foreach_enabled _pol_exists
 
 	# 4. 插入到正确位置
 	cp "$CFG_MWAN3" "$WORK/mwan3.bak" ||
@@ -712,7 +815,10 @@ cmd_plan() {
 		IFS=':'
 		set -- $row
 		IFS=$_old_ifs
-		[ $# -ge 4 ] || continue
+		case "$row" in \#*) continue ;; esac
+		[ $# -ge 4 ] ||
+			die "ISP_TABLE 行格式错误（应为 源:集合:策略:0|1）: $row"
+		_row_check "$1" "$2" "$3" "$4"
 		[ "$4" = "0" ] || continue
 		_dp_any=1
 		_dp_res=""
@@ -1117,6 +1223,28 @@ _dns_confdir_detect_emit() {
 	done
 }
 
+# 目录能不能作为片段写入目标（安全判定，不是功能判定）：
+#   - 必须是绝对路径、已存在的目录
+#   - 属主必须是 root
+#   - 组/其他人不可写
+# 为什么：片段是 root 写的，dnsmasq 也是 root 读的。若目录属于低权用户
+# （例如他在 /tmp 下预先建好 conf-dir 目标），他就能在里面放
+# isp-split.conf -> /etc/... 之类的符号链接，让 root 写穿到任意文件。
+_dns_dir_ok() {
+	_dk_d=${1:-}
+	case "$_dk_d" in /*) ;; *) return 1 ;; esac
+	[ -d "$_dk_d" ] || return 1
+	_dk_m=$(ls -ldn "$_dk_d" 2>/dev/null) || return 1
+	[ -n "$_dk_m" ] || return 1
+	_dk_uid=$(printf '%s\n' "$_dk_m" | awk '{print $3}')
+	_dk_mode=$(printf '%s\n' "$_dk_m" | awk '{print $1}')
+	[ "$_dk_uid" = "0" ] || return 1
+	case "$_dk_mode" in
+	?????w* | ????????w*) return 1 ;;
+	esac
+	return 0
+}
+
 _dns_confdir_detect() {
 	DNS_CONFDIR_SOURCE=""
 	DNS_CONFDIR_DETAIL=""
@@ -1142,6 +1270,12 @@ _dns_confdir_detect() {
 				case " $_dcd_dirs " in
 				*" $_dcd_d "*) continue ;;
 				esac
+				# 运行配置是 root 生成的，正常都在这里通过；
+				# 通过不了说明目录本身不可信（被低权用户接管），不往里写。
+				_dns_dir_ok "$_dcd_d" || {
+					log "警告：忽略不可信的 dnsmasq conf-dir（属主非 root 或组/他人可写）: $_dcd_d"
+					continue
+				}
 				_dcd_dirs="${_dcd_dirs:+$_dcd_dirs }$_dcd_d"
 				_dcd_file_used=1
 			done
@@ -1159,20 +1293,46 @@ _dns_confdir_detect() {
 
 	# b) 兜底：运行中的 dnsmasq 进程参数。busybox ps 默认截断命令行，
 	#    "ps w" 在 OpenWrt 上能取到完整参数；取不到就继续往下走。
+	#
+	#    这里只认「命令行里出现了 dnsmasq 的可执行路径」的进程，
+	#    不再用 /dnsmasq/ 整行匹配：任何进程只要参数里带
+	#    "dnsmasq --conf-dir=/somewhere"（例如 sh -c '... dnsmasq
+	#    --conf-dir=/tmp/evil'）都能骗过整行匹配，把 root 的写目标
+	#    指到别处。取到的目录还会再过 _dns_dir_ok + 名字检查。
 	_dcd_ps=$(ps w 2>/dev/null || ps 2>/dev/null || true)
 	if [ -n "$_dcd_ps" ]; then
 		_dcd_ps_vals=$(printf '%s\n' "$_dcd_ps" | awk '
-			/dnsmasq/ {
+			{
+				is_dnsmasq = 0
+				for (i = 1; i <= NF; i++)
+					if ($i ~ /(^|\/)dnsmasq$/) { is_dnsmasq = 1; break }
+				if (!is_dnsmasq) next
 				for (i = 1; i <= NF; i++) {
 					if ($i ~ /^--conf-dir=/) print substr($i, 12)
 					else if ($i == "--conf-dir" && i < NF) print $(i + 1)
 				}
 			}')
-		_dcd_parsed=$(_dns_confdir_parse "$_dcd_ps_vals")
-		if [ -n "$_dcd_parsed" ]; then
+		_dcd_ps_dirs=""
+		for _dcd_d in $(_dns_confdir_parse "$_dcd_ps_vals"); do
+			if ! _dns_dir_ok "$_dcd_d"; then
+				log "警告：忽略不可信的 dnsmasq conf-dir（属主非 root 或组/他人可写）: $_dcd_d"
+				continue
+			fi
+			# 进程参数是弱证据：再要求目录名符合 dnsmasq 的 conf-dir 约定，
+			# 避免被引导到 /etc、/etc/init.d 这类系统目录。
+			case "${_dcd_d##*/}" in
+			*dnsmasq*) ;;
+			*)
+				log "警告：忽略不像 dnsmasq 配置目录的 --conf-dir: $_dcd_d"
+				continue
+				;;
+			esac
+			_dcd_ps_dirs="${_dcd_ps_dirs:+$_dcd_ps_dirs }$_dcd_d"
+		done
+		if [ -n "$_dcd_ps_dirs" ]; then
 			DNS_CONFDIR_SOURCE=ps
 			DNS_CONFDIR_DETAIL="ps dnsmasq --conf-dir"
-			DNS_CONFDIR_DIRS=$_dcd_parsed
+			DNS_CONFDIR_DIRS=$_dcd_ps_dirs
 			_dns_confdir_detect_emit
 			return 0
 		fi
@@ -1562,6 +1722,14 @@ cmd_dns() {
 	mkdir -p "$_confdir" 2>/dev/null || die "无法创建 dnsmasq confdir: $_confdir"
 	_out=$_confdir/isp-split.conf
 
+	# 先写临时文件、最后 rename 到位。
+	# 直接 `> "$_out"` 会跟随目标位置的符号链接：片段目录通常是 /tmp 下的
+	# dnsmasq conf-dir，只要有人在里面放一个 isp-split.conf -> /etc/xxx，
+	# root 就会把 dnsmasq 片段写进 /etc/xxx（截断原文件）。
+	# rename 只替换目录项本身，不会跟随链接。
+	_out_tmp=$(_tmp_next_to "$_confdir")
+	[ -n "$_out_tmp" ] || die "无法在 $_confdir 创建临时文件"
+
 	# 旧版本可能把片段留在 /tmp/dnsmasq.d 或旧 $DNSDIR；换目录时清掉
 	# 所有候选位置里的旧片段，避免 dnsmasq 同时加载两份规则。
 	for _old_dir in $(_dns_confdir_candidates); do
@@ -1572,7 +1740,10 @@ cmd_dns() {
 	{
 		echo "# 本文件由 isp-split 生成，请勿手工修改"
 		echo "# 重新生成: isp-split dns"
-	} > "$_out"
+	} > "$_out_tmp" || {
+		rm -f "$_out_tmp"
+		die "无法写入 $_out_tmp"
+	}
 
 	_n=0
 	_skip=0
@@ -1592,7 +1763,7 @@ cmd_dns() {
 			_skip=$((_skip + 1))
 			continue
 		fi
-		echo "server=/$_dom/$_dns$_bind" >> "$_out"
+		echo "server=/$_dom/$_dns$_bind" >> "$_out_tmp"
 		_n=$((_n + 1))
 	done
 
@@ -1628,7 +1799,7 @@ cmd_dns() {
 			case "$_d" in
 			""|.*) continue ;;
 			esac
-			echo "server=/$_d/$_dns$_bind" >> "$_out"
+			echo "server=/$_d/$_dns$_bind" >> "$_out_tmp"
 			_c=$((_c + 1))
 		done < "$_f"
 		[ "$_c" -gt 0 ] || continue
@@ -1643,22 +1814,30 @@ cmd_dns() {
 	_db_rc=$?
 	if [ "$_db_rc" -eq 2 ]; then
 		# 配置错误时不要留下可能含坏 DNS 的 dnsmasq 片段
-		rm -f "$_out"
+		rm -f "$_out_tmp"
 		die "DNS 旁路规则配置错误，请修正 DNS_TABLE / DNS_MODE 后重试"
 	elif [ "$_db_rc" -ne 0 ]; then
 		log "警告：mwan3 尚未就绪，DNS 旁路规则未全部恢复；稍后执行 isp-split apply 可重试"
 	fi
 
 	if [ "$_n" -eq 0 ]; then
-		rm -f "$_out"
+		rm -f "$_out_tmp" "$_out"
 		log "没有域名分流规则（DNS 旁路已按 DNS_TABLE 就位）"
 		log "要启用域名分流请配置 DOMAIN_SPLIT，或在 $DOMAINDIR/<策略>.txt 放入域名清单"
 		return 0
 	fi
 
-	# 4) 片段已经写进探测到的目录；runtime/ps 路径不改 UCI，避免覆盖
-	#    OpenClash/adblock 等接管配置。卸载时按同一探测结果清理。
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || log "警告：dnsmasq 重启失败"
+	# 4) 片段原子落位（rename 不跟随符号链接），再让 dnsmasq 重新加载。
+	#    runtime/ps 路径不改 UCI，避免覆盖 OpenClash/adblock 等接管配置。
+	#    卸载时按同一探测结果清理。
+	# mktemp 建的是 0600；dnsmasq 以 dnsmasq 用户读 conf-dir，
+	# 片段必须是全局可读的（旧实现直接重定向，权限是 umask 的 0644）。
+	chmod 644 "$_out_tmp" 2>/dev/null || true
+	mv -f "$_out_tmp" "$_out" || {
+		rm -f "$_out_tmp"
+		die "无法写入 $_out"
+	}
+	"$DNSMASQ_SERVICE" restart >/dev/null 2>&1 || log "警告：dnsmasq 重启失败"
 
 	log "已生成 $_n 条域名 DNS 规则 -> $_out（confdir: $_confdir，来源: $DNS_CONFDIR_SOURCE，$_uci_note）"
 	[ "$_skip" -gt 0 ] && log "有 $_skip 组因缺配置被跳过"
@@ -1755,6 +1934,40 @@ _valid_policy() {
 	return 0
 }
 
+# ---- 读取侧复校验 ----
+# conf set 只保护"写"入口；wire / apply / dns / export / uninstall 都是
+# 直接 source 之后读 $ISP_TABLE 的。这些值最终会进 nft、uci 的命令行参数，
+# 而 nft 会把命令行参数重新解析一遍（"x;add table inet y" 就是两条语句），
+# 所以非法字符必须在读取侧就挡住，不能只在写入侧挡。
+_row_check() {
+	case "${1:-}" in
+	"" | *[!A-Za-z0-9._-]*) die "ISP_TABLE 的源名 '${1:-}' 非法（只允许 [A-Za-z0-9._-]）" ;;
+	esac
+	case "${2:-}" in
+	"" | *[!A-Za-z0-9_]*) die "ISP_TABLE 的集合名 '${2:-}' 非法（只允许 [A-Za-z0-9_]）" ;;
+	esac
+	[ "${#2}" -le 15 ] ||
+		die "ISP_TABLE 的集合名 '$2' 超过 15 字符（mwan3 的规则名限制）"
+	case "${3:-}" in
+	"" | *[!A-Za-z0-9_-]*) die "ISP_TABLE 的策略名 '${3:-}' 非法（只允许 [A-Za-z0-9_-]）" ;;
+	esac
+	case "${4:-}" in
+	0 | 1) ;;
+	*) die "ISP_TABLE 第 4 列只能是 0 或 1（当前: '${4:-}'）" ;;
+	esac
+}
+
+# 直接对一整行做校验（不拆字段的调用点用）
+_row_check_row() {
+	_rr_ifs=$IFS
+	IFS=':'
+	set -- $1
+	IFS=$_rr_ifs
+	[ $# -ge 4 ] ||
+		die "ISP_TABLE 行格式错误（应为 源:集合:策略:0|1）: $1"
+	_row_check "$1" "$2" "$3" "$4"
+}
+
 _valid_ipv4() {
 	_ip=${1:-}
 	case "$_ip" in
@@ -1814,7 +2027,6 @@ _conf_validate() {
 			*) die "最后一列只能是 0（禁用）或 1（启用）—— 出错行: $_line" ;;
 			esac
 		done
-		set +f
 		IFS=$_old_ifs
 		# 空表等于把工具废掉：wire 会注入空规则块（连带删掉现有规则），
 		# apply 之后每次都报"没有启用的运营商"。这种值一律拒绝。
@@ -1836,7 +2048,6 @@ _conf_validate() {
 			esac
 			_valid_ipv4 "$2" || die "DNS 地址必须是严格 IPv4（出错行: $_line）"
 		done
-		set +f
 		IFS=$_old_ifs
 		;;
 	DOMAIN_SPLIT)
@@ -1854,7 +2065,6 @@ _conf_validate() {
 			*) die "mwan3 里不存在策略 '$2'（出错行: $_line）" ;;
 			esac
 		done
-		set +f
 		IFS=$_old_ifs
 		;;
 	DNS_MODE)
@@ -2010,6 +2220,24 @@ cmd_export() {
 	mihomo | singbox | text) ;;
 	*) die "未知格式 '$_fmt'，可选 mihomo / singbox / text" ;;
 	esac
+	# 输出目录由调用方给（LuCI 里是委派用户通过 ubus file exec 调过来的）。
+	# export 是以 root 身份 mkdir + 写文件，所以必须挡住系统目录：
+	# 否则一个只有本应用 ACL 的用户就能让 root 往 /etc/init.d、/etc/crontabs
+	# 落地文件（文件名固定 isp-<源>.<ext>，但目录由他选）。
+	case "$_dir" in
+	/*) ;;
+	*) die "输出目录必须是绝对路径: $_dir" ;;
+	esac
+	case "$_dir" in
+	*..*) die "输出目录不能包含 '..': $_dir" ;;
+	/etc/init.d | /etc/init.d/* | /etc/uci-defaults | /etc/uci-defaults/* | \
+		/etc/crontabs | /etc/crontabs/* | /etc/rc.d | /etc/rc.d/* | \
+		/etc/config | /etc/config/* | /etc/hotplug.d | /etc/hotplug.d/* | \
+		/usr/sbin | /usr/sbin/* | /usr/bin | /usr/bin/* | \
+		/bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | \
+		/usr/lib | /usr/lib/* | /usr/share/rpcd | /usr/share/rpcd/*)
+		die "拒绝导出到系统目录: $_dir" ;;
+	esac
 	mkdir -p "$_dir" || die "无法创建 $_dir"
 
 	_n=0
@@ -2018,21 +2246,33 @@ cmd_export() {
 		IFS=':'
 		set -- $row
 		IFS=$_old_ifs
+		case "$row" in \#*) continue ;; esac
 		[ $# -ge 1 ] || continue
+		# 源名会拼进输出文件名，必须校验（集合/策略列不参与导出，允许缺省）
+		_valid_src "$1" ||
+			die "ISP_TABLE 的源名 '$1' 非法（只允许 [A-Za-z0-9._-]）"
 		_src=$1
 		_f="$DATA/$_src.txt"
 		[ -s "$_f" ] || continue
 
+		# 目标位置若已是符号链接，直接写会写穿到链接指向的文件；
+		# 先删掉目录项（rm 删除的是链接本身），再由下面的重定向/ cp 新建。
+		case "$_fmt" in
+		mihomo) _ext=yaml ;;
+		singbox) _ext=json ;;
+		*) _ext=txt ;;
+		esac
+		_out="$_dir/isp-$_src.$_ext"
+		rm -f "$_out"
+
 		case "$_fmt" in
 		mihomo)
-			_out="$_dir/isp-$_src.yaml"
 			{
 				echo "payload:"
 				sed 's/^/  - /' "$_f"
 			} > "$_out"
 			;;
 		singbox)
-			_out="$_dir/isp-$_src.json"
 			# sing-box 的 source 格式是对象，不是裸数组：
 			#   {"version":1,"rules":[{"ip_cidr":["10.0.0.0/8", ...]}]}
 			# 裸 JSON 字符串数组是 mihomo/Clash 的 payload 格式，
@@ -2044,7 +2284,6 @@ cmd_export() {
 			} > "$_out"
 			;;
 		text)
-			_out="$_dir/isp-$_src.txt"
 			cp "$_f" "$_out"
 			;;
 		*)
@@ -2168,13 +2407,67 @@ cmd_rollback() {
 
 # ---------------------------------------------------------------- install
 
+# 在指定目录里创建一个不可预测的临时文件（mktemp 用 O_EXCL 创建，
+# 低权用户无法用符号链接抢占这个名字）。失败时输出空行。
+_tmp_next_to() {
+	_td=${1:-/tmp}
+	mkdir -p "$_td" 2>/dev/null || _td=/tmp
+	mktemp "$_td/.isp-split.XXXXXX" 2>/dev/null
+}
+
+# 重写 /etc/crontabs/root：保留非本工具的行，按需追加 $1。
+#
+# 旧实现用固定的 /tmp/.ispcron 中转：
+#   grep -v isp-split /etc/crontabs/root > /tmp/.ispcron
+#   echo ... >> /tmp/.ispcron ; mv /tmp/.ispcron /etc/crontabs/root
+# /tmp 是世界可写目录，低权用户可以先建 /tmp/.ispcron -> /tmp/x 的符号链接，
+# root 的两次重定向就会写穿到 /tmp/x；随后的 mv 还会把符号链接本身搬到
+# /etc/crontabs/root，于是 crond 改为读 /tmp/x —— 谁都能改 root 的定时任务。
+# 现在临时文件建在 /etc 下（与目标同文件系统，rename 才是原子的）。
+_cron_rewrite() {
+	_cr_target=$CRONTAB
+	mkdir -p "${_cr_target%/*}" 2>/dev/null || return 1
+	[ -f "$_cr_target" ] || : >> "$_cr_target" 2>/dev/null || return 1
+
+	_cr_tmp=$(_tmp_next_to "${_cr_target%/*}")
+	[ -n "$_cr_tmp" ] || return 1
+	grep -v 'isp-split' "$_cr_target" > "$_cr_tmp" 2>/dev/null || true
+	if [ -n "${1:-}" ]; then
+		printf '%s\n' "$1" >> "$_cr_tmp" || { rm -f "$_cr_tmp"; return 1; }
+	fi
+	mv -f "$_cr_tmp" "$_cr_target" || { rm -f "$_cr_tmp"; return 1; }
+	return 0
+}
+
+# ISP_CRON 会原样写进 crontab，而 crontab 是 root 的命令执行上下文：
+# 一个 "* * * * * root id > /tmp/x" 就能让 root 跑任意命令。
+# 只接受 5 段纯时间字段（数字和 * , - /）。
+_cron_expr_ok() {
+	# 拆字段时要临时关掉 glob：cron 表达式里合法地包含 *，
+	# 不关的话 `for f in $ISP_CRON` 会把 * 展开成当前目录的文件名，
+	# 合法表达式反而被判成非法（实测踩过）。
+	_ce_had_f=0
+	case $- in *f*) _ce_had_f=1 ;; esac
+	[ "$_ce_had_f" = "1" ] || set -f
+	_ce_n=0
+	_ce_bad=0
+	for _ce_f in ${1:-}; do
+		_ce_n=$((_ce_n + 1))
+		case "$_ce_f" in
+		"" | *[!0-9*,-/]*) _ce_bad=1 ;;
+		esac
+	done
+	[ "$_ce_had_f" = "1" ] || set +f
+	[ "$_ce_bad" = "0" ] && [ "$_ce_n" -eq 5 ]
+}
+
 cmd_install() {
+	_cron_expr_ok "$ISP_CRON" ||
+		die "ISP_CRON 格式非法（必须是 5 段 cron 时间字段）: $ISP_CRON"
 	# crontab
 	mkdir -p /etc/crontabs
 	touch /etc/crontabs/root
-	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron 2>/dev/null || true
-	echo "$ISP_CRON /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split" >> /tmp/.ispcron
-	mv /tmp/.ispcron /etc/crontabs/root
+	_cron_rewrite "$ISP_CRON /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split"
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 
 	/etc/init.d/isp-split enable >/dev/null 2>&1 || true
@@ -2182,8 +2475,7 @@ cmd_install() {
 }
 
 cmd_uninstall() {
-	grep -v 'isp-split' /etc/crontabs/root > /tmp/.ispcron 2>/dev/null || true
-	mv /tmp/.ispcron /etc/crontabs/root 2>/dev/null || true
+	_cron_rewrite "" 2>/dev/null || true
 	/etc/init.d/isp-split disable >/dev/null 2>&1 || true
 	/etc/init.d/isp-split stop >/dev/null 2>&1 || true
 
@@ -2202,6 +2494,9 @@ cmd_uninstall() {
 		IFS=':'
 		set -- $row
 		IFS=$_old_ifs
+		case "$row" in \#*) continue ;; esac
+		[ $# -ge 2 ] || continue
+		_valid_name "$2" || continue
 		uci -q delete "mwan3.ipset_$2" 2>/dev/null
 	done
 	uci -q commit mwan3
@@ -2215,6 +2510,23 @@ cmd_uninstall() {
 }
 
 # ---------------------------------------------------------------- main
+
+# 三个表值都会被 `for row in $ISP_TABLE` 这种方式展开，而展开会做路径名
+# 展开（glob）：值里一旦有 * ? [，当前目录里一个叫
+# "x:isp_pwn:wan_only:1" 的文件就能冒充一行运营商配置（实测 plan 里会
+# 直接多出一个 isp_pwn 集合）。脚本里还有好几处必须保留 glob
+# （ls .history/*、cp out.new/*.txt），不能全局 set -f，所以在入口
+# 直接拒绝这几个字符 —— 表里本来只该有 字母数字 : . _ - # 和空白。
+_table_no_glob() {
+	for _tg_v in "$ISP_TABLE" "${DNS_TABLE:-}" "${DOMAIN_SPLIT:-}"; do
+		case "$_tg_v" in
+		*'*'* | *'?'* | *'['* | *']'*)
+			die "配置表里出现通配符字符（* ? [ ]）：展开时会被替换成当前目录的文件名。请删除这些字符（注释里也不要写）"
+			;;
+		esac
+	done
+}
+_table_no_glob
 
 case "${1:-}" in
 --version | version)
