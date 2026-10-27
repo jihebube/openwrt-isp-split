@@ -8,13 +8,14 @@
 #   apply      把已构建的集合原子刷入 nftables（不断流、不重启 mwan3）
 #   wire       在 mwan3 中创建 nft 集合与分流规则，并插到正确位置
 #   sync       以上三步 + 重载 mwan3（首次安装用这个）
-#   status     查看各集合条目数、命中包数/字节数
+#   status     查看各集合条目数、命中包数/字节数、数据源健康度
+#   diff       重新计算主源与校验源的分歧（超阈值返回 3）
 #   probe      分线实测各运营商出口速度，用来决定策略映射
 #   rollback   回滚到上一份数据并重新 apply
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.1.5a"
+ISP_VERSION="0.2.0"
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
@@ -49,6 +50,20 @@ DNSMASQ_SERVICE=${DNSMASQ_SERVICE:-/etc/init.d/dnsmasq}
 ISP_TABLE=$(printf '%s' "${ISP_TABLE:-}" | tr -d '\r')
 DNS_TABLE=$(printf '%s' "${DNS_TABLE:-}" | tr -d '\r')
 DOMAIN_SPLIT=$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')
+
+# ---- 多数据源（0.2.0）----
+# ISP_SOURCES 为空 = 单源兼容模式：仍按 ISP_MIRROR/<源名>.txt 拉取，
+# 与 0.1.x 的行为逐字节一致（老配置升级后不需要改任何东西）。
+ISP_SOURCES=$(printf '%s' "${ISP_SOURCES:-}" | tr -d '\r')
+ISP_SOURCE_FILES=$(printf '%s' "${ISP_SOURCE_FILES:-}" | tr -d '\r')
+# 0.2.0 只建骨架：默认声明了校验源但不启用，拉取/校验都不跑。
+ISP_VERIFY_ENABLE=${ISP_VERIFY_ENABLE:-0}
+ISP_DIFF_MAX_JACCARD_DROP=${ISP_DIFF_MAX_JACCARD_DROP:-90}
+ISP_DIFF_MAX_DELTA_PCT=${ISP_DIFF_MAX_DELTA_PCT:-3}
+ISP_SOURCE_MAX_FAIL_DAYS=${ISP_SOURCE_MAX_FAIL_DAYS:-3}
+RAW_ARCHIVE=$BASE/raw
+STATE_DIR=$BASE/state
+SOURCE_STATE=$STATE_DIR/sources.tsv
 
 ISP_ANCHOR=${ISP_ANCHOR:-'dest_port|src_port|default_rule|https|internet'}
 ISP_CRON=${ISP_CRON:-"17 4 * * *"}
@@ -210,56 +225,637 @@ fetch_one() {
 	fi
 }
 
-# ---------------------------------------------------------------- fetch
+# ---------------------------------------------------------------- 多数据源（0.2.0）
+#
+# 0.2.0 只建骨架：主源仍是 ispip.clang.cn（ISP_SOURCES 的第一条 primary），
+# 校验源默认只声明不启用（ISP_VERIFY_ENABLE=0）。ISP_SOURCES 为空时完全
+# 退回 0.1.x 的单源行为（ISP_MIRROR/<源名>.txt）。
+
+# 源声明规范化：每行一条 <名字>:<角色>:<基址>
+_source_rows() {
+	if printf '%s' "${ISP_SOURCES:-}" | grep -q '[^[:space:]]'; then
+		printf '%s\n' "$ISP_SOURCES" | tr -s ' \t' '\n' | sed '/^[[:space:]]*$/d'
+	else
+		printf '%s\n' "ispip:primary:${ISP_MIRROR:-}"
+	fi
+}
+
+# 拆一行源声明到 _s_name / _s_role / _s_base
+_source_split() {
+	_s_name=${1%%:*}
+	_s_rest=${1#*:}
+	_s_role=${_s_rest%%:*}
+	_s_base=${_s_rest#*:}
+}
+
+_source_role_of() {
+	_source_rows | awk -F: -v n="$1" '$1 == n { print $2; exit }'
+}
+
+_source_base_of() {
+	_source_rows | awk -v n="$1" '
+		{
+			i = index($0, ":")
+			name = substr($0, 1, i - 1)
+			if (name != n) next
+			rest = substr($0, i + 1)
+			j = index(rest, ":")
+			print substr(rest, j + 1)
+			exit
+		}'
+}
+
+_primary_source_name() {
+	_source_rows | awk -F: '$2 == "primary" { print $1; exit }'
+}
+
+# 单个源声明的白名单校验（写入侧与读取侧共用）
+_source_check() {
+	_sc_row=$1
+	_source_split "$_sc_row"
+	case "$_s_name" in
+	"" | *[!A-Za-z0-9._-]*)
+		die "ISP_SOURCES 的源名 '$_s_name' 非法（只允许 [A-Za-z0-9._-]）"
+		;;
+	esac
+	case "$_s_role" in
+	primary | verify | audit) ;;
+	*) die "ISP_SOURCES 源 '$_s_name' 的角色 '$_s_role' 非法（只能是 primary / verify / audit）" ;;
+	esac
+	# ISP_MIRROR 没配（老配置残缺）时 status/plan 仍要能看，只是 fetch 会拒绝
+	[ -n "$_s_base" ] || return 0
+	case "$_s_base" in
+	https://*) _sc_host=${_s_base#https://} ;;
+	http://*)
+		[ "${ISP_SPLIT_ALLOW_HTTP:-0}" = "1" ] ||
+			die "ISP_SOURCES 源 '$_s_name' 使用明文 HTTP（$_s_base）：数据可被中间人替换。改用 https://，或确认风险后设 ISP_SPLIT_ALLOW_HTTP=1"
+		_sc_host=${_s_base#http://}
+		log "警告：源 '$_s_name' 使用明文 HTTP，数据完整性无保证"
+		;;
+	*)
+		die "ISP_SOURCES 源 '$_s_name' 的基址必须形如 https://host（当前: $_s_base）"
+		;;
+	esac
+	# 基址只允许主机/端口/路径：不带查询串、不带空白、不带 shell 元字符。
+	case "$_sc_host" in
+	"" | *[!A-Za-z0-9._:/~-]*)
+		die "ISP_SOURCES 源 '$_s_name' 的基址不合法（只允许 host[:port][/path]）: $_s_base"
+		;;
+	esac
+}
+
+_source_check_all() {
+	_sa_primary=0
+	_sa_seen=" "
+	for _sa_row in $(_source_rows); do
+		_source_check "$_sa_row"
+		case "$_sa_seen" in
+		*" $_s_name "*) die "ISP_SOURCES 里源名 '$_s_name' 重复" ;;
+		esac
+		_sa_seen="$_sa_seen$_s_name "
+		if [ "$_s_role" = "primary" ]; then
+			_sa_primary=$((_sa_primary + 1))
+		fi
+	done
+	[ "$_sa_primary" -eq 1 ] ||
+		die "ISP_SOURCES 必须且只能有一个 primary 源（当前 $_sa_primary 个）"
+}
+
+# ISP_SOURCE_FILES 规范化成 "<源名>:<ISP_TABLE 源名>=<远端文件名>" 每行一条。
+# 书写格式（与设计一致）：yfgao:chinatelecom=chinanet,unicom_cnc=unicom
+_source_map_lines() {
+	printf '%s\n' "${ISP_SOURCE_FILES:-}" | tr ',' '\n' | awk '
+		{
+			gsub(/[[:space:]]+/, "", $0)
+			if ($0 == "") next
+			i = index($0, ":")
+			if (i > 0) {
+				cur = substr($0, 1, i - 1)
+				$0 = substr($0, i + 1)
+			}
+			if (cur != "") print cur ":" $0
+		}'
+}
+
+# <源名> <ISP_TABLE 源名> -> 该源上的远端文件名（空 = 未显式映射）
+# 映射值写"不带 .txt 的名字"（与设计文档一致）：chinatelecom=chinanet。
+# 值里自带扩展名（如 foo.dat）时原样使用，不再补后缀。
+_source_file_of() {
+	_sf=$(_source_map_lines |
+		awk -v n="$1" -v s="$2" -F'[:=]' '$1 == n && $2 == s { print $3; exit }')
+	case "$_sf" in
+	"") ;;
+	*.*) ;;
+	*) _sf="$_sf.txt" ;;
+	esac
+	printf '%s' "$_sf"
+}
+
+# ---- 源健康状态：$BASE/state/sources.tsv ----
+# 列：name  role  last_ok  fail_days  jaccard  note
+_state_get() {
+	[ -f "$SOURCE_STATE" ] || return 0
+	awk -F "$(printf '\t')" -v n="$1" -v f="$2" '
+		$1 == n {
+			if (f == "role") print $2
+			else if (f == "last_ok") print $3
+			else if (f == "fail") print $4
+			else if (f == "jaccard") print $5
+			else if (f == "note") print $6
+			exit
+		}' "$SOURCE_STATE"
+}
+
+# 连续失败计数 +1；返回新的失败天数
+_state_fail_plus() {
+	_sf_prev=$(_state_get "$1" fail)
+	case "${_sf_prev:-}" in '' | *[!0-9]*) _sf_prev=0 ;; esac
+	_sf_new=$((_sf_prev + 1))
+	_state_put "$1" "$2" "$(_state_get "$1" last_ok)" "$_sf_new" \
+		"$(_state_get "$1" jaccard)" "$3"
+	printf '%s' "$_sf_new"
+}
+
+_state_put() {
+	mkdir -p "$STATE_DIR" || return 1
+	_sp_tmp=$(mktemp "$STATE_DIR/.sources.XXXXXX" 2>/dev/null) || return 1
+	if [ -f "$SOURCE_STATE" ]; then
+		awk -F "$(printf '\t')" -v OFS="$(printf '\t')" \
+			-v n="$1" -v r="$2" -v o="$3" -v f="$4" -v j="$5" -v s="$6" '
+			$1 == n { if (!done) { print n, r, o, f, j, s; done = 1 } next }
+			{ print }
+			END { if (!done) print n, r, o, f, j, s }
+		' "$SOURCE_STATE" > "$_sp_tmp" || { rm -f "$_sp_tmp"; return 1; }
+	else
+		printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" > "$_sp_tmp" ||
+			{ rm -f "$_sp_tmp"; return 1; }
+	fi
+	mv -f "$_sp_tmp" "$SOURCE_STATE" 2>/dev/null || { rm -f "$_sp_tmp"; return 1; }
+	return 0
+}
+
+_ts_text() {
+	case "${1:-}" in
+	"" | 0 | *[!0-9]*) printf '%s' "-"; return 0 ;;
+	esac
+	date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null ||
+		date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "-"
+}
+
+# 下载一个源的全部文件到 <目录>（文件名保持远端原名）。
+# 只做"单源单文件"的三道闸门（体积/行数/badcidr）；总量与增幅闸门在合成后做。
+# 返回 0 成功；1 失败（调用方决定冻结还是降级）。
+_fetch_source() {
+	_fs_name=$1
+	_fs_base=$(printf '%s' "$2" | sed 's:/*$::')
+	_fs_dir=$3
+	_fs_role=$4
+
+	mkdir -p "$_fs_dir" || { log "源 $_fs_name: 无法创建 $_fs_dir"; return 1; }
+
+	for _fs_row in $ISP_TABLE; do
+		case "$_fs_row" in \#*) continue ;; esac
+		_row_check_row "$_fs_row"
+		_fs_src=${_fs_row%%:*}
+		_fs_file=$(_source_file_of "$_fs_name" "$_fs_src")
+		if [ -z "$_fs_file" ]; then
+			# 主源没写映射时沿用 0.1.x 的命名 <源名>.txt（老配置零改动）；
+			# 校验源只在显式映射里出现——绝不去猜别人的文件名。
+			[ "$_fs_role" = "primary" ] || continue
+			_fs_file="$_fs_src.txt"
+		fi
+		case "$_fs_file" in
+		"" | *[!A-Za-z0-9._-]*)
+			log "源 $_fs_name: 映射出的文件名 '$_fs_file' 非法"
+			return 1
+			;;
+		esac
+
+		log "源 $_fs_name: 下载 $_fs_src ($_fs_file)"
+		fetch_one "$_fs_base/$_fs_file" "$_fs_dir/$_fs_file" || {
+			log "源 $_fs_name: $_fs_src 下载失败"
+			return 1
+		}
+		_fs_sz=$(wc -c < "$_fs_dir/$_fs_file" 2>/dev/null | tr -d ' \t')
+		if [ "${_fs_sz:-0}" -gt "$MAX_RAW_BYTES" ]; then
+			log "源 $_fs_name: $_fs_src 体积 ${_fs_sz} 字节，超过上限 $MAX_RAW_BYTES"
+			return 1
+		fi
+		_fs_n=$(grep -c '[0-9]' "$_fs_dir/$_fs_file" 2>/dev/null)
+		_fs_n=${_fs_n:-0}
+		[ "$_fs_n" -gt 5 ] || {
+			log "源 $_fs_name: $_fs_src 内容异常（仅 $_fs_n 行）"
+			return 1
+		}
+		_fs_bad=$(awk -f "$LIB/badcidr.awk" "$_fs_dir/$_fs_file" 2>/dev/null | head -5)
+		if [ -n "$_fs_bad" ]; then
+			printf '%s\n' "$_fs_bad" >&2
+			log "源 $_fs_name: $_fs_src 含非法 CIDR，拒绝（现有数据未改动）"
+			return 1
+		fi
+	done
+	return 0
+}
+
+# 把主源文件按 ISP_SOURCE_FILES 映射拷成 <isp>.raw，交给 build.sh
+_compose_raw() {
+	_cm_name=$1
+	_cm_src=$2
+	_cm_out=$3
+	rm -rf "$_cm_out"
+	mkdir -p "$_cm_out" || return 1
+	for _cm_row in $ISP_TABLE; do
+		case "$_cm_row" in \#*) continue ;; esac
+		_row_check_row "$_cm_row"
+		_cm_isp=${_cm_row%%:*}
+		_cm_file=$(_source_file_of "$_cm_name" "$_cm_isp")
+		[ -n "$_cm_file" ] || _cm_file="$_cm_isp.txt"
+		[ -f "$_cm_src/$_cm_file" ] || {
+			log "合成: 缺少 $_cm_isp 的源文件（$_cm_file）"
+			return 1
+		}
+		cp -f "$_cm_src/$_cm_file" "$_cm_out/$_cm_isp.raw" || return 1
+	done
+	return 0
+}
+
+# 源数据存档：$BASE/raw/<源名>/<远端文件名>。差异/日变化都基于存档重算，
+# 所以即使当天拒绝更新，也能事后 `isp-split diff` 复查。
+_archive_source() {
+	_ar_new=$RAW_ARCHIVE/.$1.new
+	mkdir -p "$RAW_ARCHIVE" || return 1
+	rm -rf "$_ar_new"
+	mkdir -p "$_ar_new" || return 1
+	cp -a "$2/." "$_ar_new/" 2>/dev/null || { rm -rf "$_ar_new"; return 1; }
+	date +%s > "$_ar_new/.ok" || { rm -rf "$_ar_new"; return 1; }
+	rm -rf "$RAW_ARCHIVE/.$1.old"
+	if [ -d "$RAW_ARCHIVE/$1" ]; then
+		mv "$RAW_ARCHIVE/$1" "$RAW_ARCHIVE/.$1.old" 2>/dev/null || return 1
+	fi
+	if ! mv "$_ar_new" "$RAW_ARCHIVE/$1" 2>/dev/null; then
+		[ -d "$RAW_ARCHIVE/.$1.old" ] && mv "$RAW_ARCHIVE/.$1.old" "$RAW_ARCHIVE/$1" 2>/dev/null
+		return 1
+	fi
+	rm -rf "$RAW_ARCHIVE/.$1.old"
+	return 0
+}
+
+# 单个运营商两个源的三段差异 + Jaccard
+# 输出到 stdout：<P地址数> <V地址数> <共同> <仅主> <仅校验> <Jaccard%>
+_diff_ranges() {
+	_dr_p=$1
+	_dr_v=$2
+	_dr_pout=$3
+	_dr_vout=$4
+	awk -v vf="$_dr_v" -v outp="$_dr_pout" -v outv="$_dr_vout" \
+		-f "$LIB/ispdiff.awk" "$_dr_p"
+}
+
+_quarantine_write() { # <校验源名> <运营商源名> <仅主区间> <仅校验区间>
+	_qw_dir=$BASE/quarantine/$(date +%Y%m%d)
+	mkdir -p "$_qw_dir" || return 1
+	awk -f "$LIB/range2cidr.awk" "$3" > "$_qw_dir/$1.$2.only-primary.txt" || return 1
+	awk -f "$LIB/range2cidr.awk" "$4" > "$_qw_dir/$1.$2.only-verify.txt" || return 1
+	return 0
+}
+
+# 计算并打印 主源 vs 校验源 的分歧；超阈值返回 3（拒绝更新）
+# <主源目录> <校验源目录> <主源名> <校验源名> <save: always|reject|never>
+_run_diff() {
+	_rd_pdir=$1
+	_rd_vdir=$2
+	_rd_pname=$3
+	_rd_vname=$4
+	_rd_save=$5
+	_rd_rc=0
+	_rd_rows=0
+	_rd_min=""
+	_rd_bad=""
+
+	mkdir -p "$WORK" || return 1
+	_rd_tmp=$WORK/.diff.$$
+	rm -rf "$_rd_tmp"
+	mkdir -p "$_rd_tmp" || return 1
+
+	echo "== 数据源差异（主源 $_rd_pname vs 校验源 $_rd_vname，阈值 ${ISP_DIFF_MAX_JACCARD_DROP}%）"
+	printf '%-14s %10s %10s %10s %9s %9s %8s\n' \
+		"运营商" "主源地址" "校验地址" "共同" "仅主" "仅校验" "Jaccard"
+
+	for _rd_row in $ISP_TABLE; do
+		case "$_rd_row" in \#*) continue ;; esac
+		_row_check_row "$_rd_row"
+		_rd_isp=${_rd_row%%:*}
+		_rd_pf=$(_source_file_of "$_rd_pname" "$_rd_isp")
+		[ -n "$_rd_pf" ] || _rd_pf="$_rd_isp.txt"
+		_rd_vf=$(_source_file_of "$_rd_vname" "$_rd_isp")
+		[ -n "$_rd_vf" ] || continue
+		[ -f "$_rd_pdir/$_rd_pf" ] && [ -f "$_rd_vdir/$_rd_vf" ] || continue
+
+		awk -f "$LIB/cidr2range.awk" "$_rd_pdir/$_rd_pf" | sort |
+			awk -f "$LIB/merge.awk" > "$_rd_tmp/p.ranges"
+		awk -f "$LIB/cidr2range.awk" "$_rd_vdir/$_rd_vf" | sort |
+			awk -f "$LIB/merge.awk" > "$_rd_tmp/v.ranges"
+		# 先建空文件：awk 只在有内容时才创建输出文件，
+		# "没有差异"时下游 range2cidr 会打不开不存在的路径。
+		: > "$_rd_tmp/only-p.ranges"
+		: > "$_rd_tmp/only-v.ranges"
+		_rd_res=$(_diff_ranges "$_rd_tmp/p.ranges" "$_rd_tmp/v.ranges" \
+			"$_rd_tmp/only-p.ranges" "$_rd_tmp/only-v.ranges")
+		# shellcheck disable=SC2086
+		set -- $_rd_res
+		[ $# -ge 6 ] || continue
+		_rd_rows=$((_rd_rows + 1))
+		_rd_j=$6
+		printf '%-14s %10s %10s %10s %9s %9s %7s%%\n' \
+			"$_rd_isp" "$1" "$2" "$3" "$4" "$5" "$_rd_j"
+
+		if awk -v j="$_rd_j" -v m="$_rd_min" 'BEGIN { exit !(m == "" || j + 0 < m + 0) }'; then
+			_rd_min=$_rd_j
+		fi
+		if awk -v j="$_rd_j" -v t="$ISP_DIFF_MAX_JACCARD_DROP" \
+			'BEGIN { exit !(j + 0 < t + 0) }'; then
+			_rd_rc=3
+			_rd_bad="$_rd_bad $_rd_isp($_rd_j%)"
+			if [ "$_rd_save" != "never" ]; then
+				_quarantine_write "$_rd_vname" "$_rd_isp" \
+					"$_rd_tmp/only-p.ranges" "$_rd_tmp/only-v.ranges" || true
+				{
+					printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+						"$_rd_isp" "$1" "$2" "$3" "$4" "$5" "$_rd_j" "reject"
+				} >> "$BASE/quarantine/$(date +%Y%m%d)/summary.tsv" 2>/dev/null || true
+			fi
+		fi
+	done
+
+	rm -rf "$_rd_tmp"
+	[ "$_rd_rows" -gt 0 ] ||
+		echo "（两源没有共同运营商文件，无法比较——检查 ISP_SOURCE_FILES 映射）"
+	[ -n "$_rd_min" ] || _rd_min=""
+	DIFF_MIN_JACCARD=$_rd_min
+	DIFF_REJECTED=$_rd_bad
+	return $_rd_rc
+}
+
+# 单运营商地址数日变化（只比主源，同口径：原始文件 vs 上次存档）
+_delta_check() { # <源名> <新目录>
+	_dc_name=$1
+	_dc_new=$2
+	_dc_bad=""
+	[ -d "$RAW_ARCHIVE/$_dc_name" ] || return 0
+	echo "== 主源日变化（阈值 ${ISP_DIFF_MAX_DELTA_PCT}%）"
+	printf '%-14s %10s %10s %8s\n' "运营商" "上次" "本次" "变化"
+	for _dc_row in $ISP_TABLE; do
+		case "$_dc_row" in \#*) continue ;; esac
+		_row_check_row "$_dc_row"
+		_dc_isp=${_dc_row%%:*}
+		_dc_f=$(_source_file_of "$_dc_name" "$_dc_isp")
+		[ -n "$_dc_f" ] || _dc_f="$_dc_isp.txt"
+		[ -f "$_dc_new/$_dc_f" ] && [ -f "$RAW_ARCHIVE/$_dc_name/$_dc_f" ] || continue
+		_dc_old_n=$(awk -f "$LIB/cidr2range.awk" "$RAW_ARCHIVE/$_dc_name/$_dc_f" |
+			awk '{ t += $2 - $1 + 1 } END { printf "%.0f", t }')
+		_dc_new_n=$(awk -f "$LIB/cidr2range.awk" "$_dc_new/$_dc_f" |
+			awk '{ t += $2 - $1 + 1 } END { printf "%.0f", t }')
+		[ "${_dc_old_n:-0}" -gt 0 ] || continue
+		_dc_pct=$(awk -v a="$_dc_old_n" -v b="$_dc_new_n" \
+			'BEGIN { d = b - a; if (d < 0) d = -d; printf "%.1f", d * 100 / a }')
+		printf '%-14s %10s %10s %7s%%\n' "$_dc_isp" "$_dc_old_n" "$_dc_new_n" "$_dc_pct"
+		if awk -v p="$_dc_pct" -v t="$ISP_DIFF_MAX_DELTA_PCT" \
+			'BEGIN { exit !(p + 0 > t + 0) }'; then
+			_dc_bad="$_dc_bad $_dc_isp($_dc_pct%)"
+		fi
+	done
+	if [ -n "$_dc_bad" ]; then
+		echo "拒绝：单运营商日变化超过 ${ISP_DIFF_MAX_DELTA_PCT}%$_dc_bad"
+		return 3
+	fi
+	return 0
+}
+
+# 源健康度区块（status / plan 共用）
+_sources_report() {
+	_source_check_all
+	echo "数据源健康度:"
+	printf '  %-8s %-8s %-16s %6s %9s  %s\n' "源" "角色" "最后成功" "失败" "Jaccard" "状态"
+	for _sr_row in $(_source_rows); do
+		_source_split "$_sr_row"
+		_sr_last=$(_state_get "$_s_name" last_ok)
+		_sr_fail=$(_state_get "$_s_name" fail)
+		_sr_jac=$(_state_get "$_s_name" jaccard)
+		[ -n "${_sr_fail:-}" ] || _sr_fail=0
+		_sr_state="正常"
+		if [ "$_s_role" != "primary" ] && [ "$ISP_VERIFY_ENABLE" != "1" ]; then
+			_sr_state="未启用校验（ISP_VERIFY_ENABLE=0）"
+		elif [ "${_sr_fail:-0}" -gt 0 ]; then
+			_sr_state="降级（连续失败 $_sr_fail/$ISP_SOURCE_MAX_FAIL_DAYS 天）"
+		fi
+		[ -n "${_sr_last:-}" ] || _sr_last=""
+		if [ -n "${_sr_jac:-}" ]; then
+			_sr_jac_s="$_sr_jac%"
+		else
+			_sr_jac_s="-"
+		fi
+		printf '  %-8s %-8s %-16s %6s %9s  %s\n' \
+			"$_s_name" "$_s_role" "$(_ts_text "$_sr_last")" "$_sr_fail" \
+			"$_sr_jac_s" "$_sr_state"
+	done
+	if [ -f "$DATA/.stamp" ]; then
+		echo "  数据更新时间: $(_ts_text "$(cat "$DATA/.stamp" 2>/dev/null)")"
+	fi
+}
+
+# 下次 cron 触发的绝对时间（空 = 表达式不合法/一年内不触发）
+# 纯 awk 实现：路由器上没有 python，逐分钟调 date 又太慢（10 秒轮询受不了）。
+_cron_next_epoch() {
+	_cne_off=$(date +%z 2>/dev/null)
+	[ -n "${_cne_off:-}" ] || _cne_off="+0000"
+	awk -v expr="$1" -v now="$(date +%s)" -v off="$_cne_off" '
+	function expand(f, lo, hi, arr,   n, p, k, r, h, a, b, st, i) {
+		if (f == "") return 0
+		n = split(f, p, ",")
+		for (k = 1; k <= n; k++) {
+			st = 1
+			r = p[k]
+			if (index(r, "/") > 0) { split(r, h, "/"); st = h[2] + 0; r = h[1] }
+			if (r == "*") { a = lo; b = hi }
+			else if (index(r, "-") > 0) { split(r, h, "-"); a = h[1] + 0; b = h[2] + 0 }
+			else { a = r + 0; b = a }
+			if (st < 1) st = 1
+			if (a < lo) a = lo
+			if (b > hi) b = hi
+			for (i = a; i <= b; i += st) arr[i] = 1
+		}
+		return 1
+	}
+	function civil(z,   era, doe, yoe, y, doy, mp) {
+		z += 719468
+		era = int((z >= 0 ? z : z - 146096) / 146097)
+		doe = z - era * 146097
+		yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+		y = yoe + era * 400
+		doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+		mp = int((5 * doy + 2) / 153)
+		CD = doy - int((153 * mp + 2) / 5) + 1
+		CM = mp + (mp < 10 ? 3 : -9)
+		CY = y + (CM <= 2)
+	}
+	BEGIN {
+		if (split(expr, f, " ") != 5) exit 1
+		if (!expand(f[1], 0, 59, MIN)) exit 1
+		if (!expand(f[2], 0, 23, HOUR)) exit 1
+		if (!expand(f[3], 1, 31, DOM)) exit 1
+		if (!expand(f[4], 1, 12, MON)) exit 1
+		if (!expand(f[5], 0, 7, DOW)) exit 1
+		if (DOW[7]) DOW[0] = 1
+		dom_star = (f[3] ~ /^\*/)
+		dow_star = (f[5] ~ /^\*/)
+		sign = (substr(off, 1, 1) == "-") ? -1 : 1
+		offsec = sign * (substr(off, 2, 2) * 3600 + substr(off, 4, 2) * 60)
+		start = now + offsec
+		z0 = int(start / 86400)
+		for (d = 0; d <= 366; d++) {
+			z = z0 + d
+			civil(z)
+			dow = (z + 4) % 7
+			dok = DOM[CD]
+			wok = DOW[dow]
+			if (dom_star || dow_star) { if (!(dok && wok)) continue }
+			else if (!(dok || wok)) continue
+			if (!MON[CM]) continue
+			for (h = 0; h <= 23; h++) {
+				if (!HOUR[h]) continue
+				for (m = 0; m <= 59; m++) {
+					if (!MIN[m]) continue
+					t = z * 86400 + h * 3600 + m * 60
+					if (t <= start) continue
+					print t - offsec
+					exit
+				}
+			}
+		}
+		exit 1
+	}'
+}
+
+# mwan3 运行时状态 -> TSV 行（L=接口 T=track P=策略成员）
+_mwan3_lines() {
+	command -v mwan3 >/dev/null 2>&1 || return 0
+	mwan3 status 2>/dev/null | awk '
+		$1 == "interface" { cur = $2; printf "L\t%s\t%s\t%s\n", $2, $4, $8; next }
+		$1 == "track" {
+			ip = $2; sub(/:$/, "", ip)
+			printf "T\t%s\t%s\t%s\n", cur, ip, $3
+			next
+		}
+		/^Current policies:/ { sec = 1; next }
+		sec && /^[^[:space:]]/ {
+			if ($0 ~ /^[A-Za-z0-9_.-]+:$/) { pol = $0; sub(/:$/, "", pol); next }
+			sec = 0
+		}
+		sec && /^[[:space:]]+[A-Za-z0-9_.-]+ \([0-9]+%\)/ {
+			iface = $1
+			pct = $0; sub(/.*\(/, "", pct); sub(/%.*/, "", pct)
+			printf "P\t%s\t%s\t%s\n", pol, iface, pct
+			next
+		}
+	'
+}
 
 cmd_fetch() {
 	mkdir -p "$WORK" || die "无法创建 $WORK"
 
-	# 数据源协议：只接受 https。明文 HTTP 下任何人都能在链路上把运营商
-	# 网段整段换掉（把某个集合指向别人的地址段 = 把流量导到特定出口），
-	# 而本工具没有任何签名/摘要校验来兜底。确实需要 http 镜像时显式
-	# 设 ISP_SPLIT_ALLOW_HTTP=1。
-	case "$ISP_MIRROR" in
-	https://*) ;;
-	http://*)
-		[ "${ISP_SPLIT_ALLOW_HTTP:-0}" = "1" ] ||
-			die "ISP_MIRROR 是明文 HTTP（$ISP_MIRROR）：数据可被中间人替换。改用 https://，或确认风险后设 ISP_SPLIT_ALLOW_HTTP=1"
-		log "警告：ISP_MIRROR 使用明文 HTTP（已按 ISP_SPLIT_ALLOW_HTTP=1 放行），数据完整性无保证"
-		;;
-	*)
-		die "ISP_MIRROR 必须形如 https://host（当前: $ISP_MIRROR）"
-		;;
-	esac
+	# 源声明先校验，再联网：非法 URL/角色不该等到下载一半才发现。
+	_source_check_all
 
-	rm -rf "$WORK/raw.new" "$WORK/out.new"
+	_primary=$(_primary_source_name)
+	_primary_base=$(_source_base_of "$_primary")
+	[ -n "$_primary" ] || die "ISP_SOURCES 里没有 primary 源"
+	[ -n "$_primary_base" ] ||
+		die "主源缺少镜像基址：ISP_SOURCES 为空时必须配置 ISP_MIRROR"
+
+	_force=${ISP_SPLIT_FORCE_FETCH:-0}
+
+	rm -rf "$WORK/raw.new" "$WORK/out.new" "$WORK/compose.new"
 	mkdir -p "$WORK/raw.new"
 
-	for row in $ISP_TABLE; do
-		case "$row" in \#*) continue ;; esac
-		_row_check_row "$row"
-		_src=${row%%:*}
-		log "下载 $_src"
-		fetch_one "$ISP_MIRROR/$_src.txt" "$WORK/raw.new/$_src.raw" ||
-			die "$_src 下载失败，保留现有数据不动"
-		_sz=$(wc -c < "$WORK/raw.new/$_src.raw" 2>/dev/null | tr -d ' ')
-		if [ "${_sz:-0}" -gt "$MAX_RAW_BYTES" ]; then
-			die "$_src 下载体积 ${_sz} 字节，超过上限 $MAX_RAW_BYTES 字节，拒绝本次更新"
-		fi
-		_n=$(grep -c '[0-9]' "$WORK/raw.new/$_src.raw" 2>/dev/null)
-		_n=${_n:-0}
-		[ "$_n" -gt 5 ] || die "$_src 内容异常（仅 $_n 行），拒绝覆盖现有数据"
+	# ---- 1) 主源：失败即冻结（保留旧数据），绝不自动换源 ----
+	log "主源: $_primary（$_primary_base）"
+	if ! _fetch_source "$_primary" "$_primary_base" "$WORK/raw.new/$_primary" primary; then
+		_state_fail_plus "$_primary" primary "主源下载失败" >/dev/null
+		die "主源 $_primary 下载失败，保留现有数据不动（冻结，cron 会在下次再试）"
+	fi
 
-		# 落盘后逐行跑 badcidr：一行 "1.2.3.4/abc" 会在 cidr2range 里
-		# 被当成 /0，直接把整个 IPv4 塞进第一个集合，必须在这里拒绝。
-		_bad=$(awk -f "$LIB/badcidr.awk" "$WORK/raw.new/$_src.raw" 2>/dev/null | head -5)
-		if [ -n "$_bad" ]; then
-			printf '%s\n' "$_bad" >&2
-			die "$_src 含非法 CIDR，拒绝本次更新（现有数据未改动）"
+	# ---- 2) 校验源/审计源：默认不启用 ----
+	_verify_ok=""
+	_verify_fail=""
+	for _row in $(_source_rows); do
+		_source_split "$_row"
+		case "$_s_role" in
+		verify | audit) ;;
+		*) continue ;;
+		esac
+		if [ "$ISP_VERIFY_ENABLE" != "1" ]; then
+			log "跳过校验源 $_s_name（ISP_VERIFY_ENABLE=0，0.2.0 默认不启用）"
+			continue
+		fi
+
+		log "校验源: $_s_name（$_s_base）"
+		if _fetch_source "$_s_name" "$_s_base" "$WORK/raw.new/$_s_name" "$_s_role"; then
+			_verify_ok="$_verify_ok $_s_name"
+			_state_put "$_s_name" "$_s_role" "$(date +%s)" 0 \
+				"$(_state_get "$_s_name" jaccard)" "校验源正常"
+		else
+			# 设计 §2.5 的分级降级：校验源挂了继续用主源，但连续失败
+			# 达到 ISP_SOURCE_MAX_FAIL_DAYS 天就升级为"拒绝更新"，防止
+			# 校验长期失效而无人察觉。
+			_fail=$(_state_fail_plus "$_s_name" "$_s_role" "校验源不可用（已降级）")
+			_verify_fail="$_verify_fail $_s_name"
+			log "警告: 校验源 $_s_name 不可用（连续 $_fail/$ISP_SOURCE_MAX_FAIL_DAYS 天），本次降级为只用主源"
+			if [ "$_fail" -ge "$ISP_SOURCE_MAX_FAIL_DAYS" ] && [ "$_force" != "1" ]; then
+				log "错误: 校验源 $_s_name 已连续 $_fail 天不可用（>= $ISP_SOURCE_MAX_FAIL_DAYS），拒绝在无校验的情况下更新"
+				echo "现有数据未改动。确认可接受无校验更新，可设 ISP_SPLIT_FORCE_FETCH=1 再试。"
+				exit 3
+			fi
 		fi
 	done
 
+	# ---- 3) 闸门：日变化 + 与校验源的差异（都在写任何东西之前）----
+	# 日变化闸门只跟"校验源已启用且拉到了"一起生效：0.2.0 默认不开启校验，
+	# 老配置升级后行为必须与 0.1.x 完全一致，不能凭空多出一道会拒更新的闸门。
+	if [ -n "$_verify_ok" ] && [ "$_force" != "1" ]; then
+		if ! _delta_check "$_primary" "$WORK/raw.new/$_primary"; then
+			echo "已拒绝本次更新（现有数据未改动）。确认数据无误可设 ISP_SPLIT_FORCE_FETCH=1 再试。"
+			exit 3
+		fi
+	fi
+
+	for _vname in $_verify_ok; do
+		if _run_diff "$WORK/raw.new/$_primary" "$WORK/raw.new/$_vname" \
+			"$_primary" "$_vname" reject; then
+			continue
+		fi
+		echo
+		if [ "$_force" = "1" ]; then
+			log "警告: 与校验源 $_vname 的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（${DIFF_REJECTED}），已按 ISP_SPLIT_FORCE_FETCH=1 放行"
+			continue
+		fi
+		echo "已拒绝本次更新：与校验源的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（$_vname:${DIFF_REJECTED}）。"
+		echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
+		echo "人工确认数据无误后，可用 ISP_SPLIT_FORCE_FETCH=1 isp-split fetch 放行。"
+		exit 3
+	done
+	if [ -n "$_verify_ok" ] && [ -n "${DIFF_MIN_JACCARD:-}" ]; then
+		for _vname in $_verify_ok; do
+			_state_put "$_vname" "$(_source_role_of "$_vname")" "$(date +%s)" 0 \
+				"$DIFF_MIN_JACCARD" "校验源正常"
+		done
+	fi
+
+	# ---- 4) 合成（0.2.0：只有 primary 参与合成）----
 	log "构建集合（互斥化）"
-	ISP_SPLIT_LIB=$LIB sh "$LIB/build.sh" "$WORK/raw.new" "$WORK/out.new" \
+	_compose_raw "$_primary" "$WORK/raw.new/$_primary" "$WORK/compose.new" ||
+		die "按 ISP_SOURCE_FILES 合成失败，保留现有数据不动"
+
+	ISP_SPLIT_LIB=$LIB sh "$LIB/build.sh" "$WORK/compose.new" "$WORK/out.new" \
 		"$(priority_list)" || die "构建失败，保留现有数据不动"
 
 	# 至少要有启用集合的非空产物，否则视为构建异常
@@ -315,7 +911,6 @@ cmd_fetch() {
 	foreach_enabled _addr_old
 	_old_total=$_addr_total
 
-	_force=${ISP_SPLIT_FORCE_FETCH:-0}
 	if [ "$_new_total" -gt 1073741824 ] && [ "$_force" != "1" ]; then
 		die "所有集合合计 $_new_total 个地址，超过 IPv4 总量的 25%，拒绝本次更新（疑似源数据被污染；确认数据无误可设 ISP_SPLIT_FORCE_FETCH=1 再试）"
 	fi
@@ -375,7 +970,108 @@ cmd_fetch() {
 	fi
 	rm -rf "$_old"
 
+	# 主源存档留到最后：更新成功了才把本次数据当作"上一份"，
+	# 失败/拒绝时存档保持不动，日变化与 diff 才有正确的比较基准。
+	_archive_source "$_primary" "$WORK/raw.new/$_primary" ||
+		log "警告: 主源存档失败（不影响本次更新，但下次的日变化比较会退化为无基准）"
+	for _vname in $_verify_ok; do
+		_archive_source "$_vname" "$WORK/raw.new/$_vname" ||
+			log "警告: 校验源 $_vname 存档失败（不影响本次更新）"
+	done
+
+	# 源健康度落盘（主源成功）
+	_state_put "$_primary" primary "$(date +%s)" 0 "${DIFF_MIN_JACCARD:-}" "正常"
+
+	if [ -n "${DIFF_MIN_JACCARD:-}" ]; then
+		mkdir -p "$STATE_DIR" 2>/dev/null || true
+		printf '%s\t%s\n' "$DIFF_MIN_JACCARD" "$(date +%s)" \
+			> "$STATE_DIR/last-diff" 2>/dev/null || true
+	fi
+
 	log "数据已更新：$(wc -l "$DATA"/*.txt | tail -1)"
+}
+
+# ---------------------------------------------------------------- diff
+
+# 重新计算"主源 vs 校验源"的分歧（基于 $BASE/raw 存档，不联网）。
+# 分歧超过 ISP_DIFF_MAX_JACCARD_DROP 时返回 3；差异段写 quarantine/<日期>/。
+cmd_diff() {
+	_save=always
+	case "${1:-}" in
+	--no-save) _save=never ;;
+	"") ;;
+	*) die "用法: isp-split diff [--no-save]" ;;
+	esac
+	_source_check_all
+	_p=$(_primary_source_name)
+	[ -d "$RAW_ARCHIVE/$_p" ] ||
+		die "还没有主源存档（$RAW_ARCHIVE/$_p）。先运行 isp-split fetch 拉一份数据"
+
+	_rc=0
+	_any=0
+	for _row in $(_source_rows); do
+		_source_split "$_row"
+		[ "$_s_role" = "primary" ] && continue
+		_any=1
+		if [ ! -d "$RAW_ARCHIVE/$_s_name" ]; then
+			echo "== 校验源 $_s_name: 无存档（从未成功拉取）；启用后先跑一次 fetch"
+			continue
+		fi
+		_run_diff "$RAW_ARCHIVE/$_p" "$RAW_ARCHIVE/$_s_name" \
+			"$_p" "$_s_name" "$_save" || _rc=3
+	done
+	[ "$_any" = "1" ] ||
+		echo "ISP_SOURCES 里没有校验源（只有 primary），没有可比较的对象。"
+
+	if [ "$_rc" -eq 3 ]; then
+		echo
+		echo "分歧超过阈值 ${ISP_DIFF_MAX_JACCARD_DROP}%：按设计 fetch 会拒绝本次更新（退出码 3）。"
+		[ "$_save" = "always" ] &&
+			echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
+	fi
+	return $_rc
+}
+
+# ---------------------------------------------------------------- dnstest
+
+# 单条线路的 DNS 可达性探测（LuCI 配置页的"测线"按钮）
+cmd_dnstest() {
+	_pol=${1:-}
+	_json=0
+	[ "${2:-}" = "--json" ] && _json=1
+	[ -n "$_pol" ] || die "用法: isp-split dnstest <策略名> [--json]"
+	_valid_policy "$_pol" || die "策略名 '$_pol' 非法"
+	_TARGET=$_pol
+	_dns=$(dns_of_policy "$_pol")
+	[ -n "$_dns" ] || die "DNS_TABLE 里没有策略 '$_pol' 的 DNS 服务器"
+	_valid_ipv4 "$_dns" || die "DNS_TABLE 里策略 '$_pol' 的 DNS '$_dns' 不是合法 IPv4"
+	_dev=$(policy_device "$_pol")
+
+	_ok=false
+	_ans=""
+	if command -v nslookup >/dev/null 2>&1; then
+		if command -v timeout >/dev/null 2>&1; then
+			_out=$(timeout 6 nslookup www.example.com "$_dns" 2>/dev/null)
+		else
+			_out=$(nslookup www.example.com "$_dns" 2>/dev/null)
+		fi
+		_ans=$(printf '%s\n' "$_out" | awk '/^Address: / { print $2 }' | grep -v ':' | head -1)
+		[ -n "$_ans" ] && _ok=true
+	fi
+
+	if [ "$_json" = "1" ]; then
+		printf '{"policy":"%s","dns":"%s","device":"%s","ok":%s,"answer":"%s"}\n' \
+			"$_pol" "$_dns" "${_dev:-}" "$_ok" "${_ans:-}"
+	else
+		printf '策略 %s -> 线路 %s，DNS %s\n' "$_pol" "${_dev:-未知}" "$_dns"
+		if [ "$_ok" = "true" ]; then
+			printf '  结果: 可用（www.example.com -> %s）\n' "$_ans"
+		else
+			printf '  结果: 不可用（DNS 无响应或 nslookup 不可用）\n'
+		fi
+	fi
+	[ "$_ok" = "true" ] || return 1
+	return 0
 }
 
 # ---------------------------------------------------------------- apply
@@ -843,6 +1539,9 @@ cmd_plan() {
 	foreach_enabled _p1
 
 	echo
+	_sources_report
+
+	echo
 	echo "未启用的运营商（其地址段不会被任何策略接管，落到兜底规则）:"
 	_dp_body=$(_mwan3_rules_body)
 	_dp_any=0
@@ -1004,6 +1703,25 @@ _status_one() {
 }
 
 # 机器可读输出，供 LuCI 渲染表格
+# 运营商显示名（LuCI 卡片标题）；未列出的源名原样显示
+_isp_label() {
+	case "$1" in
+	chinatelecom | chinanet | telecom) printf '%s' "电信" ;;
+	unicom_cnc | unicom) printf '%s' "联通" ;;
+	cmcc | mobile) printf '%s' "移动" ;;
+	cernet) printf '%s' "教育网" ;;
+	chinabtn) printf '%s' "铁通" ;;
+	gwbn) printf '%s' "长城宽带" ;;
+	othernet) printf '%s' "其他/IDC" ;;
+	hk) printf '%s' "香港" ;;
+	mo) printf '%s' "澳门" ;;
+	tw) printf '%s' "台湾" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+# 机器可读输出（LuCI 表格/卡片直接用）。形状保持 0.1.x 的数组不变，
+# 只给每项加了一个 label 字段（运营商中文名），老消费者不受影响。
 cmd_status_json() {
 	_first=1
 	printf '['
@@ -1032,8 +1750,8 @@ cmd_status_json() {
 		fi
 		[ "$_first" = "1" ] || printf ','
 		_first=0
-		printf '{"set":"%s","src":"%s","policy":"%s","exists":%s,"elements":%s,"packets":%s,"bytes":%s}' \
-			"$_set" "$_src" "$_pol" "$_ex" "${_n:-0}" "${_p:-0}" "${_b:-0}"
+		printf '{"set":"%s","label":"%s","src":"%s","policy":"%s","exists":%s,"elements":%s,"packets":%s,"bytes":%s}' \
+			"$_set" "$(_isp_label "$_src")" "$_src" "$_pol" "$_ex" "${_n:-0}" "${_p:-0}" "${_b:-0}"
 	}
 	foreach_enabled _sj
 	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
@@ -1042,11 +1760,145 @@ cmd_status_json() {
 		_fbb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
 			grep -oE "bytes [0-9]+" | grep -oE "[0-9]+")
 		[ "$_first" = "1" ] || printf ','
-		printf '{"set":"兜底","src":"-","policy":"未命中集合","exists":true,"elements":"","packets":%s,"bytes":%s}' \
+		printf '{"set":"兜底","label":"兜底","src":"-","policy":"未命中集合","exists":true,"elements":"","packets":%s,"bytes":%s}' \
 			"${_fbp:-0}" "${_fbb:-0}"
 	fi
 	printf ']'
 	echo
+}
+
+# 环境状态：数据源健康度 / 双线健康 / 策略占比 / 数据时间 / 最近一次 diff。
+# 与 status --json（nft 统计）分开放，是为了让后者的数组形状保持不变。
+cmd_health_json() {
+	_source_check_all
+	printf '{"sources":['
+	_sfj=1
+	for _row in $(_source_rows); do
+		_source_split "$_row"
+		_last=$(_state_get "$_s_name" last_ok)
+		_fail=$(_state_get "$_s_name" fail)
+		case "${_fail:-}" in '' | *[!0-9]*) _fail=0 ;; esac
+		_jac=$(_state_get "$_s_name" jaccard)
+		_st="ok"
+		_en=true
+		if [ "$_s_role" != "primary" ] && [ "$ISP_VERIFY_ENABLE" != "1" ]; then
+			_st="disabled"
+			_en=false
+		elif [ "$_fail" -gt 0 ]; then
+			_st="degraded"
+		fi
+		[ "$_sfj" = "1" ] || printf ','
+		_sfj=0
+		printf '{"name":"%s","label":"%s","role":"%s","last_ok":%s,"last_ok_text":"%s","fail_days":%s,"jaccard":%s,"max_fail":%s,"status":"%s","enabled":%s}' \
+			"$_s_name" "$(_isp_label "$_s_name")" "$_s_role" "${_last:-0}" \
+			"$(_ts_text "$_last")" "$_fail" "${_jac:-null}" \
+			"$ISP_SOURCE_MAX_FAIL_DAYS" "$_st" "$_en"
+	done
+	printf ']'
+
+	# 线路状态与策略占比（解析 mwan3 status；没装/没跑时返回空数组）
+	_ml=$(_mwan3_lines 2>/dev/null)
+	if [ -n "$_ml" ]; then
+		printf '%s\n' "$_ml" | awk -F'\t' '
+			function clean(s) { gsub(/[^A-Za-z0-9_.-]/, "", s); return s }
+			$1 == "L" {
+				name = clean($2)
+				st[name] = clean($3)
+				tr[name] = clean($4)
+				if (!(name in seen)) { seen[name] = 1; order[++n] = name }
+				next
+			}
+			$1 == "T" {
+				k = clean($2)
+				c[k]++
+				tip[k, c[k]] = clean($3)
+				tst[k, c[k]] = clean($4)
+				next
+			}
+			$1 == "P" {
+				p = clean($2)
+				if (!(p in pseen)) { pseen[p] = 1; porder[++np] = p }
+				m[p]++
+				mif[p, m[p]] = clean($3)
+				mpc[p, m[p]] = $4 + 0
+				next
+			}
+			END {
+				printf ",\"lines\":["
+				for (i = 1; i <= n; i++) {
+					if (i > 1) printf ","
+					printf "{\"iface\":\"%s\",\"state\":\"%s\",\"tracking\":\"%s\",\"tracks\":[", order[i], st[order[i]], tr[order[i]]
+					for (j = 1; j <= c[order[i]]; j++) {
+						if (j > 1) printf ","
+						printf "{\"ip\":\"%s\",\"state\":\"%s\"}", tip[order[i], j], tst[order[i], j]
+					}
+					printf "]}"
+				}
+				printf "],\"policies\":["
+				for (i = 1; i <= np; i++) {
+					if (i > 1) printf ","
+					printf "{\"name\":\"%s\",\"members\":[", porder[i]
+					for (j = 1; j <= m[porder[i]]; j++) {
+						if (j > 1) printf ","
+						printf "{\"iface\":\"%s\",\"pct\":%s}", mif[porder[i], j], mpc[porder[i], j]
+					}
+					printf "]}"
+				}
+				printf "]"
+			}'
+	else
+		printf ',"lines":[],"policies":[]'
+	fi
+	if [ "$ISP_VERIFY_ENABLE" = "1" ]; then
+		printf ',"verify_enabled":true'
+	else
+		printf ',"verify_enabled":false'
+	fi
+
+	_stamp=$(cat "$DATA/.stamp" 2>/dev/null | tr -d ' \t\r\n')
+	case "${_stamp:-}" in '' | *[!0-9]*) _stamp=0 ;; esac
+	_cron_safe=$(printf '%s' "$ISP_CRON" | tr -d '"\\')
+	_next=$(_cron_next_epoch "$ISP_CRON" 2>/dev/null)
+	printf ',"data":{"stamp":%s,"updated":"%s","cron":"%s","next_cron":"%s","next_epoch":%s}' \
+		"$_stamp" "$(_ts_text "$_stamp")" "$_cron_safe" \
+		"$(_ts_text "$_next")" "${_next:-0}"
+
+	_dj=""
+	_da=0
+	if [ -f "$STATE_DIR/last-diff" ]; then
+		_dj=$(awk '{ print $1; exit }' "$STATE_DIR/last-diff" 2>/dev/null)
+		_da=$(awk '{ print $2; exit }' "$STATE_DIR/last-diff" 2>/dev/null)
+	fi
+	case "${_da:-}" in '' | *[!0-9]*) _da=0 ;; esac
+	printf ',"diff":{"min_jaccard":%s,"at":%s,"at_text":"%s"}' \
+		"${_dj:-null}" "$_da" "$(_ts_text "$_da")"
+
+	printf '}\n'
+}
+
+# 环境状态的文字版（命令行排查用）
+cmd_health() {
+	case "${1:-}" in
+	--json)
+		_openclash_fakeip_warn >&2
+		cmd_health_json
+		return 0
+		;;
+	esac
+	_openclash_fakeip_warn
+	_sources_report
+	echo
+	echo "线路状态:"
+	_ml=$(_mwan3_lines 2>/dev/null)
+	if [ -n "$_ml" ]; then
+		printf '%s\n' "$_ml" | awk -F'\t' '
+			$1 == "L" { printf "  %-8s %-8s tracking=%s\n", $2, $3, $4 }
+			$1 == "T" { printf "    track %s: %s\n", $3, $4 }
+			$1 == "P" { printf "  策略 %-12s %s %s%%\n", $2, $3, $4 }
+		'
+	else
+		echo "  （mwan3 未运行，读不到线路状态）"
+	fi
 }
 
 cmd_status() {
@@ -1079,10 +1931,10 @@ cmd_status() {
 	echo
 	echo "注: 命中包/流量为连接首包统计（后续包由 conntrack 恢复标记，不再经过规则链）。"
 	echo "    业务吞吐请看接口计数: cat /sys/class/net/pppoe-wan*/statistics/rx_bytes"
-	if [ -f "$DATA/.stamp" ]; then
-		echo "数据更新时间: $(date -d "@$(cat "$DATA/.stamp")" 2>/dev/null ||
-			date -r "$(cat "$DATA/.stamp")" 2>/dev/null || echo '未知')"
-	fi
+	echo
+	_sources_report
+	_next=$(_cron_next_epoch "$ISP_CRON" 2>/dev/null)
+	[ -n "${_next:-}" ] && echo "  下次自动更新: $(_ts_text "$_next")（cron: $ISP_CRON）"
 	# 兜底流量状态：先看 UCI 配置意图，再看链里实际渲染形状。
 	# mwan3-nft 3.6 对 rule 有两种渲染形态，必须都认：
 	#   直接： ip daddr 0.0.0.0/0 ... jump mwan3_policy_<default>
@@ -2120,9 +2972,11 @@ _conf_validate() {
 }
 
 # 安全重写某个 KEY 的值：写前校验并备份、写后 sh -n 校验、失败自动回滚
+# 第三个参数是写入目标，默认正式配置；预检用临时副本，绝不碰 /etc/isp-split.conf。
 _conf_write() {
 	_key=$1
 	_val=$2
+	_target=${3:-$CONF}
 	case "$_key" in
 	isp_table) _key=ISP_TABLE ;;
 	dns_table) _key=DNS_TABLE ;;
@@ -2141,12 +2995,12 @@ _conf_write() {
 	#      但仍然打印"已更新"并返回 0 —— 静默丢配置；
 	#   2) 直接重定向覆盖正式文件，写到一半失败（磁盘满）可能留下
 	#      一份语法合法但被截断的配置，sh -n 查不出来。
-	_backup=$CONF.bak.$$
-	_tmp=$CONF.tmp.$$
-	cp -f "$CONF" "$_backup" || die "无法备份配置"
+	_backup=$_target.bak.$$
+	_tmp=$_target.tmp.$$
+	cp -f "$_target" "$_backup" || die "无法备份配置"
 	# 临时文件先复制原文件再原地截断重写：这样模式/属主跟原文件一致
 	# （rename 会把临时文件的权限带过去；OpenWrt 没有 stat，不能靠 chmod 复制）
-	cp -f "$CONF" "$_tmp" || die "无法创建临时配置文件"
+	cp -f "$_target" "$_tmp" || die "无法创建临时配置文件"
 
 	awk -v key="$_key" -v val="$_val" '
 		function emit(v,	n, i, L) {
@@ -2201,9 +3055,9 @@ _conf_write() {
 		die "写入后校验失败（$_key 的内容与预期不一致），已回滚，原文件未改动"
 	fi
 
-	mv -f "$_tmp" "$CONF" || {
+	mv -f "$_tmp" "$_target" || {
 		rm -f "$_tmp" "$_backup"
-		cp -f "$_backup" "$CONF" 2>/dev/null
+		cp -f "$_backup" "$_target" 2>/dev/null
 		die "替换配置失败，已回滚"
 	}
 	rm -f "$_backup"
@@ -2229,12 +3083,61 @@ conf_set() {
 	echo "  DNS 相关      -> isp-split dns"
 }
 
+# 只校验不落盘：LuCI 保存前的行内校验与"保存并生效"之间的最后一道闸
+conf_check() {
+	_ck_key=${1:-}
+	_ck_val=${2:-}
+	[ -n "$_ck_key" ] || die "用法: isp-split conf check <项> <值>"
+	_ck_val=$(printf '%s' "$_ck_val" | tr '|' '\n')
+	case "$_ck_key" in
+	isp_table) _ck_key=ISP_TABLE ;;
+	dns_table) _ck_key=DNS_TABLE ;;
+	domain_split) _ck_key=DOMAIN_SPLIT ;;
+	dns_mode) _ck_key=DNS_MODE ;;
+	*) die "未知配置项 '$_ck_key'，可选：isp_table / dns_table / domain_split / dns_mode" ;;
+	esac
+	_conf_validate "$_ck_key" "$_ck_val" || return $?
+	echo "$_ck_key 校验通过"
+}
+
+# 保存前预检：把"还没保存的改动"写进配置的临时副本，再跑 plan 预演。
+# 正式配置一个字节都不动，用户能看到"如果保存会变成什么样"。
+conf_preview() {
+	[ $# -ge 2 ] || die "用法: isp-split conf preview <项> <值> [<项> <值> ...]"
+	_pv_tmp=$(mktemp "${TMPDIR:-/tmp}/isp-split-preview.XXXXXX" 2>/dev/null) ||
+		die "无法创建临时配置文件"
+	cp -f "$CONF" "$_pv_tmp" || { rm -f "$_pv_tmp"; die "无法复制配置"; }
+
+	while [ $# -ge 2 ]; do
+		_pv_key=$1
+		_pv_val=$(printf '%s' "$2" | tr '|' '\n')
+		shift 2
+		if ! _conf_write "$_pv_key" "$_pv_val" "$_pv_tmp"; then
+			rm -f "$_pv_tmp"
+			return 1
+		fi
+	done
+
+	echo "== 预检：以下预演基于【尚未保存】的改动（$CONF 未被修改）"
+	ISP_SPLIT_CONF=$_pv_tmp \
+		ISP_SPLIT_BASE="$BASE" \
+		ISP_SPLIT_LIB="$LIB" \
+		ISP_SPLIT_MWAN3="$CFG_MWAN3" \
+		ISP_SPLIT_CRONTAB="$CRONTAB" \
+		sh "$0" plan
+	_pv_rc=$?
+	rm -f "$_pv_tmp"
+	return $_pv_rc
+}
+
 cmd_conf() {
 	_op=${1:-get}
 	case "$_op" in
 	get) conf_get ;;
 	set) shift; conf_set "$@" || return $? ;;
-	*) die "用法: isp-split conf [get | set <项> <值>]" ;;
+	check) shift; conf_check "$@" || return $? ;;
+	preview) shift; conf_preview "$@" || return $? ;;
+	*) die "用法: isp-split conf [get | set <项> <值> | check <项> <值> | preview <项> <值> ...]" ;;
 	esac
 }
 
@@ -2574,6 +3477,8 @@ case "${1:-}" in
 	exit 0
 	;;
 fetch) cmd_fetch ;;
+diff) shift; cmd_diff "$@" ;;
+dnstest) shift; cmd_dnstest "$@" ;;
 apply) cmd_apply ;;
 wire) cmd_wire ;;
 sync) cmd_sync ;;
@@ -2584,6 +3489,7 @@ stage) cmd_stage ;;
 enable) cmd_enable ;;
 verify) cmd_verify ;;
 status) shift; cmd_status "$@" ;;
+health) shift; cmd_health "$@" ;;
 probe) cmd_probe ;;
 rollback) cmd_rollback ;;
 dns) cmd_dns ;;
@@ -2602,7 +3508,8 @@ uninstall) cmd_uninstall ;;
   selftest   在独立临时表里实测加载 1.3 万条，测完删除
 
   —— 数据 ——
-  fetch      下载并重建运营商 IP 段（不动线上流量）
+  fetch      下载并重建运营商 IP 段（不动线上流量；多源逐源拉取并过闸门）
+  diff       重新计算"主源 vs 校验源"的分歧（基于存档，不联网；超阈值返回 3）
   rollback   回滚到上一份数据
 
   —— 上线（建议分两步）——
@@ -2614,9 +3521,12 @@ uninstall) cmd_uninstall ;;
   apply      原子刷入 nftables 集合（不断流、不重启 mwan3）
   wire       建立 mwan3 集合与规则并插到正确位置
   conf       读写配置：conf get | conf set <项> <值>
+             conf check <项> <值>（只校验）| conf preview <项> <值> ...（预演未保存的改动）
+  dnstest    测一条线路的 DNS 是否可用：dnstest <策略名>
   refresh    fetch + apply（只更新数据，不动 mwan3 配置）
   sync       fetch + wire + apply
   status     查看条目数与命中统计
+  health     数据源健康度 + 双线状态（--json 给 LuCI 用）
   probe      分线实测出口速度
   dns        生成多线路 DNS 配置（域名按线路选 DNS）
   export     导出给代理侧用：export mihomo|singbox|text <目录>

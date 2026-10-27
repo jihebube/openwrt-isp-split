@@ -1230,6 +1230,253 @@ else
 	ng "OpenClash 未启用仍告警"
 fi
 
+echo "== 12. 多数据源管线（0.2.0）"
+# 目标：证明"骨架"在不改变默认行为的前提下工作
+#   1. 老配置（没有 ISP_SOURCES）行为与 0.1.x 完全一致
+#   2. 双源正常：diff 通过，数据更新，存档落盘
+#   3. 校验源挂：降级继续（退出 0），连续 3 天失败后升级为拒绝（退出 3）
+#   4. 分歧超阈值：拒绝更新（退出 3）+ quarantine 留档 + 旧数据不动
+#   5. 主源挂：冻结（非 0 退出），旧数据不动
+# 全部离线：用假 uclient-fetch 把 URL 映射到 tools/fixtures/multisource。
+
+MS=$TMP/ms
+mkdir -p "$MS/bin" "$MS/mirror/ispip.clang.cn" "$MS/mirror/china-operator-ip.yfgao.com"
+cat > "$MS/bin/uclient-fetch" <<'MS_FETCH'
+#!/bin/sh
+out=""; url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-O) out=$2; shift 2 ;;
+	-q) shift ;;
+	-T) shift 2 ;;
+	*) url=$1; shift ;;
+	esac
+done
+[ -n "$out" ] || exit 1
+rel=$(printf '%s' "$url" | sed 's|^https\?://||')
+[ -f "$MS_MIRROR/$rel" ] || exit 1
+cp "$MS_MIRROR/$rel" "$out"
+MS_FETCH
+chmod +x "$MS/bin/uclient-fetch"
+
+cp "$FIX/multisource/clang/chinatelecom.txt" "$MS/mirror/ispip.clang.cn/chinatelecom.txt"
+cp "$FIX/multisource/clang/unicom_cnc.txt" "$MS/mirror/ispip.clang.cn/unicom_cnc.txt"
+cp "$FIX/multisource/yfgao/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+cp "$FIX/multisource/yfgao/unicom.txt" "$MS/mirror/china-operator-ip.yfgao.com/unicom.txt"
+
+cat > "$MS/ms.conf" <<'MS_CONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_MIRROR="https://ispip.clang.cn"
+ISP_SOURCES="
+clang:primary:https://ispip.clang.cn
+yfgao:verify:https://china-operator-ip.yfgao.com
+"
+ISP_SOURCE_FILES="
+clang:chinatelecom=chinatelecom,unicom_cnc=unicom_cnc
+yfgao:chinatelecom=chinanet,unicom_cnc=unicom
+"
+ISP_VERIFY_ENABLE=1
+MS_CONF
+
+# 老配置：没有 ISP_SOURCES / ISP_SOURCE_FILES / ISP_VERIFY_ENABLE
+cat > "$MS/legacy.conf" <<'MS_LEGACY'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_MIRROR="https://ispip.clang.cn"
+MS_LEGACY
+
+# 非法角色：只能在 primary/verify/audit 里选
+cat > "$MS/badrole.conf" <<'MS_BADROLE'
+ISP_TABLE="chinatelecom:isp_tel:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_MIRROR="https://ispip.clang.cn"
+ISP_SOURCES="
+clang:primary:https://ispip.clang.cn
+yfgao:mirror:https://china-operator-ip.yfgao.com
+"
+MS_BADROLE
+
+_ms_run() {
+	_ms_conf=$1
+	_ms_base=$2
+	shift 2
+	(
+		PATH="$MS/bin:$PATH"
+		MS_MIRROR="$MS/mirror"
+		ISP_SPLIT_CONF="$_ms_conf"
+		ISP_SPLIT_BASE="$_ms_base"
+		ISP_SPLIT_LIB="$LIB"
+		export PATH MS_MIRROR ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+		sh "$ROOT/files/usr/sbin/isp-split" "$@"
+	)
+}
+
+# --- 12.1 双源正常 ---
+rm -rf "$MS/base-ok"
+if _ms_run "$MS/ms.conf" "$MS/base-ok" fetch >"$MS/ok.log" 2>&1 &&
+	[ -s "$MS/base-ok/data/chinatelecom.txt" ] &&
+	[ "$(wc -l < "$MS/base-ok/data/chinatelecom.txt" | tr -d ' ')" = "6" ]; then
+	ok "双源正常：主源出数据、集合构建成功"
+else
+	ng "双源正常流程失败"
+	sed 's/^/    /' "$MS/ok.log"
+fi
+
+if grep -q '^yfgao	verify	[0-9]*	0	100.00' "$MS/base-ok/state/sources.tsv" 2>/dev/null; then
+	ok "双源正常：Jaccard=100% 记入 state/sources.tsv"
+else
+	ng "state/sources.tsv 未记录 Jaccard"
+	sed 's/^/    /' "$MS/base-ok/state/sources.tsv" 2>/dev/null
+fi
+
+if [ -f "$MS/base-ok/raw/clang/chinatelecom.txt" ] &&
+	[ -f "$MS/base-ok/raw/yfgao/chinanet.txt" ]; then
+	ok "双源正常：两源 raw 存档各自独立（raw/<源名>/）"
+else
+	ng "两源 raw 存档缺失"
+	find "$MS/base-ok/raw" -type f 2>/dev/null | sed 's/^/    /'
+fi
+
+if _ms_run "$MS/ms.conf" "$MS/base-ok" diff >"$MS/diff.log" 2>&1; then
+	ok "diff 子命令基于存档可重算且不误报（退出 0）"
+else
+	ng "diff 子命令对一致数据返回非 0"
+	sed 's/^/    /' "$MS/diff.log"
+fi
+
+# --- 12.2 老配置单源兼容（必须与 0.1.x 一致） ---
+rm -rf "$MS/base-legacy"
+if _ms_run "$MS/legacy.conf" "$MS/base-legacy" fetch >"$MS/legacy.log" 2>&1 &&
+	[ -s "$MS/base-legacy/data/chinatelecom.txt" ] &&
+	[ -d "$MS/base-legacy/raw/ispip" ] &&
+	[ ! -d "$MS/base-legacy/raw/yfgao" ]; then
+	ok "老配置（无 ISP_SOURCES）单源行为不变，且不触发多源路径"
+else
+	ng "老配置兼容性被破坏"
+	sed 's/^/    /' "$MS/legacy.log" 2>/dev/null
+	find "$MS/base-legacy" -maxdepth 2 2>/dev/null | sed 's/^/    /'
+fi
+
+if _ms_run "$MS/legacy.conf" "$MS/base-legacy" health --json 2>/dev/null |
+	grep -q '"name":"ispip"'; then
+	ok "老配置在源健康度里显示为单源 ispip"
+else
+	ng "老配置的源健康度未显示 ispip"
+fi
+
+# --- 12.3 校验源挂：降级继续 ---
+rm -f "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+rm -rf "$MS/base-degrade"
+_ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >"$MS/degrade.log" 2>&1
+_ms_rc=$?
+if [ "$_ms_rc" -eq 0 ] && [ -s "$MS/base-degrade/data/chinatelecom.txt" ]; then
+	ok "校验源不可用：仍用主源更新（退出 0，降级）"
+else
+	ng "校验源不可用导致更新失败（退出 $_ms_rc，应降级为 0）"
+	sed 's/^/    /' "$MS/degrade.log"
+fi
+if _ms_run "$MS/ms.conf" "$MS/base-degrade" health --json 2>/dev/null |
+	grep -q '"status":"degraded"'; then
+	ok "校验源降级状态出现在 health --json"
+else
+	ng "health --json 未标出降级"
+	_ms_run "$MS/ms.conf" "$MS/base-degrade" health --json 2>&1 | sed 's/^/    /'
+fi
+if _ms_run "$MS/ms.conf" "$MS/base-degrade" plan 2>/dev/null |
+	grep -q '数据源健康度'; then
+	ok "plan 输出包含"数据源健康度"区块"
+else
+	ng "plan 未输出数据源健康度"
+fi
+
+# --- 12.4 连续失败达到上限：升级为拒绝更新 ---
+_ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >/dev/null 2>&1
+_ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >/dev/null 2>&1
+if _ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >"$MS/escalate.log" 2>&1; then
+	ng "校验源连续失败 3 天仍未拒绝更新"
+else
+	_ms_rc=$?
+	if [ "$_ms_rc" -eq 3 ]; then
+		ok "校验源连续失败达上限后拒绝更新（退出 3）"
+	else
+		ng "连续失败后的退出码是 $_ms_rc（期望 3）"
+		sed 's/^/    /' "$MS/escalate.log"
+	fi
+fi
+
+# --- 12.5 分歧超阈值：拒绝 + quarantine 留档 + 旧数据不动 ---
+cp "$FIX/multisource/yfgao-drift/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+cp "$FIX/multisource/yfgao/unicom.txt" "$MS/mirror/china-operator-ip.yfgao.com/unicom.txt"
+rm -rf "$MS/base-drift"
+# 先建立一份正常数据，再让校验源漂移
+cp "$FIX/multisource/yfgao/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+_ms_run "$MS/ms.conf" "$MS/base-drift" fetch >/dev/null 2>&1
+_ms_before=$(cat "$MS/base-drift/data/chinatelecom.txt" 2>/dev/null | md5sum | awk '{print $1}')
+cp "$FIX/multisource/yfgao-drift/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+if _ms_run "$MS/ms.conf" "$MS/base-drift" fetch >"$MS/drift.log" 2>&1; then
+	ng "分歧超阈值仍被接受（应退出 3）"
+else
+	_ms_rc=$?
+	if [ "$_ms_rc" -eq 3 ]; then
+		ok "分歧超阈值拒绝更新（退出 3）"
+	else
+		ng "分歧超阈值的退出码是 $_ms_rc（期望 3）"
+	fi
+fi
+_ms_after=$(cat "$MS/base-drift/data/chinatelecom.txt" 2>/dev/null | md5sum | awk '{print $1}')
+if [ "$_ms_before" = "$_ms_after" ]; then
+	ok "拒绝更新时旧数据未被改动"
+else
+	ng "拒绝更新后数据被改动"
+fi
+if find "$MS/base-drift/quarantine" -name '*.only-verify.txt' 2>/dev/null |
+	grep -q . &&
+	grep -rq '100.0.0.0/24' "$MS/base-drift/quarantine" 2>/dev/null; then
+	ok "差异段写入 quarantine/<日期>/（含 100.0.0.0/24）"
+else
+	ng "quarantine 未留下差异段"
+	find "$MS/base-drift/quarantine" -type f 2>/dev/null | sed 's/^/    /'
+fi
+
+# --- 12.6 主源不可用：冻结，旧数据不动 ---
+rm -rf "$MS/base-freeze"
+cp "$FIX/multisource/yfgao/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
+_ms_run "$MS/ms.conf" "$MS/base-freeze" fetch >/dev/null 2>&1
+_ms_before=$(cat "$MS/base-freeze/data/chinatelecom.txt" 2>/dev/null | md5sum | awk '{print $1}')
+mv "$MS/mirror/ispip.clang.cn/chinatelecom.txt" "$MS/mirror/ispip.clang.cn/.hidden"
+if _ms_run "$MS/ms.conf" "$MS/base-freeze" fetch >"$MS/freeze.log" 2>&1; then
+	ng "主源不可用时仍返回成功"
+else
+	ok "主源不可用时冻结并返回非 0"
+fi
+mv "$MS/mirror/ispip.clang.cn/.hidden" "$MS/mirror/ispip.clang.cn/chinatelecom.txt"
+_ms_after=$(cat "$MS/base-freeze/data/chinatelecom.txt" 2>/dev/null | md5sum | awk '{print $1}')
+if [ "$_ms_before" = "$_ms_after" ]; then
+	ok "主源失败时旧数据未被改动"
+else
+	ng "主源失败后数据被改动"
+fi
+
+# --- 12.7 非法源角色被拒绝 ---
+if _ms_run "$MS/badrole.conf" "$MS/base-bad" fetch >/dev/null 2>&1; then
+	ng "非法源角色（mirror）仍被接受"
+else
+	ok "非法源角色被拒绝"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then

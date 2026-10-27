@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
-PKG_VERSION:=0.1.5
-PKG_RELEASE:=2
+PKG_VERSION:=0.2.0
+PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 
@@ -122,6 +122,7 @@ define Package/isp-split/install
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/range2cidr.awk $(1)/usr/lib/isp-split/range2cidr.awk
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/rules-splice.awk $(1)/usr/lib/isp-split/rules-splice.awk
 	$(INSTALL_DATA) ./files/usr/lib/isp-split/badcidr.awk $(1)/usr/lib/isp-split/badcidr.awk
+	$(INSTALL_DATA) ./files/usr/lib/isp-split/ispdiff.awk $(1)/usr/lib/isp-split/ispdiff.awk
 	$(INSTALL_CONF) ./files/etc/isp-split.conf $(1)/etc/isp-split.conf
 endef
 
