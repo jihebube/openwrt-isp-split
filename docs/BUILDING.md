@@ -58,7 +58,7 @@ OWRT_WORK=/tmp/sdkbuild sh scripts/build-apk.sh
 `.github/workflows/release.yml` 已配置：push tag 后自动用 25.12.6 与 24.10.4 两个 SDK 分别编译（调用同一个 `scripts/build-apk.sh`），连同源码包一起发布到 Release。
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git tag v0.2.1 && git push origin v0.2.1
 ```
 
 ---

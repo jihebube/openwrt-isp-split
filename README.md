@@ -11,12 +11,12 @@
 
 ## 特性
 
-- **运营商网段自动维护**：每日拉取 10 类运营商 IP 段（约 1.3 万条），互斥化后写入 mwan3 的 nftables 集合，无需手工维护
-- **多数据源骨架（0.2.0 新增）**：主源 + 校验源，逐源独立下载与闸门；校验源只跑日 diff，分歧超阈值（Jaccard < 90%）时**拒绝更新并留档差异段**，校验源连续失效 3 天自动升级为拒绝更新
+- **运营商网段自动维护**：默认拉取并互斥化 4 类主流运营商（电信 / 联通 / 移动 / 教育网），写入 mwan3 的 nftables 集合；`ISP_TABLE` 里另有 6 类可按数据源开启
+- **双源校验（0.2.1 默认开启）**：`gaoyifan/china-operator-ip`（MIT）出数据，`ispip.clang.cn` 只跑日 diff；Jaccard < 90% 时**拒绝更新并留档差异段**，校验源连续失效 3 天升级为拒绝更新，主源失效立即冻结旧数据
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
-- **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮），深浅色与移动端自适应
+- **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
 - **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
 
 ## 环境要求
@@ -124,20 +124,27 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 
 生效方式：策略映射改动执行 `isp-split wire && isp-split apply`；DNS 改动执行 `isp-split dns`；也可在 LuCI 配置页操作。完整字段说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
-多数据源（0.2.0 默认只声明不启用校验，0.2.1 才默认开启）：
+多数据源（0.2.1 默认双源：yfgao 主源 + clang 校验源）：
 
 ```sh
 ISP_SOURCES="
-clang:primary:https://ispip.clang.cn
-yfgao:verify:https://china-operator-ip.yfgao.com
+yfgao:primary:https://china-operator-ip.yfgao.com
+clang:verify:https://ispip.clang.cn
 "
 ISP_SOURCE_FILES="
 yfgao:chinatelecom=chinanet,unicom_cnc=unicom,cmcc=cmcc,cernet=cernet
+clang:chinatelecom=chinatelecom,unicom_cnc=unicom_cnc,cmcc=cmcc,cernet=cernet
 "
-ISP_VERIFY_ENABLE=0   # 改成 1 即启用日 diff；分歧超阈值会拒绝更新（退出码 3）
+ISP_VERIFY_ENABLE=1   # 校验源只跑日 diff；分歧超阈值会拒绝更新（退出码 3）
 ```
 
 `ISP_SOURCES` 留空 = 与 0.1.x 完全一致的单源行为，老配置无需改动。
+升级时已有 `/etc/isp-split.conf` 会被保留：显式声明过 `ISP_SOURCES` 的配置
+（例如生产上的 clang 主源 + `ISP_VERIFY_ENABLE=0`）不会被自动切换。
+
+yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
+`chinabtn/gwbn/othernet/hk/mo/tw` 默认关闭，原因见
+[docs/CONFIGURATION.md 的「多数据源」一节](docs/CONFIGURATION.md#多数据源v021-默认双源)。
 
 ## 文档
 
@@ -152,7 +159,7 @@ ISP_VERIFY_ENABLE=0   # 改成 1 即启用日 diff；分歧超阈值会拒绝更
 
 | 能力 | iKuai（商业） | 本项目 |
 |---|---|---|
-| 运营商网段分流 | ✅ | ✅ 10 类运营商约 1.3 万网段，每日自动更新 |
+| 运营商网段分流 | ✅ | ✅ 默认 4 类主流运营商（可扩到 10 类），每日自动更新 |
 | 多线路 DNS | ✅ | ✅ bind / mark 双模式，兼容代理接管 DNS |
 | 域名 / 设备钉线 | ✅ | ✅ `DOMAIN_SPLIT` + mwan3 源地址规则 |
 | 灰度 / 预演 / 回滚 | 部分 | ✅ 三级预检 + stage 灰度 + 一键还原 |
@@ -169,18 +176,22 @@ ISP_VERIFY_ENABLE=0   # 改成 1 即启用日 diff；分歧超阈值会拒绝更
 1. **与 OpenClash fake-ip 模式不兼容**：fake-ip 给域名返回假 IP（198.18.0.0/15），本工具按真实目标 IP 匹配运营商集合，fake-ip 下分流与多线路 DNS 均不生效（启动检测会告警）。请使用 redir-host 模式（新版 OpenClash 默认）。
 2. 只处理直连流量；代理流量的出口由代理自身决定
 3. CDN 调度依赖 DNS 解析路径，国内域名应走本地 dnsmasq 而非代理远程解析
-4. 数据来自 APNIC/WHOIS 派生，个别骨干段归类有误差
+4. 数据来自 BGP/AS_PATH（yfgao）与 IPNetDB/WHOIS（clang）等公开记录，个别骨干段归类有误差
 5. 稳态性能开销接近零；每日一次全量加载约 800 ms、典型 4 个启用集合约 2300 个元素（x86_64 实测示例，实际随数据源与启用项变化）
 6. `wire` 仍以文本级拼接写入 `/etc/config/mwan3`，但已有三重防护：锚点缺失直接报错（不会追加到链尾）、新文件先放临时目录用 UCI 解析校验、校验通过后原子覆盖并保留备份。在 LuCI 保存过 mwan3 后仍需重跑 `isp-split wire && isp-split apply`
 7. 更新源的 IP 可能落在某个集合里，该线路故障时 `fetch` 会失败
 8. 启用 `othernet` 集合会把公共 DNS 一并分走，该线路故障时导致解析失败（默认关闭）
 9. mwan3 原生的「域名 -> nftset」需要 dnsmasq-full（`no-nftset` 的基础镜像不支持）；本工具的多线路 DNS 不受此限制
 10. 兜底流量由 mwan3 的 `default_rule_v4` 决定：**缺省即启用**（mwan3 对 rule 的 `enabled` 缺省=启用）；只有显式禁用或删除该规则时，兜底流量才走系统默认路由（`status` 会提示）
+11. 默认主源 yfgao 只提供 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 中的
+    `chinabtn/gwbn/othernet/hk/mo/tw` 默认关闭。要启用这些分类，需要换用提供对应文件的
+    主源（例如把 clang 配成 primary），否则 `fetch` 会明确报缺文件
 
 ## 路线图
 
-- [ ] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），并默认开启 `ISP_VERIFY_ENABLE=1`
-      （0.2.0 只建骨架：主源仍是 clang，校验源默认不启用）
+- [x] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），默认 `ISP_VERIFY_ENABLE=1`，
+      校验源换 clang；`sources.tsv` 残留清理、LuCI 只读数据源区块
+      （代码已完成，等生产 3 天 diff 数据与验收后发版）
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）
@@ -188,9 +199,18 @@ ISP_VERIFY_ENABLE=0   # 改成 1 即启用日 diff；分歧超阈值会拒绝更
 ## 反馈与适配
 
 - 平台兼容问题（ARM/MIPS、非 Kwrt 固件）请开 issue 并附：`sh tools/router-preflight.sh` 输出、`nft --version`、内存大小
-- 数据源（ispip.clang.cn）归属误差请到其项目反馈，本仓库只负责分流逻辑
+- 数据源归属误差请到对应项目反馈（主源 [gaoyifan/china-operator-ip](https://github.com/gaoyifan/china-operator-ip)、
+  校验源 [ispip.clang.cn](https://ispip.clang.cn)），本仓库只负责分流逻辑
 - 欢迎提交 PR；shell 请保持 busybox ash 兼容（禁止 bash 专属语法），改动请跑 `sh tools/selftest.sh`
 
 ## 许可
 
-[MIT](LICENSE)。运营商数据来自 [ispip.clang.cn](https://ispip.clang.cn)（数据源自 APNIC 等公开记录），使用时请保留来源说明。mwan3-nft 基于 [dl12345/mwan3](https://github.com/dl12345/mwan3)。
+本仓库代码 [MIT](LICENSE)。数据来源的许可红线：
+
+| 源 | 许可 | 分发 |
+|---|---|---|
+| [gaoyifan/china-operator-ip](https://github.com/gaoyifan/china-operator-ip)（默认主源） | **MIT** | ✅ 可随固件/ipk 分发 |
+| [ispip.clang.cn](https://ispip.clang.cn)（默认校验源） | **无许可证**，仅免责声明 | ❌ 只做运行时下载，仓库与包内**不含**任何 clang 数据 |
+
+安装包与仓库只带配置模板，所有运营商数据都由设备运行时下载；不要把自己抓下来的
+`/etc/isp-split/data/*.txt` 打包分发。mwan3-nft 基于 [dl12345/mwan3](https://github.com/dl12345/mwan3)。
