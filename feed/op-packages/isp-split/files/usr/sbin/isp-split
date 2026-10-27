@@ -15,7 +15,7 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.2.0"
+ISP_VERSION="0.2.1"
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
@@ -51,13 +51,13 @@ ISP_TABLE=$(printf '%s' "${ISP_TABLE:-}" | tr -d '\r')
 DNS_TABLE=$(printf '%s' "${DNS_TABLE:-}" | tr -d '\r')
 DOMAIN_SPLIT=$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')
 
-# ---- 多数据源（0.2.0）----
+# ---- 多数据源（0.2.1 默认双源）----
 # ISP_SOURCES 为空 = 单源兼容模式：仍按 ISP_MIRROR/<源名>.txt 拉取，
 # 与 0.1.x 的行为逐字节一致（老配置升级后不需要改任何东西）。
 ISP_SOURCES=$(printf '%s' "${ISP_SOURCES:-}" | tr -d '\r')
 ISP_SOURCE_FILES=$(printf '%s' "${ISP_SOURCE_FILES:-}" | tr -d '\r')
-# 0.2.0 只建骨架：默认声明了校验源但不启用，拉取/校验都不跑。
-ISP_VERIFY_ENABLE=${ISP_VERIFY_ENABLE:-0}
+# 0.2.1 起默认启用校验源；用户配置里显式写了 ISP_VERIFY_ENABLE=0 时仍以用户值为准。
+ISP_VERIFY_ENABLE=${ISP_VERIFY_ENABLE:-1}
 ISP_DIFF_MAX_JACCARD_DROP=${ISP_DIFF_MAX_JACCARD_DROP:-90}
 ISP_DIFF_MAX_DELTA_PCT=${ISP_DIFF_MAX_DELTA_PCT:-3}
 ISP_SOURCE_MAX_FAIL_DAYS=${ISP_SOURCE_MAX_FAIL_DAYS:-3}
@@ -225,11 +225,11 @@ fetch_one() {
 	fi
 }
 
-# ---------------------------------------------------------------- 多数据源（0.2.0）
+# ---------------------------------------------------------------- 多数据源（0.2.1）
 #
-# 0.2.0 只建骨架：主源仍是 ispip.clang.cn（ISP_SOURCES 的第一条 primary），
-# 校验源默认只声明不启用（ISP_VERIFY_ENABLE=0）。ISP_SOURCES 为空时完全
-# 退回 0.1.x 的单源行为（ISP_MIRROR/<源名>.txt）。
+# 0.2.1 默认双源：yfgao 主源 + clang 校验源（模板见 files/etc/isp-split.conf）。
+# 老配置里显式声明的 ISP_SOURCES 完全按用户声明执行，不会被覆盖。
+# ISP_SOURCES 为空时完全退回 0.1.x 的单源行为（ISP_MIRROR/<源名>.txt）。
 
 # 源声明规范化：每行一条 <名字>:<角色>:<基址>
 _source_rows() {
@@ -351,6 +351,13 @@ _source_file_of() {
 	printf '%s' "$_sf"
 }
 
+# 该源是否声明过任意一条文件名映射。
+# 声明过 = 默认只处理映射里列出的运营商；主源上"已启用但未映射"的运营商
+# 仍会退回 <源名>.txt 兼容路径（见 _fetch_source）。完全没声明 = 老配置。
+_source_has_map() {
+	_source_map_lines | grep -q "^$1:"
+}
+
 # ---- 源健康状态：$BASE/state/sources.tsv ----
 # 列：name  role  last_ok  fail_days  jaccard  note
 _state_get() {
@@ -394,6 +401,52 @@ _state_put() {
 	return 0
 }
 
+# 清理 state/sources.tsv 里已经不在 ISP_SOURCES 中的残留行。
+#
+# 典型场景：0.1.x 单源时代留下 `ispip primary`，用户后来改成双源，
+# 旧行会一直躺在文件里（status/health 虽然只遍历声明过的源，但数据本身是脏的，
+# 排查时也很容易被误读）。这里在 fetch/status/health 入口做一次幂等清理：
+#   · 只保留当前 ISP_SOURCES（空则为兼容模式的 ispip）声明过的源；
+#   · 顺带丢掉字段数不足 6 的坏行；
+#   · 没有任何变化时不动文件（status 每 10 秒轮询，不必反复写 flash）。
+_state_prune() {
+	[ -f "$SOURCE_STATE" ] || return 0
+	_sp_decl=" "
+	for _sp_row in $(_source_rows); do
+		_sp_name=${_sp_row%%:*}
+		[ -n "$_sp_name" ] && _sp_decl="$_sp_decl$_sp_name "
+	done
+	[ "$_sp_decl" != "  " ] || return 0
+
+	mkdir -p "$STATE_DIR" || return 1
+	_sp_tmp=$(mktemp "$STATE_DIR/.sources.prune.XXXXXX" 2>/dev/null) || return 1
+	_sp_rem=$(mktemp "$STATE_DIR/.sources.removed.XXXXXX" 2>/dev/null) ||
+		{ rm -f "$_sp_tmp"; return 1; }
+	awk -F "$(printf '\t')" -v keep="$_sp_decl" -v rem="$_sp_rem" '
+		NF >= 6 {
+			if (index(keep, " " $1 " ") > 0) print
+			else print $1 > rem
+		}' "$SOURCE_STATE" > "$_sp_tmp" || {
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 1
+	}
+
+	if cmp -s "$_sp_tmp" "$SOURCE_STATE"; then
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 0
+	fi
+
+	_sp_removed=$(tr '\n' ' ' < "$_sp_rem" 2>/dev/null)
+	mv -f "$_sp_tmp" "$SOURCE_STATE" 2>/dev/null || {
+		rm -f "$_sp_tmp" "$_sp_rem"
+		return 1
+	}
+	rm -f "$_sp_rem"
+	[ -n "${_sp_removed:-}" ] &&
+		log "已清理 state/sources.tsv 中不在 ISP_SOURCES 的残留源: ${_sp_removed% }" >&2
+	return 0
+}
+
 _ts_text() {
 	case "${1:-}" in
 	"" | 0 | *[!0-9]*) printf '%s' "-"; return 0 ;;
@@ -419,10 +472,24 @@ _fetch_source() {
 		_fs_src=${_fs_row%%:*}
 		_fs_file=$(_source_file_of "$_fs_name" "$_fs_src")
 		if [ -z "$_fs_file" ]; then
-			# 主源没写映射时沿用 0.1.x 的命名 <源名>.txt（老配置零改动）；
-			# 校验源只在显式映射里出现——绝不去猜别人的文件名。
-			[ "$_fs_role" = "primary" ] || continue
-			_fs_file="$_fs_src.txt"
+			# 该源声明过映射时，映射里没列出的运营商默认不下载：
+			# yfgao 没有 hk/mo/tw 这些分类，按 <源名>.txt 去猜只会每天 404。
+			# 但为了不破坏 0.2.0 老配置（clang 主源 + 用户自己启用 hk 等），
+			# 主源上"已启用但未映射"的运营商仍退回历史命名试一次；
+			# 文件不存在时由下载失败明确报错，而不是静默少一个集合。
+			if _source_has_map "$_fs_name"; then
+				case "$_fs_row" in
+				*:1) ;;
+				*) continue ;;
+				esac
+				[ "$_fs_role" = "primary" ] || continue
+				_fs_file="$_fs_src.txt"
+			else
+				# 完全没声明映射的老配置，沿用 0.1.x 的命名 <源名>.txt；
+				# 校验源只在显式映射里出现——绝不去猜别人的文件名。
+				[ "$_fs_role" = "primary" ] || continue
+				_fs_file="$_fs_src.txt"
+			fi
 		fi
 		case "$_fs_file" in
 		"" | *[!A-Za-z0-9._-]*)
@@ -469,7 +536,16 @@ _compose_raw() {
 		_row_check_row "$_cm_row"
 		_cm_isp=${_cm_row%%:*}
 		_cm_file=$(_source_file_of "$_cm_name" "$_cm_isp")
-		[ -n "$_cm_file" ] || _cm_file="$_cm_isp.txt"
+		if [ -z "$_cm_file" ]; then
+			if _source_has_map "$_cm_name"; then
+				case "$_cm_row" in
+				*:1) _cm_file="$_cm_isp.txt" ;;
+				*) continue ;;
+				esac
+			else
+				_cm_file="$_cm_isp.txt"
+			fi
+		fi
 		[ -f "$_cm_src/$_cm_file" ] || {
 			log "合成: 缺少 $_cm_isp 的源文件（$_cm_file）"
 			return 1
@@ -533,6 +609,7 @@ _run_diff() {
 	_rd_bad=""
 	DIFF_MIN_JACCARD=""
 	DIFF_REJECTED=""
+	DIFF_ROWS=0
 
 	mkdir -p "$WORK" || return 1
 	_rd_tmp=$WORK/.diff.$$
@@ -548,7 +625,16 @@ _run_diff() {
 		_row_check_row "$_rd_row"
 		_rd_isp=${_rd_row%%:*}
 		_rd_pf=$(_source_file_of "$_rd_pname" "$_rd_isp")
-		[ -n "$_rd_pf" ] || _rd_pf="$_rd_isp.txt"
+		if [ -z "$_rd_pf" ]; then
+			if _source_has_map "$_rd_pname"; then
+				case "$_rd_row" in
+				*:1) _rd_pf="$_rd_isp.txt" ;;
+				*) continue ;;
+				esac
+			else
+				_rd_pf="$_rd_isp.txt"
+			fi
+		fi
 		_rd_vf=$(_source_file_of "$_rd_vname" "$_rd_isp")
 		[ -n "$_rd_vf" ] || continue
 		[ -f "$_rd_pdir/$_rd_pf" ] && [ -f "$_rd_vdir/$_rd_vf" ] || continue
@@ -595,6 +681,7 @@ _run_diff() {
 	[ -n "$_rd_min" ] || _rd_min=""
 	DIFF_MIN_JACCARD=$_rd_min
 	DIFF_REJECTED=$_rd_bad
+	DIFF_ROWS=$_rd_rows
 	return $_rd_rc
 }
 
@@ -611,7 +698,16 @@ _delta_check() { # <源名> <新目录>
 		_row_check_row "$_dc_row"
 		_dc_isp=${_dc_row%%:*}
 		_dc_f=$(_source_file_of "$_dc_name" "$_dc_isp")
-		[ -n "$_dc_f" ] || _dc_f="$_dc_isp.txt"
+		if [ -z "$_dc_f" ]; then
+			if _source_has_map "$_dc_name"; then
+				case "$_dc_row" in
+				*:1) _dc_f="$_dc_isp.txt" ;;
+				*) continue ;;
+				esac
+			else
+				_dc_f="$_dc_isp.txt"
+			fi
+		fi
 		[ -f "$_dc_new/$_dc_f" ] && [ -f "$RAW_ARCHIVE/$_dc_name/$_dc_f" ] || continue
 		_dc_old_n=$(awk -f "$LIB/cidr2range.awk" "$RAW_ARCHIVE/$_dc_name/$_dc_f" |
 			awk '{ t += $2 - $1 + 1 } END { printf "%.0f", t }')
@@ -636,6 +732,7 @@ _delta_check() { # <源名> <新目录>
 # 源健康度区块（status / plan 共用）
 _sources_report() {
 	_source_check_all
+	_state_prune
 	echo "数据源健康度:"
 	printf '  %-8s %-8s %-16s %6s %9s  %s\n' "源" "角色" "最后成功" "失败" "Jaccard" "状态"
 	for _sr_row in $(_source_rows); do
@@ -645,8 +742,13 @@ _sources_report() {
 		_sr_jac=$(_state_get "$_s_name" jaccard)
 		[ -n "${_sr_fail:-}" ] || _sr_fail=0
 		_sr_state="正常"
-		if [ "$_s_role" != "primary" ] && [ "$ISP_VERIFY_ENABLE" != "1" ]; then
+		if [ "$_s_role" = "primary" ]; then
+			[ "${_sr_fail:-0}" -gt 0 ] &&
+				_sr_state="主源失败（已冻结，连续 $_sr_fail 天）"
+		elif [ "$ISP_VERIFY_ENABLE" != "1" ]; then
 			_sr_state="未启用校验（ISP_VERIFY_ENABLE=0）"
+		elif [ "${_sr_fail:-0}" -ge "${ISP_SOURCE_MAX_FAIL_DAYS:-3}" ]; then
+			_sr_state="拒绝更新（连续失败 $_sr_fail/$ISP_SOURCE_MAX_FAIL_DAYS 天）"
 		elif [ "${_sr_fail:-0}" -gt 0 ]; then
 			_sr_state="降级（连续失败 $_sr_fail/$ISP_SOURCE_MAX_FAIL_DAYS 天）"
 		fi
@@ -767,6 +869,12 @@ cmd_fetch() {
 
 	# 源声明先校验，再联网：非法 URL/角色不该等到下载一半才发现。
 	_source_check_all
+	_state_prune
+	case "${ISP_SOURCE_MAX_FAIL_DAYS:-}" in
+	"" | 0 | *[!0-9]*)
+		die "ISP_SOURCE_MAX_FAIL_DAYS 必须是正整数（当前: '${ISP_SOURCE_MAX_FAIL_DAYS:-}'）"
+		;;
+	esac
 
 	_primary=$(_primary_source_name)
 	_primary_base=$(_source_base_of "$_primary")
@@ -785,6 +893,10 @@ cmd_fetch() {
 		_state_fail_plus "$_primary" primary "主源下载失败" >/dev/null
 		die "主源 $_primary 下载失败，保留现有数据不动（冻结，cron 会在下次再试）"
 	fi
+	# 主源下载成功就先记一笔：后面的 diff/熔断即使拒绝更新，也不该让
+	# status 把主源显示成"从未成功"。
+	_state_put "$_primary" primary "$(date +%s)" 0 \
+		"$(_state_get "$_primary" jaccard)" "主源下载正常（待校验）"
 
 	# ---- 2) 校验源/审计源：默认不启用 ----
 	_verify_ok=""
@@ -796,7 +908,7 @@ cmd_fetch() {
 		*) continue ;;
 		esac
 		if [ "$ISP_VERIFY_ENABLE" != "1" ]; then
-			log "跳过校验源 $_s_name（ISP_VERIFY_ENABLE=0，0.2.0 默认不启用）"
+			log "跳过校验源 $_s_name（配置里显式 ISP_VERIFY_ENABLE=0）"
 			continue
 		fi
 
@@ -804,7 +916,7 @@ cmd_fetch() {
 		if _fetch_source "$_s_name" "$_s_base" "$WORK/raw.new/$_s_name" "$_s_role"; then
 			_verify_ok="$_verify_ok $_s_name"
 			_state_put "$_s_name" "$_s_role" "$(date +%s)" 0 \
-				"$(_state_get "$_s_name" jaccard)" "校验源正常"
+				"$(_state_get "$_s_name" jaccard)" "校验源下载正常（待 diff）"
 		else
 			# 设计 §2.5 的分级降级：校验源挂了继续用主源，但连续失败
 			# 达到 ISP_SOURCE_MAX_FAIL_DAYS 天就升级为"拒绝更新"，防止
@@ -821,8 +933,8 @@ cmd_fetch() {
 	done
 
 	# ---- 3) 闸门：日变化 + 与校验源的差异（都在写任何东西之前）----
-	# 日变化闸门只跟"校验源已启用且拉到了"一起生效：0.2.0 默认不开启校验，
-	# 老配置升级后行为必须与 0.1.x 完全一致，不能凭空多出一道会拒更新的闸门。
+	# 日变化闸门只跟"校验源已启用且拉到了"一起生效：单源兼容模式
+	# （ISP_SOURCES 为空）不能凭空多出一道会拒更新的闸门，0.1.x 行为保持不变。
 	if [ -n "$_verify_ok" ] && [ "$_force" != "1" ]; then
 		if ! _delta_check "$_primary" "$WORK/raw.new/$_primary"; then
 			echo "已拒绝本次更新（现有数据未改动）。确认数据无误可设 ISP_SPLIT_FORCE_FETCH=1 再试。"
@@ -832,32 +944,55 @@ cmd_fetch() {
 
 	_diff_min_all=""
 	for _vname in $_verify_ok; do
-		if _run_diff "$WORK/raw.new/$_primary" "$WORK/raw.new/$_vname" \
-			"$_primary" "$_vname" reject; then
-			:
-		elif [ "$_force" = "1" ]; then
-			echo
-			log "警告: 与校验源 $_vname 的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（${DIFF_REJECTED}），已按 ISP_SPLIT_FORCE_FETCH=1 放行"
-		else
-			echo
-			echo "已拒绝本次更新：与校验源的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（$_vname:${DIFF_REJECTED}）。"
-			echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
-			echo "人工确认数据无误后，可用 ISP_SPLIT_FORCE_FETCH=1 isp-split fetch 放行。"
-			exit 3
-		fi
-		# 每个校验源记自己的 Jaccard（多校验源时不能互相覆盖）
-		if [ -n "${DIFF_MIN_JACCARD:-}" ]; then
+		_rd_ok=1
+		_run_diff "$WORK/raw.new/$_primary" "$WORK/raw.new/$_vname" \
+			"$_primary" "$_vname" reject || _rd_ok=0
+
+		# 先把本次结果写进源健康度，再决定是否拒绝：
+		# 被拒绝的那次也要能在 status 里看到"最近 Jaccard 掉到多少"。
+		if [ "${DIFF_ROWS:-0}" -eq 0 ]; then
 			_state_put "$_vname" "$(_source_role_of "$_vname")" "$(date +%s)" 0 \
-				"$DIFF_MIN_JACCARD" "校验源正常"
+				"$(_state_get "$_vname" jaccard)" "无可比对运营商（检查映射）"
+		elif [ -n "${DIFF_MIN_JACCARD:-}" ]; then
+			if [ "$_rd_ok" = "1" ]; then
+				_jnote="校验源正常"
+			else
+				_jnote="分歧超阈值（ ${DIFF_REJECTED# }）"
+			fi
+			_state_put "$_vname" "$(_source_role_of "$_vname")" "$(date +%s)" 0 \
+				"$DIFF_MIN_JACCARD" "$_jnote"
 			if awk -v a="$_diff_min_all" -v b="$DIFF_MIN_JACCARD" \
 				'BEGIN { exit !(a == "" || b + 0 < a + 0) }'; then
 				_diff_min_all=$DIFF_MIN_JACCARD
 			fi
 		fi
+
+		if [ "${DIFF_ROWS:-0}" -eq 0 ]; then
+			if [ "$_force" = "1" ]; then
+				echo
+				log "警告: 校验源 $_vname 没有可比对的运营商，已按 ISP_SPLIT_FORCE_FETCH=1 放行"
+			else
+				echo
+				echo "已拒绝本次更新：校验源 $_vname 没有可比对的运营商（检查 ISP_SOURCE_FILES 的文件名映射）。"
+				echo "没有可比对项时无法证明主源没有漂移。确认可接受无校验更新，可设 ISP_SPLIT_FORCE_FETCH=1 再试。"
+				exit 3
+			fi
+		elif [ "$_rd_ok" = "0" ]; then
+			if [ "$_force" = "1" ]; then
+				echo
+				log "警告: 与校验源 $_vname 的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（${DIFF_REJECTED}），已按 ISP_SPLIT_FORCE_FETCH=1 放行"
+			else
+				echo
+				echo "已拒绝本次更新：与校验源的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（$_vname:${DIFF_REJECTED}）。"
+				echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
+				echo "人工确认数据无误后，可用 ISP_SPLIT_FORCE_FETCH=1 isp-split fetch 放行。"
+				exit 3
+			fi
+		fi
 	done
 	DIFF_MIN_JACCARD=$_diff_min_all
 
-	# ---- 4) 合成（0.2.0：只有 primary 参与合成）----
+	# ---- 4) 合成（只有 primary 参与合成；校验源只跑 diff）----
 	log "构建集合（互斥化）"
 	_compose_raw "$_primary" "$WORK/raw.new/$_primary" "$WORK/compose.new" ||
 		die "按 ISP_SOURCE_FILES 合成失败，保留现有数据不动"
@@ -1010,6 +1145,7 @@ cmd_diff() {
 	*) die "用法: isp-split diff [--no-save]" ;;
 	esac
 	_source_check_all
+	_state_prune
 	_p=$(_primary_source_name)
 	[ -d "$RAW_ARCHIVE/$_p" ] ||
 		die "还没有主源存档（$RAW_ARCHIVE/$_p）。先运行 isp-split fetch 拉一份数据"
@@ -1778,6 +1914,7 @@ cmd_status_json() {
 # 与 status --json（nft 统计）分开放，是为了让后者的数组形状保持不变。
 cmd_health_json() {
 	_source_check_all
+	_state_prune
 	printf '{"sources":['
 	_sfj=1
 	for _row in $(_source_rows); do

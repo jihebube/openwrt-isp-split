@@ -529,6 +529,9 @@ return view.extend({
 			if (s.status === 'disabled') {
 				tag = 'isp-tag';
 				text = _('未启用校验');
+			} else if (s.max_fail && s.fail_days >= s.max_fail) {
+				tag = 'isp-tag is-bad';
+				text = _('拒绝更新') + ' ' + s.fail_days + '/' + s.max_fail;
 			} else if (s.fail_days > 0) {
 				tag = 'isp-tag is-warn';
 				text = _('降级') + ' ' + s.fail_days + '/' + s.max_fail;
