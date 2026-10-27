@@ -14,7 +14,7 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.1.5"
+ISP_VERSION="0.1.5a"
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
@@ -80,6 +80,37 @@ need_nft() {
 	command -v nft >/dev/null 2>&1 || die "未找到 nft 命令"
 	nft list table inet mwan3 >/dev/null 2>&1 ||
 		die "table inet mwan3 不存在，请确认 mwan3-nft 已启动"
+}
+
+# ---- OpenClash fake-ip 模式检测（BUG-17）----
+# fake-ip 模式给域名返回 198.18.0.0/15 的假地址，而本工具是按"目标 IP
+# 归属运营商"匹配集合的：假 IP 不在任何运营商网段里，规则永远不会命中，
+# 所有流量都落到兜底；同时 fake-ip 的 DNS 劫持会盖掉本工具写的分线 DNS
+# 片段。结果是"装好了但静默不生效"，用户只能看到兜底计数一直涨。
+# 因此 plan/verify/status 以及 wire/apply/sync 启动时都主动告警。
+# 只告警、不阻断：用户可能就是要先装好，再切 redir-host 模式。
+_openclash_fakeip() {
+	command -v uci >/dev/null 2>&1 || return 1
+	_ocf_en=$(uci -q get openclash.config.enable 2>/dev/null) || return 1
+	[ "$_ocf_en" = "1" ] || return 1
+	_ocf_mode=$(uci -q get openclash.config.en_mode 2>/dev/null) || return 1
+	# 兼容 fake-ip / fakeip / fake_ip / Fake-IP 等写法
+	_ocf_norm=$(printf '%s' "$_ocf_mode" | tr 'A-Z' 'a-z' | tr -d ' _-')
+	case "$_ocf_norm" in
+	fakeip*) return 0 ;;
+	esac
+	return 1
+}
+
+_openclash_fakeip_warn() {
+	_openclash_fakeip || return 0
+	# sync 会依次调用 wire/apply，同一次执行只提示一次，避免刷屏
+	[ "${_OCF_WARNED:-0}" = "1" ] && return 0
+	_OCF_WARNED=1
+	echo "[isp-split] ⚠ 检测到 OpenClash fake-ip 模式：假 IP 无法匹配运营商集合，"
+	echo "            IP 分流与多线路 DNS 均不会生效。处理：OpenClash 切 redir-host 模式"
+	echo "            （LuCI → OpenClash → 模式设置），或接受分流不生效。"
+	return 0
 }
 
 # work 目录（临时批处理/备份文件的家）是否真的可写。
@@ -463,6 +494,7 @@ _fallback_counter() {
 }
 
 cmd_apply() {
+	_openclash_fakeip_warn
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
 
@@ -625,6 +657,7 @@ _write_rule() {
 }
 
 cmd_wire() {
+	_openclash_fakeip_warn
 	need_nft
 	# 先确认 work 目录可写再动 UCI：否则可能 commit 了 ipset 段之后才发现
 	# 写不了规则片段，留下半套配置。
@@ -695,6 +728,7 @@ cmd_refresh() {
 }
 
 cmd_sync() {
+	_openclash_fakeip_warn
 	cmd_fetch
 	cmd_wire
 	cmd_apply
@@ -725,6 +759,7 @@ cmd_enable() {
 }
 
 cmd_verify() {
+	_openclash_fakeip_warn
 	need_nft
 	echo "== mwan3_rules 链中的规则顺序（自上而下，命中即停）"
 	_body=$(_mwan3_rules_body)
@@ -787,6 +822,7 @@ cmd_verify() {
 
 # 只读预演：不写任何文件、不发任何 uci/nft 改动。
 cmd_plan() {
+	_openclash_fakeip_warn
 	echo "== openwrt-isp-split 预演（不做任何改动）"
 	echo
 	printf '%-14s %-14s %-12s %8s %10s\n' "集合" "来源" "策略" "条目" "状态"
@@ -1014,11 +1050,15 @@ cmd_status_json() {
 }
 
 cmd_status() {
-	need_nft
 	if [ "${1:-}" = "--json" ]; then
+		need_nft
+		# stdout 必须是纯 JSON（LuCI 直接解析），告警只走 stderr
+		_openclash_fakeip_warn >&2
 		cmd_status_json
 		return 0
 	fi
+	_openclash_fakeip_warn
+	need_nft
 	printf '%-14s %-10s %10s %12s %10s  %s\n' "集合" "来源" "条目" "命中包" "流量" "策略"
 	_st_all() { _status_one "$1" "$2" "$3"; }
 	foreach_enabled _st_all

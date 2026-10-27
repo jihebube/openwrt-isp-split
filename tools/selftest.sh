@@ -1103,6 +1103,133 @@ else
 	ok "相对路径 ISP_SPLIT_BASE 被拒绝（SEC-9）"
 fi
 
+echo "== 11. OpenClash fake-ip 启动告警（BUG-17）"
+# fake-ip 下假 IP（198.18.0.0/15）不在任何运营商集合里，规则静默不命中。
+# 用例只检查「是否告警」，不依赖真实 nft/uci。
+mkdir -p "$TMP/bug17/fakebin" "$TMP/bug17/base"
+cat > "$TMP/bug17/fakebin/uci" <<'FAKE_UCI17'
+#!/bin/sh
+case "$*" in
+*"get openclash.config.en_mode"*)
+	printf '%s\n' "${FAKE_OC_MODE:-redir-host}"
+	exit 0
+	;;
+*"get openclash.config.enable"*)
+	printf '%s\n' "${FAKE_OC_ENABLE:-1}"
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI17
+cat > "$TMP/bug17/fakebin/nft" <<'FAKE_NFT17'
+#!/bin/sh
+[ "$1" = "-a" ] && shift
+case "$*" in
+"list table inet mwan3") exit 0 ;;
+*"chain inet mwan3 mwan3_rules"*)
+	printf 'table inet mwan3 {\n\tchain mwan3_rules {\n'
+	printf '\t\tip daddr 10.0.0.0/8 counter jump mwan3_policy_wan_only\n'
+	printf '\t}\n}\n'
+	exit 0
+	;;
+esac
+exit 1
+FAKE_NFT17
+chmod +x "$TMP/bug17/fakebin/uci" "$TMP/bug17/fakebin/nft"
+cat > "$TMP/bug17/conf" <<'BUG17_CONF'
+ISP_TABLE="chinatelecom:isp_tel:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+BUG17_CONF
+
+_bug17_run() {
+	_b17_mode=$1
+	_b17_en=$2
+	shift 2
+	(
+		PATH="$TMP/bug17/fakebin:$PATH"
+		ISP_SPLIT_CONF="$TMP/bug17/conf"
+		ISP_SPLIT_BASE="$TMP/bug17/base"
+		DNSMASQ_CONF_GLOB="$TMP/bug17/no-such-conf.*"
+		DNSMASQ_DEFAULT_DIR="$TMP/bug17/default.d"
+		FAKE_OC_MODE="$_b17_mode"
+		FAKE_OC_ENABLE="$_b17_en"
+		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB \
+			DNSMASQ_DEFAULT_DIR FAKE_OC_MODE FAKE_OC_ENABLE
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		"$@"
+	)
+}
+
+_b17_warn='检测到 OpenClash fake-ip 模式'
+
+# 三个只读命令都必须在首行告警（status 的告警在表头之前）
+_b17_out=$(_bug17_run fake-ip 1 cmd_plan 2>&1)
+if printf '%s\n' "$_b17_out" | head -1 | grep -q "$_b17_warn"; then
+	ok "fake-ip 下 plan 首行告警"
+else
+	ng "fake-ip 下 plan 未告警"
+	printf '%s\n' "$_b17_out" | sed 's/^/    /'
+fi
+
+_b17_out=$(_bug17_run fake-ip 1 cmd_verify 2>&1)
+if printf '%s\n' "$_b17_out" | head -1 | grep -q "$_b17_warn"; then
+	ok "fake-ip 下 verify 首行告警"
+else
+	ng "fake-ip 下 verify 未告警"
+	printf '%s\n' "$_b17_out" | sed 's/^/    /'
+fi
+
+_b17_out=$(_bug17_run fake-ip 1 cmd_status 2>&1)
+if printf '%s\n' "$_b17_out" | head -1 | grep -q "$_b17_warn"; then
+	ok "fake-ip 下 status 首行告警"
+else
+	ng "fake-ip 下 status 未告警"
+	printf '%s\n' "$_b17_out" | sed 's/^/    /'
+fi
+
+# status --json 的 stdout 必须仍是纯 JSON（LuCI 直接解析），告警只能走 stderr
+_b17_json=$(_bug17_run fake-ip 1 cmd_status --json 2>/dev/null)
+_b17_json_err=$(_bug17_run fake-ip 1 cmd_status --json 2>&1 >/dev/null)
+if printf '%s' "$_b17_json" | grep -q '^\[' &&
+	! printf '%s' "$_b17_json" | grep -q "$_b17_warn" &&
+	printf '%s\n' "$_b17_json_err" | grep -q "$_b17_warn"; then
+	ok "status --json 的 stdout 仍为纯 JSON，告警走 stderr"
+else
+	ng "status --json 被告警污染或未告警"
+	printf '    stdout: %s\n    stderr: %s\n' "$_b17_json" "$_b17_json_err"
+fi
+
+# redir-host 是正常模式，三个命令都不该出现告警
+_b17_quiet=1
+for _b17_c in cmd_plan cmd_verify cmd_status; do
+	_b17_out=$(_bug17_run redir-host 1 "$_b17_c" 2>&1)
+	printf '%s\n' "$_b17_out" | grep -q "$_b17_warn" && _b17_quiet=0
+done
+if [ "$_b17_quiet" -eq 1 ]; then
+	ok "redir-host 下 plan/verify/status 均不告警"
+else
+	ng "redir-host 下出现误告警"
+fi
+
+# en_mode 的变体写法（fakeip，无连字符）同样要识别
+_b17_out=$(_bug17_run fakeip 1 cmd_plan 2>&1)
+if printf '%s\n' "$_b17_out" | grep -q "$_b17_warn"; then
+	ok "en_mode=fakeip（无连字符）同样告警"
+else
+	ng "en_mode=fakeip 未被识别"
+fi
+
+# OpenClash 未启用（enable=0）时不告警：模式值残留不代表正在生效
+_b17_out=$(_bug17_run fake-ip 0 cmd_plan 2>&1)
+if ! printf '%s\n' "$_b17_out" | grep -q "$_b17_warn"; then
+	ok "OpenClash enable=0 时不告警"
+else
+	ng "OpenClash 未启用仍告警"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then
