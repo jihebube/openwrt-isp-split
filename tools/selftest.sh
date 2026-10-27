@@ -710,6 +710,154 @@ else
 	printf '%s\n' "$_bug78_out" | sed 's/^/    /'
 fi
 
+
+echo "== 9. conf/rollback/export 的静默失败（BUG-9 ~ BUG-13）"
+mkdir -p "$TMP/bug9"
+cat > "$TMP/bug9/uci" <<'FAKE_UCI9'
+#!/bin/sh
+case "$*" in
+*"show mwan3"*)
+	printf 'mwan3.wan_only=policy\nmwan3.wanb_only=policy\n'
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI9
+chmod +x "$TMP/bug9/uci"
+
+# 在隔离子 shell 里只加载函数定义，然后直接调用 lib 里的函数。
+_bug9_run() {
+	_c=$1
+	shift
+	(
+		PATH="$TMP/bug9:$PATH"
+		ISP_SPLIT_CONF="$_c"
+		export PATH ISP_SPLIT_CONF
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		"$@"
+	)
+}
+
+# BUG-9a：配置里没有这个键时，conf set 必须真的写进去（旧实现静默无操作）
+cat > "$TMP/bug9/no-key.conf" <<'CONF9A'
+DNS_MODE="bind"
+DNS_TABLE=""
+CONF9A
+if _bug9_run "$TMP/bug9/no-key.conf" conf_set isp_table "a:isp_a:wan_only:1" >/dev/null 2>&1 &&
+   grep -q '^ISP_TABLE="a:isp_a:wan_only:1"$' "$TMP/bug9/no-key.conf"; then
+	ok "键不存在时 conf set 会追加写入（不再静默无操作）"
+else
+	ng "键不存在时 conf set 仍未写入"
+fi
+
+# BUG-9b：单引号写法也必须能改，并且回读得到新值
+cat > "$TMP/bug9/squote.conf" <<'CONF9B'
+DNS_MODE='bind'
+DNS_TABLE='wan_only:1.1.1.1'
+ISP_TABLE="a:isp_a:wan_only:1"
+CONF9B
+_bug9_run "$TMP/bug9/squote.conf" conf_set dns_table "wan_only:9.9.9.9" >/dev/null 2>&1
+_bug9_got=$(_bug9_run "$TMP/bug9/squote.conf" _conf_val DNS_TABLE)
+if [ "$_bug9_got" = "wan_only:9.9.9.9" ]; then
+	ok "单引号写法的键也能被 conf set 改写（回读一致）"
+else
+	ng "单引号写法的键改写失败，回读到: '$_bug9_got'"
+fi
+
+# BUG-9c：值里带空行属于正常输入，不能被"回读校验"误判成写入失败
+_bug9_rc=0
+_bug9_run "$TMP/bug9/squote.conf" conf_set isp_table "a:isp_a:wan_only:1
+
+b:isp_b:wanb_only:0" >/dev/null 2>&1 || _bug9_rc=1
+_bug9_rows=$(_bug9_run "$TMP/bug9/squote.conf" conf_get | grep -c '^isp	')
+if [ "$_bug9_rc" -eq 0 ] && [ "$_bug9_rows" -eq 2 ]; then
+	ok "值中夹空行时仍能写入（2 行）"
+else
+	ng "值中夹空行写入失败（rc=$_bug9_rc，读到 $_bug9_rows 行）"
+fi
+
+# BUG-10：空 ISP_TABLE 必须被拒绝，且文件保持原样
+if _bug9_run "$TMP/bug9/no-key.conf" conf_set isp_table "" >/dev/null 2>&1; then
+	ng "空 ISP_TABLE 被接受（会把整张表清空）"
+else
+	ok "空 ISP_TABLE 被拒绝（非 0）"
+fi
+if grep -q '^ISP_TABLE="a:isp_a:wan_only:1"$' "$TMP/bug9/no-key.conf"; then
+	ok "空 ISP_TABLE 被拒后原配置未改动"
+else
+	ng "空 ISP_TABLE 被拒后配置被改动"
+fi
+
+# BUG-11：历史快照为空时 rollback 必须拒绝，且不能动现有数据
+mkdir -p "$TMP/bug11/base/data" "$TMP/bug11/base/.history/20260101-000000"
+printf '1.2.3.0/24\n' > "$TMP/bug11/base/data/isp_a.txt"
+cat > "$TMP/bug11/conf" <<'CONF11'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+CONF11
+if ( PATH="$TMP/bug9:$PATH" ISP_SPLIT_CONF="$TMP/bug11/conf" \
+	ISP_SPLIT_BASE="$TMP/bug11/base" BASE="$TMP/bug11/base" \
+	export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE BASE
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	cmd_rollback ) >/dev/null 2>&1; then
+	ng "空历史快照的 rollback 返回成功（会清空全部集合）"
+else
+	if [ -s "$TMP/bug11/base/data/isp_a.txt" ]; then
+		ok "空历史快照时 rollback 拒绝执行，现有数据未改动"
+	else
+		ng "空历史快照时 rollback 仍删除了现有数据"
+	fi
+fi
+
+# BUG-13：sing-box 导出必须是 source 格式对象，而不是裸 JSON 数组
+mkdir -p "$TMP/bug13/data"
+printf '1.2.3.0/24\n5.6.0.0/16\n' > "$TMP/bug13/data/a.txt"
+cat > "$TMP/bug13/conf" <<'CONF13'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+CONF13
+_bug13_run() {
+	(
+		PATH="$TMP/bug9:$PATH"
+		ISP_SPLIT_CONF="$TMP/bug13/conf"
+		ISP_SPLIT_BASE="$TMP/bug13"
+		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		"$@"
+	)
+}
+if _bug13_run cmd_export singbox "$TMP/bug13/out" >/dev/null 2>&1 &&
+   grep -q '"version": 1' "$TMP/bug13/out/isp-a.json" 2>/dev/null &&
+   grep -q '"ip_cidr"' "$TMP/bug13/out/isp-a.json" 2>/dev/null &&
+   ! head -1 "$TMP/bug13/out/isp-a.json" | grep -qx '\['; then
+	ok "sing-box 导出为 source 格式对象（{\"version\":1,\"rules\":[{\"ip_cidr\":[...]}]}）"
+else
+	ng "sing-box 导出格式仍不是 sing-box 可解析的 source 格式"
+fi
+
+# BUG-13b：未知格式要在建目录之前就失败（不留下空目录）
+if _bug13_run cmd_export bogus "$TMP/bug13/bogus-dir" >/dev/null 2>&1; then
+	ng "未知导出格式返回成功"
+elif [ -d "$TMP/bug13/bogus-dir" ]; then
+	ng "未知导出格式仍创建了输出目录"
+else
+	ok "未知导出格式直接失败且不创建目录"
+fi
+
+# BUG-14：CRLF 保存的配置不能把运营商行静默丢掉
+printf 'ISP_TABLE="\r\nchinatelecom:isp_tel:wan_only:1\r\nunicom_cnc:isp_uni:wanb_only:1\r\n"\r\nDNS_MODE="bind"\r\nDNS_TABLE=""\r\n' \
+	> "$TMP/bug9/crlf.conf"
+_bug9_n=$(_bug9_run "$TMP/bug9/crlf.conf" conf_get | grep -c '^isp	')
+if [ "$_bug9_n" -eq 2 ]; then
+	ok "CRLF 配置被正确规范化（2 行运营商均可读）"
+else
+	ng "CRLF 配置解析异常: 读到 $_bug9_n 行（期望 2）"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 [ "$fail" -eq 0 ]
