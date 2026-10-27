@@ -18,6 +18,14 @@ fail=0
 ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass + 1)); }
 ng() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
 
+# 非 root 环境提示：SEC-3 起 dnsmasq conf-dir 要求属主为 root（_dns_dir_ok
+# 校验 uid=0），所以 BUG-6 的「conf-dir 探测」与「卸载清理」2 项在非 root
+# 机器上必然失败。这是安全加固的正确行为，不是回归；这 2 项由 root VM 覆盖。
+if [ "$(id -u)" -ne 0 ]; then
+	echo "提示：当前为非 root 环境，2 项依赖 uid=0 的 conf-dir 用例（BUG-6）预计失败；"
+	echo "      属安全加固的正确行为，已由 root 环境（VM）覆盖。其余用例结果不受影响。"
+fi
+
 echo "== 1. 数据管线"
 sh "$LIB/build.sh" "$FIX/raw" "$TMP/out" "isp_a isp_b isp_c isp_d" 2>/dev/null
 
@@ -985,7 +993,7 @@ printf 'ISP_TABLE="a:isp_a:wan_only:1"\nDNS_TABLE=""\nDOMAIN_SPLIT=""\nDNS_MODE=
 awk 'BEGIN { for (i = 0; i < 5000; i++) printf "%01024d\n", i }' > "$TMP/sec/mirror/a.txt"
 if SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
 	ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base4" \
-	ISP_MIRROR="https://mirror.test" \
+	ISP_MIRROR="https://mirror.test" ISP_SPLIT_LIB="$LIB" \
 	sh "$ROOT/files/usr/sbin/isp-split" fetch >/dev/null 2>&1; then
 	ng "超大源文件仍被接受（SEC-4）"
 else
@@ -998,7 +1006,7 @@ printf '1.0.0.0/8\n2.0.0.0/8\n3.0.0.0/8\n4.0.0.0/8\n5.0.0.0/8\n6.0.0.0/8\n' \
 _sec_fetch() {
 	SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
 		ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base5" \
-		ISP_MIRROR="https://mirror.test" \
+		ISP_MIRROR="https://mirror.test" ISP_SPLIT_LIB="$LIB" \
 		sh "$ROOT/files/usr/sbin/isp-split" fetch
 }
 if _sec_fetch >/dev/null 2>&1 && [ -f "$TMP/sec/base5/data/.sets" ]; then
@@ -1019,7 +1027,7 @@ else
 fi
 if ISP_SPLIT_FORCE_FETCH=1 SEC_MIRROR="$TMP/sec/mirror" PATH="$TMP/sec/secbin:$PATH" \
 	ISP_SPLIT_CONF="$TMP/sec/fetch.conf" ISP_SPLIT_BASE="$TMP/sec/base5" \
-	ISP_MIRROR="https://mirror.test" \
+	ISP_MIRROR="https://mirror.test" ISP_SPLIT_LIB="$LIB" \
 	sh "$ROOT/files/usr/sbin/isp-split" fetch >/dev/null 2>&1; then
 	ok "ISP_SPLIT_FORCE_FETCH=1 可显式放行（SEC-5）"
 else
@@ -1097,4 +1105,7 @@ fi
 
 echo
 echo "通过 $pass 项，失败 $fail 项"
+if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then
+	echo "（非 root 环境：依赖 uid=0 属主校验的 2 项属预期失败，已由 VM 覆盖）"
+fi
 [ "$fail" -eq 0 ]
