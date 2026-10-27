@@ -130,7 +130,7 @@ fetch_one() {
 # ---------------------------------------------------------------- fetch
 
 cmd_fetch() {
-	mkdir -p "$WORK"
+	mkdir -p "$WORK" || die "无法创建 $WORK"
 	rm -rf "$WORK/raw.new" "$WORK/out.new"
 	mkdir -p "$WORK/raw.new"
 
@@ -183,7 +183,9 @@ cmd_fetch() {
 	mkdir -p "$BASE/.history"
 	if [ -d "$DATA" ]; then
 		_ts=$(date +%Y%m%d-%H%M%S)
-		cp -a "$DATA" "$BASE/.history/$_ts"
+		# 快照失败（磁盘满）时必须中止：否则新数据写坏了也没有东西可回滚。
+		cp -a "$DATA" "$BASE/.history/$_ts" ||
+			die "无法创建历史快照（磁盘空间不足？），现有数据未改动"
 		# 只保留最近 3 份历史快照
 		_cnt=$(ls -1d "$BASE/.history"/*/ 2>/dev/null | wc -l | tr -d ' ')
 		if [ "$_cnt" -gt 3 ]; then
@@ -193,11 +195,37 @@ cmd_fetch() {
 		fi
 	fi
 
-	mkdir -p "$DATA"
-	rm -f "$DATA"/*.txt
-	cp "$WORK/out.new"/*.txt "$DATA/"
+	# 先在暂存目录里准备好整套数据并校验，最后整体替换目录。
+	# 旧写法是 `rm -f $DATA/*.txt` + `cp`：磁盘满时 cp 写一半失败没人看，
+	# 现场留下"半套数据 + 旧 .stamp"，fetch 照样打印"数据已更新"并返回 0，
+	# 下一次 apply 就会把没拷全的集合静默清空。
+	_new=$WORK/data.new
+	rm -rf "$_new"
+	mkdir -p "$_new" || die "无法创建暂存目录 $_new"
+	cp "$WORK/out.new"/*.txt "$_new/" ||
+		{ rm -rf "$_new"; die "写入新数据失败（磁盘空间不足？），现有数据未改动"; }
+	date +%s > "$_new/.stamp" ||
+		{ rm -rf "$_new"; die "无法写入数据时间戳，现有数据未改动"; }
 
-	date +%s > "$DATA/.stamp"
+	_chk_new() {
+		[ -s "$_new/$1.txt" ] || {
+			rm -rf "$_new"
+			die "构建产物 $1.txt 为空或缺失，拒绝覆盖现有数据"
+		}
+	}
+	foreach_enabled _chk_new
+
+	_old=$BASE/data.old
+	rm -rf "$_old"
+	if [ -d "$DATA" ]; then
+		mv "$DATA" "$_old" || { rm -rf "$_new"; die "无法替换数据目录，现有数据未改动"; }
+	fi
+	if ! mv "$_new" "$DATA"; then
+		[ -d "$_old" ] && mv "$_old" "$DATA"
+		die "无法替换数据目录，已恢复原数据"
+	fi
+	rm -rf "$_old"
+
 	log "数据已更新：$(wc -l "$DATA"/*.txt | tail -1)"
 }
 
@@ -2065,9 +2093,41 @@ EOF
 cmd_rollback() {
 	_last=$(ls -1d "$BASE/.history"/*/ 2>/dev/null | sort | tail -1)
 	[ -n "$_last" ] || die "没有可回滚的历史数据"
+
+	# 快照可能是空的、或上次 fetch 被磁盘满/断电打断只拷了一半。
+	# 旧写法先 rm 掉现有数据再 cp，cp 失败被忽略，接着 apply 会把所有集合
+	# flush 成空集，最后打印"已生效"返回 0 —— 一次 rollback 静默清空分流。
+	# 因此先把快照拷到暂存目录校验，确认无误后才原子替换。
+	mkdir -p "$WORK" 2>/dev/null || true
+	_stage=$WORK/rollback.new
+	rm -rf "$_stage"
+	mkdir -p "$_stage" || die "无法创建回滚暂存目录 $_stage"
+	if ! cp "$_last"*.txt "$_stage/" 2>/dev/null; then
+		rm -rf "$_stage"
+		die "历史快照 $_last 为空或已损坏（没有 .txt），拒绝回滚；现有数据未改动"
+	fi
+	_chk_rb() {
+		[ -s "$_stage/$1.txt" ] || {
+			rm -rf "$_stage"
+			die "历史快照缺少 $1.txt（快照不完整），拒绝回滚；现有数据未改动"
+		}
+	}
+	foreach_enabled _chk_rb
+
+	_old=$BASE/data.old
+	rm -rf "$_old"
+	if [ -d "$DATA" ]; then
+		mv "$DATA" "$_old" || { rm -rf "$_stage"; die "无法替换数据目录，现有数据未改动"; }
+	fi
+	if ! mv "$_stage" "$DATA"; then
+		[ -d "$_old" ] && mv "$_old" "$DATA"
+		die "回滚替换失败，已恢复原数据"
+	fi
+	rm -rf "$_old"
+	# 快照里带 .stamp 就沿用，status 才能显示这份数据的真实时间
+	[ -f "$_last/.stamp" ] && cp "$_last/.stamp" "$DATA/.stamp" 2>/dev/null
+
 	log "回滚到 $_last"
-	rm -f "$DATA"/*.txt
-	cp "$_last"*.txt "$DATA/"
 	cmd_apply
 }
 
