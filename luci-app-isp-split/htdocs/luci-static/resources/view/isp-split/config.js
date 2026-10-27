@@ -4,19 +4,47 @@
 'require ui';
 
 /*
- * LuCI 配置页：运营商 → 策略映射 / 多线路 DNS / 域名分流
+ * LuCI 配置页：策略映射 / 多线路 DNS / 域名分流
  *
- * 所有文件解析与改写都由 `isp-split conf` 在 shell 侧完成（带校验和回滚），
- * 这里只负责渲染表单、收集值、回传。前端不直接拼配置文件。
+ * 约定：
+ *   · 所有文件解析与改写仍由 `isp-split conf` 在 shell 侧完成（带白名单校验、
+ *     回读校验、失败回滚），前端只负责收集值；
+ *   · 前端做一遍同样的校验，错误直接标在出错的输入框下面（红字），
+ *     不必等后端返回；
+ *   · `conf preview` 只把改动写进临时副本再跑 plan，"保存前预检"不会碰
+ *     /etc/isp-split.conf。
  */
 
 var CMD = '/usr/sbin/isp-split';
 
+/* ---------------------------------------------------------------- 图标（内联 SVG） */
+
+var ICONS = {
+	refresh: '<path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4v7h-7"/>',
+	check: '<path d="M4 12.5 9 17.5 20 6.5"/>',
+	plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+	up: '<path d="M12 19V5"/><path d="M6 11l6-6 6 6"/>',
+	down: '<path d="M12 5v14"/><path d="M6 13l6 6 6-6"/>',
+	trash: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M6 7l1 13h10l1-13"/>',
+	plug: '<path d="M9 3v6"/><path d="M15 3v6"/><path d="M6 9h12v3a6 6 0 0 1-12 0z"/><path d="M12 18v3"/>',
+	save: '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v6h8V4"/><path d="M8 20v-6h8v6"/>'
+};
+
+function svgIcon(name, size) {
+	var span = document.createElement('span');
+	span.className = 'isp-ico';
+	span.innerHTML = '<svg viewBox="0 0 24 24" width="' + (size || 16) + '" height="' + (size || 16) +
+		'" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+		'stroke-linejoin="round" aria-hidden="true">' + (ICONS[name] || ICONS.check) + '</svg>';
+	return span;
+}
+
+/* ---------------------------------------------------------------- 工具 */
+
 function run(args) {
 	return fs.exec(CMD, args).then(function(res) {
-		// fs.exec 不管退出码都会 resolve。旧实现直接返回结果，
-		// 于是 conf set 校验失败 / wire 失败时页面照样弹"已保存并生效"，
-		// 错误只藏在下面的日志框里。这里把非 0 转成 reject。
+		// fs.exec 不管退出码都会 resolve；非 0 必须变成 reject，
+		// 否则校验失败也会被 UI 当成"已保存"。
 		if (res && res.code) {
 			var out = ((res.stdout || '') + (res.stderr || '')).trim();
 			throw new Error('isp-split ' + args.join(' ') +
@@ -25,6 +53,52 @@ function run(args) {
 		return res;
 	});
 }
+
+/* 行内错误提示：同一个 td 里紧跟输入框的一行红字 */
+function errBox() {
+	return E('div', { 'class': 'isp-err' });
+}
+
+function setErr(box, msg) {
+	if (!box)
+		return;
+	if (msg) {
+		box.textContent = msg;
+		box.classList.add('is-on');
+	} else {
+		box.textContent = '';
+		box.classList.remove('is-on');
+	}
+}
+
+function isIPv4(s) {
+	if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(s))
+		return false;
+	var p = s.split('.');
+	for (var i = 0; i < p.length; i++) {
+		if (+p[i] > 255)
+			return false;
+	}
+	return true;
+}
+
+function isDomain(s) {
+	if (!/^[A-Za-z0-9._-]+$/.test(s))
+		return false;
+	if (s.charAt(0) === '.' || s.charAt(s.length - 1) === '.')
+		return false;
+	return s.indexOf('..') < 0;
+}
+
+function isSrc(s) {
+	return /^[A-Za-z0-9._-]+$/.test(s);
+}
+
+function isSetName(s) {
+	return /^[A-Za-z0-9_]{1,15}$/.test(s);
+}
+
+/* ---------------------------------------------------------------- 视图 */
 
 return view.extend({
 	load: function() {
@@ -35,30 +109,33 @@ return view.extend({
 		var self = this;
 		var out = (res && res.stdout) || '';
 
-		var mode = 'bind';
-		var policies = [];
-		var isp = [];
-		var dns = [];
-		var domains = [];
+		var model = {
+			mode: 'bind',
+			policies: [],
+			isp: [],
+			dns: [],
+			domains: []
+		};
 
 		out.split('\n').forEach(function(line) {
 			if (!line)
 				return;
 			var f = line.split('\t');
 			if (f[0] === 'dns_mode')
-				mode = (f[1] || 'bind').trim();
+				model.mode = (f[1] || 'bind').trim();
 			else if (f[0] === 'policies')
-				policies = (f[1] || '').trim().split(/\s+/).filter(Boolean);
+				model.policies = (f[1] || '').trim().split(/\s+/).filter(Boolean);
 			else if (f[0] === 'isp' && f.length >= 5)
-				isp.push({ src: f[1], set: f[2], policy: f[3], enabled: f[4] === '1' });
+				model.isp.push({ src: f[1], set: f[2], policy: f[3], enabled: f[4] === '1' });
 			else if (f[0] === 'dns' && f.length >= 3)
-				dns.push({ policy: f[1], dns: f[2] });
+				model.dns.push({ policy: f[1], dns: f[2], test: null });
 			else if (f[0] === 'domain' && f.length >= 3)
-				domains.push({ domain: f[1], policy: f[2] });
+				model.domains.push({ domain: f[1], policy: f[2] });
 		});
 
-		if (!isp.length) {
-			return E('div', { 'class': 'cbi-map' }, [
+		if (!model.isp.length) {
+			return E('div', { 'class': 'isp-app cbi-map' }, [
+				E('link', { 'rel': 'stylesheet', 'href': L.resource('isp-split/isp-split.css') }),
 				E('h2', {}, [ _('运营商分流 · 配置') ]),
 				E('div', { 'class': 'cbi-map-descr' }, [
 					_('读不到 /etc/isp-split.conf 的 ISP_TABLE，请先确认已安装并执行过 isp-split fetch。')
@@ -66,227 +143,577 @@ return view.extend({
 			]);
 		}
 
-		/* ---------------- 运营商映射表 ---------------- */
+		var result = E('pre', { 'id': 'cfg-out', 'class': 'isp-out', 'hidden': '' }, ['']);
 
-		var ispBody = E('tbody', {});
-		isp.forEach(function(row) {
-			var sel = E('select', { 'class': 'cbi-input-select' }, policies.map(function(p) {
-				return E('option', { 'value': p, 'selected': p === row.policy ? '' : null }, [ p ]);
-			}));
-			sel.addEventListener('change', function() { row.policy = sel.value; });
+		function showResult(text) {
+			result.textContent = text;
+			result.removeAttribute('hidden');
+			result.scrollTop = 0;
+		}
 
-			var chk = E('input', { 'type': 'checkbox', 'checked': row.enabled ? '' : null });
-			chk.addEventListener('change', function() { row.enabled = chk.checked; });
+		/* ============================================================ 一、策略映射 */
 
-			ispBody.appendChild(E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td' }, [ row.src ]),
-				E('td', { 'class': 'td' }, [ E('code', {}, [ row.set ]) ]),
-				E('td', { 'class': 'td' }, [ sel ]),
-				E('td', { 'class': 'td' }, [ chk ])
-			]));
+		var ispTbody = E('tbody', {});
+
+		function renderIsp() {
+			while (ispTbody.firstChild)
+				ispTbody.removeChild(ispTbody.firstChild);
+
+			model.isp.forEach(function(row, idx) {
+				row._err = row._err || {};
+
+				var srcInp = E('input', {
+					'type': 'text', 'class': 'cbi-input-text', 'value': row.src,
+					'placeholder': '源名，如 chinatelecom'
+				});
+				srcInp.addEventListener('input', function() {
+					row.src = srcInp.value.trim();
+					validateIspRow(row);
+				});
+
+				var setInp = E('input', {
+					'type': 'text', 'class': 'cbi-input-text', 'value': row.set,
+					'placeholder': '集合名，<=15 字符'
+				});
+				setInp.addEventListener('input', function() {
+					row.set = setInp.value.trim();
+					validateIspRow(row);
+				});
+
+				var polSel = E('select', { 'class': 'cbi-input-select' },
+					model.policies.map(function(p) {
+						return E('option', { 'value': p, 'selected': p === row.policy ? '' : null }, [ p ]);
+					}));
+				if (!model.policies.length)
+					polSel.appendChild(E('option', { 'value': '' }, [ _('（mwan3 里没有策略）') ]));
+				polSel.addEventListener('change', function() {
+					row.policy = polSel.value;
+					validateIspRow(row);
+				});
+
+				var chk = E('input', { 'type': 'checkbox', 'checked': row.enabled ? '' : null });
+				chk.addEventListener('change', function() { row.enabled = chk.checked; });
+
+				var up = E('button', {
+					'class': 'isp-icon-btn', 'title': _('上移（提高优先级）'),
+					'disabled': idx === 0 ? '' : null,
+					'click': function() { moveIsp(idx, -1); }
+				}, [ svgIcon('up', 15) ]);
+
+				var down = E('button', {
+					'class': 'isp-icon-btn', 'title': _('下移（降低优先级）'),
+					'disabled': idx === model.isp.length - 1 ? '' : null,
+					'click': function() { moveIsp(idx, 1); }
+				}, [ svgIcon('down', 15) ]);
+
+				var tr = E('tr', {}, [
+					E('td', { 'data-th': _('运营商') }, [ srcInp, row._err.src = errBox() ]),
+					E('td', { 'data-th': _('集合') }, [ setInp, row._err.set = errBox() ]),
+					E('td', { 'data-th': _('策略') }, [ polSel, row._err.policy = errBox() ]),
+					E('td', { 'data-th': _('启用') }, [
+						E('label', { 'class': 'isp-switch' }, [
+							chk,
+							E('span')
+						])
+					]),
+					E('td', { 'data-th': _('顺序') }, [
+						E('div', { 'class': 'isp-row-actions' }, [ up, down ])
+					])
+				]);
+				ispTbody.appendChild(tr);
+				validateIspRow(row);
+			});
+		}
+
+		function moveIsp(idx, delta) {
+			var to = idx + delta;
+			if (to < 0 || to >= model.isp.length)
+				return;
+			var row = model.isp.splice(idx, 1)[0];
+			model.isp.splice(to, 0, row);
+			renderIsp();
+		}
+
+		function validateIspRow(row) {
+			var err = row._err || {};
+			var ok = true;
+
+			if (!isSrc(row.src || '')) {
+				setErr(err.src, _('只能包含字母、数字、点、下划线、连字符'));
+				ok = false;
+			} else {
+				setErr(err.src, '');
+			}
+
+			if (!isSetName(row.set || '')) {
+				setErr(err.set, _('1-15 个字符，只能是字母/数字/下划线'));
+				ok = false;
+			} else {
+				var dup = model.isp.filter(function(r) { return r !== row && r.set === row.set; }).length;
+				if (dup) {
+					setErr(err.set, _('集合名重复'));
+					ok = false;
+				} else {
+					setErr(err.set, '');
+				}
+			}
+
+			if (!row.policy || (model.policies.length && model.policies.indexOf(row.policy) < 0)) {
+				setErr(err.policy, _('mwan3 里没有这个策略'));
+				ok = false;
+			} else {
+				setErr(err.policy, '');
+			}
+
+			row._valid = ok;
+			return ok;
+		}
+
+		renderIsp();
+
+		var addIspBtn = E('button', {
+			'class': 'cbi-button cbi-button-neutral',
+			'click': function() {
+				model.isp.push({
+					src: '', set: '', policy: model.policies[0] || '', enabled: true
+				});
+				renderIsp();
+			}
+		}, [ svgIcon('plus'), E('span', {}, [_('添加运营商')]) ]);
+
+		/* ============================================================ 二、多线路 DNS */
+
+		var dnsTbody = E('tbody', {});
+
+		/* DNS 行 = mwan3 策略 ∪ DNS_TABLE 里已有但 mwan3 没列出的策略 */
+		var dnsPolicies = model.policies.slice();
+		model.dns.forEach(function(r) {
+			if (dnsPolicies.indexOf(r.policy) < 0)
+				dnsPolicies.push(r.policy);
+		});
+		dnsPolicies.forEach(function(p) {
+			var exists = null;
+			model.dns.forEach(function(r) { if (r.policy === p) exists = r; });
+			if (!exists)
+				model.dns.push({ policy: p, dns: '', test: null });
 		});
 
-		/* ---------------- 多线路 DNS ---------------- */
+		function renderDns() {
+			while (dnsTbody.firstChild)
+				dnsTbody.removeChild(dnsTbody.firstChild);
+
+			model.dns.forEach(function(row) {
+				row._err = errBox();
+
+				var inp = E('input', {
+					'type': 'text', 'class': 'cbi-input-text',
+					'placeholder': _('该线路使用的 DNS，如 223.5.5.5'),
+					'value': row.dns
+				});
+				inp.addEventListener('input', function() {
+					row.dns = inp.value.trim();
+					validateDnsRow(row);
+				});
+
+				var resSpan = E('div', { 'class': 'isp-test-result' }, [
+					row.test ? row.test.text : ''
+				]);
+				if (row.test)
+					resSpan.className = 'isp-test-result ' + (row.test.ok ? 'is-ok' : 'is-bad');
+
+				var testBtn = E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'title': _('向该线路的 DNS 发一次查询'),
+					'click': function() {
+						resSpan.className = 'isp-test-result';
+						resSpan.textContent = _('测试中…');
+						/* 这里不能用 run()：DNS 不可用时命令返回 1，但 JSON 仍然有效 */
+						return fs.exec(CMD, ['dnstest', row.policy, '--json']).then(function(r) {
+							var d = null;
+							try {
+								d = JSON.parse((r.stdout || '').trim() || 'null');
+							} catch (e) {
+								d = null;
+							}
+							if (d && d.ok) {
+								resSpan.className = 'isp-test-result is-ok';
+								resSpan.textContent = _('可用') + '（' + (d.device || '?') + ' → ' +
+									(d.answer || '?') + '）';
+								row.test = { ok: true, text: resSpan.textContent };
+							} else {
+								resSpan.className = 'isp-test-result is-bad';
+								resSpan.textContent = _('不可用（DNS 无响应）');
+								row.test = { ok: false, text: resSpan.textContent };
+							}
+						}).catch(function(e) {
+							resSpan.className = 'isp-test-result is-bad';
+							resSpan.textContent = _('测线失败：') + String(e).replace(/^.*失败（[^）]*）：/, '');
+						});
+					}
+				}, [ svgIcon('plug'), E('span', {}, [_('测线')]) ]);
+
+				dnsTbody.appendChild(E('tr', {}, [
+					E('td', { 'data-th': _('线路（策略）') }, [
+						E('span', { 'class': 'isp-line-name' }, [ row.policy ]),
+						row._err
+					]),
+					E('td', { 'data-th': _('DNS') }, [ inp ]),
+					E('td', { 'data-th': _('测线') }, [
+						E('div', { 'class': 'isp-row-actions' }, [ testBtn ]),
+						resSpan
+					])
+				]));
+				validateDnsRow(row);
+			});
+		}
+
+		function validateDnsRow(row) {
+			if (!row.dns) {
+				setErr(row._err, '');
+				row._valid = true;
+				return true;
+			}
+			if (!isIPv4(row.dns)) {
+				setErr(row._err, _('必须是 IPv4 地址，如 223.5.5.5'));
+				row._valid = false;
+				return false;
+			}
+			setErr(row._err, '');
+			row._valid = true;
+			return true;
+		}
+
+		renderDns();
 
 		var modeSel = E('select', { 'class': 'cbi-input-select' }, [
-			E('option', { 'value': 'bind', 'selected': mode === 'bind' ? '' : null }, [ 'bind（dnsmasq @接口 绑定）' ]),
-			E('option', { 'value': 'mark', 'selected': mode === 'mark' ? '' : null }, [ 'mark（nft 按目标 DNS 打标）' ])
+			E('option', { 'value': 'bind', 'selected': model.mode === 'bind' ? '' : null },
+				[_('bind · dnsmasq 绑定出接口')]),
+			E('option', { 'value': 'mark', 'selected': model.mode === 'mark' ? '' : null },
+				[_('mark · nft 按目标 DNS 打标')])
 		]);
+		modeSel.addEventListener('change', function() { model.mode = modeSel.value; });
 
-		var dnsBody = E('tbody', {});
-		var known = [ 'wan_only', 'wanb_only' ];
-		policies.forEach(function(p) { if (known.indexOf(p) < 0) known.push(p); });
-		known.forEach(function(p) {
-			var cur = null;
-			dns.forEach(function(r) { if (r.policy === p) cur = r; });
-			if (!cur && p !== 'wan_only' && p !== 'wanb_only')
-				return;
-			if (!cur) {
-				cur = { policy: p, dns: '' };
-				dns.push(cur);
-			}
-			var inp = E('input', { 'type': 'text', 'class': 'cbi-input-text',
-				'placeholder': 'DNS 地址', 'value': cur.dns });
-			inp.addEventListener('input', function() { cur.dns = inp.value.trim(); });
+		/* ============================================================ 三、域名分流 */
 
-			dnsBody.appendChild(E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td' }, [ E('code', {}, [ p ]) ]),
-				E('td', { 'class': 'td' }, [ inp ])
-			]));
-		});
-
-		/* ---------------- 域名分流 ---------------- */
-
-		var domTbody = E('tbody', { 'id': 'isp-dom-tbody' });
+		var domTbody = E('tbody', {});
 
 		function renderDomains() {
 			while (domTbody.firstChild)
 				domTbody.removeChild(domTbody.firstChild);
 
-			if (!domains.length) {
-				domTbody.appendChild(E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td', 'colspan': 3 }, [
-						_('尚未配置。大多数域名不需要在这里出现——只有 CDN 调度不准的站点才需要钉线。')
+			if (!model.domains.length) {
+				domTbody.appendChild(E('tr', {}, [
+					E('td', { 'colspan': 3, 'data-th': '' }, [
+						E('div', { 'class': 'isp-empty' }, [
+							_('尚未配置。大多数域名不需要在这里出现——只有 CDN 调度不准的站点才需要钉线。')
+						])
 					])
 				]));
+				return;
 			}
 
-			domains.forEach(function(row, idx) {
-				var inp = E('input', { 'type': 'text', 'class': 'cbi-input-text',
-					'placeholder': '域名后缀，如 bilivideo.com', 'value': row.domain, 'style': 'width:100%' });
-				inp.addEventListener('input', function() { row.domain = inp.value.trim(); });
+			model.domains.forEach(function(row, idx) {
+				var inp = E('input', {
+					'type': 'text', 'class': 'cbi-input-text',
+					'placeholder': _('域名后缀，如 bilivideo.com'),
+					'value': row.domain
+				});
+				inp.addEventListener('input', function() {
+					row.domain = inp.value.trim();
+					validateDomainRow(row);
+				});
 
-				var sel = E('select', { 'class': 'cbi-input-select' }, policies.map(function(p) {
-					return E('option', { 'value': p, 'selected': p === row.policy ? '' : null }, [ p ]);
-				}));
-				sel.addEventListener('change', function() { row.policy = sel.value; });
+				var sel = E('select', { 'class': 'cbi-input-select' },
+					model.policies.map(function(p) {
+						return E('option', { 'value': p, 'selected': p === row.policy ? '' : null }, [ p ]);
+					}));
+				sel.addEventListener('change', function() {
+					row.policy = sel.value;
+					validateDomainRow(row);
+				});
 
 				var del = E('button', {
-					'class': 'cbi-button cbi-button-negative',
-					'click': function() { domains.splice(idx, 1); renderDomains(); }
-				}, [ _('删除') ]);
+					'class': 'isp-icon-btn is-danger', 'title': _('删除'),
+					'click': function() {
+						ui.showModal(_('确认删除'), [
+							E('p', {}, [
+								_('把 ') + (row.domain || _('这一行')) + _(' 从域名分流里删掉？')
+							]),
+							E('div', { 'class': 'right' }, [
+								E('button', { 'class': 'btn', 'click': ui.hideModal }, [_('取消')]),
+								' ',
+								E('button', {
+									'class': 'cbi-button cbi-button-negative',
+									'click': function() {
+										ui.hideModal();
+										model.domains.splice(idx, 1);
+										renderDomains();
+									}
+								}, [_('删除')])
+							])
+						]);
+					}
+				}, [ svgIcon('trash', 15) ]);
 
-				domTbody.appendChild(E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td' }, [ inp ]),
-					E('td', { 'class': 'td' }, [ sel ]),
-					E('td', { 'class': 'td' }, [ del ])
+				var err = errBox();
+				row._err = err;
+
+				domTbody.appendChild(E('tr', {}, [
+					E('td', { 'data-th': _('域名后缀') }, [ inp, err ]),
+					E('td', { 'data-th': _('钉到线路') }, [ sel ]),
+					E('td', { 'data-th': _('操作') }, [
+						E('div', { 'class': 'isp-row-actions' }, [ del ])
+					])
 				]));
+				validateDomainRow(row);
 			});
 		}
+
+		function validateDomainRow(row) {
+			if (!row.domain) {
+				setErr(row._err, '');
+				row._valid = true;
+				return true;
+			}
+			if (!isDomain(row.domain)) {
+				setErr(row._err, _('只能包含字母/数字/点/下划线/连字符，且不能以点开头或结尾'));
+				row._valid = false;
+				return false;
+			}
+			var dup = model.domains.filter(function(r) {
+				return r !== row && r.domain === row.domain;
+			}).length;
+			if (dup) {
+				setErr(row._err, _('域名重复'));
+				row._valid = false;
+				return false;
+			}
+			setErr(row._err, '');
+			row._valid = true;
+			return true;
+		}
+
 		renderDomains();
 
 		var addDomBtn = E('button', {
 			'class': 'cbi-button cbi-button-positive',
 			'click': function() {
-				domains.push({ domain: '', policy: policies[0] || 'wan_only' });
+				model.domains.push({ domain: '', policy: model.policies[0] || '' });
 				renderDomains();
 			}
-		}, [ _('添加域名') ]);
+		}, [ svgIcon('plus'), E('span', {}, [_('添加域名')]) ]);
 
-		var result = E('pre', {
-			'id': 'cfg-out',
-			'style': 'max-height:16em;overflow:auto;white-space:pre-wrap;font-family:monospace;' +
-				'font-size:12px;padding:10px;border-radius:4px;border:1px solid rgba(128,128,128,.3)',
-			'hidden': ''
-		}, [ '' ]);
+		/* ============================================================ 保存 / 预检 */
 
-		function showResult(text) {
-			result.textContent = text;
-			result.removeAttribute('hidden');
-		}
-
-		function save(apply) {
-			var ispVal = isp.map(function(r) {
+		function values() {
+			var ispVal = model.isp.map(function(r) {
 				return r.src + ':' + r.set + ':' + r.policy + ':' + (r.enabled ? '1' : '0');
 			}).join('|');
 
-			var dnsVal = dns.filter(function(r) { return r.dns; })
+			var dnsVal = model.dns.filter(function(r) { return r.dns; })
 				.map(function(r) { return r.policy + ':' + r.dns; }).join('|');
 
-			var domVal = domains.filter(function(r) { return r.domain; })
-				.map(function(r) { return r.domain + ':' + r.policy; })
-				.join('|');
+			var domVal = model.domains.filter(function(r) { return r.domain; })
+				.map(function(r) { return r.domain + ':' + r.policy; }).join('|');
 
-			var log = [];
+			return {
+				isp: ispVal,
+				dns: dnsVal,
+				dom: domVal,
+				mode: modeSel.value
+			};
+		}
 
-			function step(args) {
-				return run(args).then(function(r) {
-					var t = ((r.stdout || '') + (r.stderr || '')).trim();
-					log.push('$ isp-split ' + args.join(' ') + '\n' + (t || '  (无输出)'));
-					return r;
-				});
+		/* 返回 true = 全部合法；出错的行已经标红 */
+		function validateAll() {
+			var ok = true;
+			model.isp.forEach(function(r) { ok = validateIspRow(r) && ok; });
+			model.dns.forEach(function(r) { ok = validateDnsRow(r) && ok; });
+			model.domains.forEach(function(r) { ok = validateDomainRow(r) && ok; });
+
+			if (!model.isp.length) {
+				ui.addNotification(null, E('p', {}, [
+					_('至少保留一行运营商映射')
+				]), 'danger');
+				ok = false;
+			}
+			return ok;
+		}
+
+		function listErrors() {
+			var msgs = [];
+			model.isp.forEach(function(r) {
+				if (r._valid === false)
+					msgs.push(_('运营商行 ') + (r.set || r.src || '?') + _(' 有错误'));
+			});
+			model.dns.forEach(function(r) {
+				if (r._valid === false)
+					msgs.push(_('DNS 行 ') + r.policy + _(' 有错误'));
+			});
+			model.domains.forEach(function(r) {
+				if (r._valid === false)
+					msgs.push(_('域名行 ') + (r.domain || '?') + _(' 有错误'));
+			});
+			return msgs;
+		}
+
+		function step(args, log) {
+			return run(args).then(function(r) {
+				var t = ((r.stdout || '') + (r.stderr || '')).trim();
+				log.push('$ isp-split ' + args.join(' ') + '\n' + (t || '  (无输出)'));
+				return r;
+			});
+		}
+
+		function preflight() {
+			if (!validateAll()) {
+				showResult(_('预检未通过：') + '\n  - ' + listErrors().join('\n  - '));
+				ui.addNotification(null, E('p', {}, [_('表格里还有非法输入，先修正标红的行')]), 'danger');
+				return;
 			}
 
-			step(['conf', 'set', 'isp_table', ispVal])
-				.then(function() { return step(['conf', 'set', 'dns_table', dnsVal]); })
-				.then(function() { return step(['conf', 'set', 'domain_split', domVal]); })
-				.then(function() { return step(['conf', 'set', 'dns_mode', modeSel.value]); })
+			var v = values();
+			showResult(_('正在预检（只写临时副本，不会改动配置）…'));
+			run(['conf', 'preview',
+				'isp_table', v.isp,
+				'dns_table', v.dns,
+				'domain_split', v.dom,
+				'dns_mode', v.mode
+			]).then(function(r) {
+				showResult(((r.stdout || '') + (r.stderr || '')) || '(无输出)');
+				ui.addNotification(null, E('p', {}, [_('预检完成，配置未被修改')]), 'info');
+			}).catch(function(e) {
+				showResult(_('预检失败：') + String(e));
+				ui.addNotification(null, E('p', {}, [_('预检失败：') + String(e)]), 'danger');
+			});
+		}
+
+		function save(apply) {
+			if (!validateAll()) {
+				showResult(_('保存已取消：') + '\n  - ' + listErrors().join('\n  - '));
+				ui.addNotification(null, E('p', {}, [_('表格里还有非法输入，先修正标红的行')]), 'danger');
+				return;
+			}
+
+			var v = values();
+			var log = [];
+
+			step(['conf', 'set', 'isp_table', v.isp], log)
+				.then(function() { return step(['conf', 'set', 'dns_table', v.dns], log); })
+				.then(function() { return step(['conf', 'set', 'domain_split', v.dom], log); })
+				.then(function() { return step(['conf', 'set', 'dns_mode', v.mode], log); })
 				.then(function() {
 					if (!apply)
 						return null;
-					return step(['wire'])
-						.then(function() { return step(['apply']); })
-						.then(function() { return step(['dns']); });
+					return step(['wire'], log)
+						.then(function() { return step(['apply'], log); })
+						.then(function() { return step(['dns'], log); });
 				})
 				.then(function() {
 					showResult(log.join('\n\n'));
 					ui.addNotification(null, E('p', {}, [
-						apply ? _('已保存并生效') : _('已保存。改动需执行「保存并生效」或手动 wire/apply 后才生效')
+						apply
+							? _('已保存并生效')
+							: _('已保存。改动需执行「保存并生效」或手动 wire/apply 后才生效')
 					]), 'info');
 				})
 				.catch(function(e) {
 					showResult(log.join('\n\n') + '\n\n错误: ' + String(e));
-					ui.addNotification(null, E('p', {}, [ '操作失败：' + String(e) ]), 'danger');
+					ui.addNotification(null, E('p', {}, [ _('操作失败：') + String(e) ]), 'danger');
 				});
 		}
 
-		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, [ _('运营商分流 · 配置') ]),
-			E('div', { 'class': 'cbi-map-descr' }, [
-				_('运营商到策略的映射、每条线的 DNS、以及需要钉到具体线路的域名。'),
-				_('改动写入 /etc/isp-split.conf，写入前会校验，语法不合法会自动回滚。')
-			]),
+		/* ============================================================ 页面 */
 
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('运营商 → 策略') ]),
-				E('table', { 'class': 'table cbi-section-table' }, [
-					E('thead', {}, [ E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, [ _('运营商') ]),
-						E('th', { 'class': 'th' }, [ _('集合') ]),
-						E('th', { 'class': 'th' }, [ _('策略') ]),
-						E('th', { 'class': 'th' }, [ _('启用') ])
-					]) ]),
-					ispBody
+		return E('div', { 'class': 'isp-app cbi-map' }, [
+			E('link', { 'rel': 'stylesheet', 'href': L.resource('isp-split/isp-split.css') }),
+
+			E('div', { 'class': 'isp-hero' }, [
+				E('h2', {}, [ _('运营商分流 · 配置') ]),
+				E('div', { 'class': 'isp-sub' }, [
+					_('改动写入 /etc/isp-split.conf：写入前校验、写入后回读，语法不合法自动回滚。')
 				])
 			]),
 
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('多线路 DNS') ]),
-				E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, [ _('出线方式') ]),
-					E('div', { 'class': 'cbi-value-field' }, [
-						modeSel,
-						E('div', { 'class': 'cbi-value-description' }, [
-							_('bind 依赖 dnsmasq 的 @接口；mark 用 nft 按目标 DNS 打标，OpenClash 接管 DNS 时更稳。')
+			/* ---- 策略映射 ---- */
+			E('section', { 'class': 'isp-section' }, [
+				E('h3', {}, [ _('策略映射') ]),
+				E('p', { 'class': 'isp-desc' }, [
+					_('顺序即优先级：排在前面的运营商优先占有重叠地址。集合名同时是 mwan3 规则名（<=15 字符）。')
+				]),
+				E('table', { 'class': 'isp-form-table' }, [
+					E('thead', {}, [
+						E('tr', {}, [
+							E('th', {}, [_('运营商（源名）')]),
+							E('th', {}, [_('集合')]),
+							E('th', {}, [_('策略')]),
+							E('th', {}, [_('启用')]),
+							E('th', {}, [_('顺序')])
 						])
-					])
+					]),
+					ispTbody
 				]),
-				E('table', { 'class': 'table cbi-section-table' }, [
-					E('thead', {}, [ E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, [ _('策略') ]),
-						E('th', { 'class': 'th' }, [ _('该线路使用的 DNS') ])
-					]) ]),
-					dnsBody
+				E('div', { 'class': 'isp-btn-row' }, [ addIspBtn ])
+			]),
+
+			/* ---- 多线路 DNS ---- */
+			E('section', { 'class': 'isp-section' }, [
+				E('h3', {}, [ _('多线路 DNS') ]),
+				E('p', { 'class': 'isp-desc' }, [
+					_('让每条线用自己运营商的 DNS，CDN 才会把本运营商节点返回给你。留空表示不配置。')
+				]),
+				E('table', { 'class': 'isp-form-table' }, [
+					E('thead', {}, [
+						E('tr', {}, [
+							E('th', {}, [_('线路（策略）')]),
+							E('th', {}, [_('DNS 服务器')]),
+							E('th', {}, [_('测线')])
+						])
+					]),
+					dnsTbody
+				]),
+				E('div', { 'class': 'isp-btn-row' }, [
+					E('span', { 'class': 'isp-line-name' }, [_('出线方式')]),
+					modeSel,
+					E('span', { 'class': 'isp-tag' }, [
+						_('bind 依赖 dnsmasq @接口；mark 用 nft 打标，OpenClash 接管 DNS 时更稳')
+					])
 				])
 			]),
 
-			E('div', { 'class': 'cbi-section' }, [
+			/* ---- 域名分流 ---- */
+			E('section', { 'class': 'isp-section' }, [
 				E('h3', {}, [ _('域名分流') ]),
-				E('div', { 'class': 'cbi-value-description' }, [
-					_('未列出的域名走系统默认上游（默认就是 PPPoE 下发的运营商 DNS，无需配置）。'),
-					_('只有个别站点 CDN 调度不准时，才在这里把它的域名钉到指定线路。')
+				E('p', { 'class': 'isp-desc' }, [
+					_('未列出的域名走系统默认上游（通常就是 PPPoE 下发的运营商 DNS，无需配置）。'),
+					_('只有个别站点 CDN 调度不准时，才需要把它的域名钉到指定线路。')
 				]),
-				E('table', { 'class': 'table cbi-section-table' }, [
-					E('thead', {}, [ E('tr', { 'class': 'tr table-titles' }, [
-						E('th', { 'class': 'th' }, [ _('域名后缀') ]),
-						E('th', { 'class': 'th' }, [ _('钉到线路') ]),
-						E('th', { 'class': 'th' }, [ _('') ])
-					]) ]),
+				E('table', { 'class': 'isp-form-table' }, [
+					E('thead', {}, [
+						E('tr', {}, [
+							E('th', {}, [_('域名后缀')]),
+							E('th', {}, [_('钉到线路')]),
+							E('th', {}, [_('操作')])
+						])
+					]),
 					domTbody
 				]),
-				E('div', { 'style': 'margin-top:6px' }, [ addDomBtn ])
+				E('div', { 'class': 'isp-btn-row' }, [ addDomBtn ])
 			]),
 
-			E('div', { 'class': 'cbi-page-actions' }, [
+			E('div', { 'class': 'isp-footer-actions' }, [
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
+					'click': preflight
+				}, [ svgIcon('refresh'), E('span', {}, [_('保存前预检')]) ]),
+				E('button', {
+					'class': 'cbi-button',
 					'click': function() { save(false); }
-				}, [ _('仅保存') ]),
-				' ',
+				}, [ svgIcon('save'), E('span', {}, [_('仅保存')]) ]),
 				E('button', {
 					'class': 'cbi-button cbi-button-positive',
 					'click': function() { save(true); }
-				}, [ _('保存并生效') ])
+				}, [ svgIcon('check'), E('span', {}, [_('保存并生效')]) ])
 			]),
 
 			result
