@@ -531,6 +531,8 @@ _run_diff() {
 	_rd_rows=0
 	_rd_min=""
 	_rd_bad=""
+	DIFF_MIN_JACCARD=""
+	DIFF_REJECTED=""
 
 	mkdir -p "$WORK" || return 1
 	_rd_tmp=$WORK/.diff.$$
@@ -828,27 +830,32 @@ cmd_fetch() {
 		fi
 	fi
 
+	_diff_min_all=""
 	for _vname in $_verify_ok; do
 		if _run_diff "$WORK/raw.new/$_primary" "$WORK/raw.new/$_vname" \
 			"$_primary" "$_vname" reject; then
-			continue
-		fi
-		echo
-		if [ "$_force" = "1" ]; then
+			:
+		elif [ "$_force" = "1" ]; then
+			echo
 			log "警告: 与校验源 $_vname 的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（${DIFF_REJECTED}），已按 ISP_SPLIT_FORCE_FETCH=1 放行"
-			continue
+		else
+			echo
+			echo "已拒绝本次更新：与校验源的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（$_vname:${DIFF_REJECTED}）。"
+			echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
+			echo "人工确认数据无误后，可用 ISP_SPLIT_FORCE_FETCH=1 isp-split fetch 放行。"
+			exit 3
 		fi
-		echo "已拒绝本次更新：与校验源的分歧超过 ${ISP_DIFF_MAX_JACCARD_DROP}%（$_vname:${DIFF_REJECTED}）。"
-		echo "差异段已留档: $BASE/quarantine/$(date +%Y%m%d)/"
-		echo "人工确认数据无误后，可用 ISP_SPLIT_FORCE_FETCH=1 isp-split fetch 放行。"
-		exit 3
-	done
-	if [ -n "$_verify_ok" ] && [ -n "${DIFF_MIN_JACCARD:-}" ]; then
-		for _vname in $_verify_ok; do
+		# 每个校验源记自己的 Jaccard（多校验源时不能互相覆盖）
+		if [ -n "${DIFF_MIN_JACCARD:-}" ]; then
 			_state_put "$_vname" "$(_source_role_of "$_vname")" "$(date +%s)" 0 \
 				"$DIFF_MIN_JACCARD" "校验源正常"
-		done
-	fi
+			if awk -v a="$_diff_min_all" -v b="$DIFF_MIN_JACCARD" \
+				'BEGIN { exit !(a == "" || b + 0 < a + 0) }'; then
+				_diff_min_all=$DIFF_MIN_JACCARD
+			fi
+		fi
+	done
+	DIFF_MIN_JACCARD=$_diff_min_all
 
 	# ---- 4) 合成（0.2.0：只有 primary 参与合成）----
 	log "构建集合（互斥化）"
