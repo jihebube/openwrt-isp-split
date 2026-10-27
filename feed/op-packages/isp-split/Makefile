@@ -4,6 +4,7 @@ PKG_NAME:=isp-split
 PKG_VERSION:=0.1.5
 PKG_RELEASE:=2
 PKG_LICENSE:=MIT
+PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=jihebube <jihebube@users.noreply.github.com>
 
 include $(INCLUDE_DIR)/package.mk
