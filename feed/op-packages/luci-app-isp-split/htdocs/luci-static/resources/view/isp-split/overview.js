@@ -2,7 +2,6 @@
 'require view';
 'require fs';
 'require ui';
-'require poll';
 
 /*
  * LuCI 概览页：运营商分流状态
@@ -13,6 +12,11 @@
  *
  * 页面只用原生 DOM（LuCI 的 E()）+ 一份静态 CSS，没有构建工具、没有外链资源：
  * 路由器离线时图标与样式照常显示。
+ *
+ * 为什么不用 LuCI 的 poll 模块：`poll.add()` 会触发 document 级的 poll-start 事件，
+ * 主题随之在顶栏弹出英文 "Refreshing" 徽标（luci.js: showIndicator(_('Refreshing'))），
+ * 中文界面里很突兀，而且位置离数据很远。这里改成自己的定时器 + 页面内中文徽标
+ * 「刷新中…」，用户看到的是同一处状态点。
  */
 
 var CMD = '/usr/sbin/isp-split';
@@ -69,6 +73,55 @@ function fmtBytes(n) {
 
 function accentOf(src) {
 	return 'var(--isp-accent-' + (GLYPH_FOR[src] || 'other') + ')';
+}
+
+/*
+ * cron 表达式 → 人话（分 时 日 月 周）。
+ * 只翻译最常见、能一眼看懂的形状；认不出来的原样返回，宁可显示原文也不猜错。
+ *   17 4 * * *   → 每天 04:17
+ *   30 3 * * 1   → 每周一 03:30
+ *   5 2 1 * *    → 每月 1 日 02:05
+ */
+var DOW_NAMES = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+function humanCron(expr) {
+	var f = String(expr || '').trim().split(/\s+/);
+
+	if (f.length !== 5)
+		return '';
+
+	function num(s) {
+		return /^\d+$/.test(s) ? +s : null;
+	}
+
+	var min = num(f[0]);
+	var hour = num(f[1]);
+	if (min === null || hour === null || min > 59 || hour > 23)
+		return '';
+
+	var hhmm = (hour < 10 ? '0' : '') + hour + ':' + (min < 10 ? '0' : '') + min;
+	var dom = num(f[2]);
+	var dow = num(f[4]);
+
+	if (f[2] === '*' && f[3] === '*' && f[4] === '*')
+		return _('每天 ') + hhmm;
+
+	if (f[2] === '*' && f[3] === '*' && dow !== null && dow <= 7)
+		return _('每') + DOW_NAMES[dow % 7] + ' ' + hhmm;
+
+	if (f[4] === '*' && f[3] === '*' && f[2] !== '*' && dom !== null)
+		return _('每月 ') + dom + _(' 日 ') + hhmm;
+
+	return '';
+}
+
+/* mwan3 的线路状态是英文枚举，界面上统一显示中文；原文留在 title 里备查 */
+function stateText(state) {
+	if (state === 'online')
+		return _('在线');
+	if (state === 'offline')
+		return _('离线');
+	return _('未知');
 }
 
 /* ---------------------------------------------------------------- 数据解析 */
@@ -200,7 +253,20 @@ return view.extend({
 	refresh: function() {
 		var self = this;
 
-		return Promise.all([
+		/* 上一轮还没回来就不再叠一次取数（10s 一跳，网络慢时很容易叠） */
+		if (this._inflight)
+			return this._inflight;
+
+		this.busy = true;
+		this.paintPill();
+
+		var done = function() {
+			self._inflight = null;
+			self.busy = false;
+			self.paintPill();
+		};
+
+		this._inflight = Promise.all([
 			this.readJson(['status', '--json']).catch(function(e) {
 				return { __error: String(e) };
 			}),
@@ -213,7 +279,43 @@ return view.extend({
 			self.health = (res[1] && !res[1].__error) ? res[1] : {};
 			self.healthError = res[1] && res[1].__error;
 			self.paint();
-		});
+		}).then(done, done);
+
+		return this._inflight;
+	},
+
+	/* 状态徽标：正常「自动刷新 10s」/ 取数中「刷新中…」+ 转圈 / 暂停「已暂停」 */
+	paintPill: function() {
+		var pill = this._pill;
+		if (!pill || !pill.parentNode)
+			return;
+
+		var icon = this._pillIcon;
+		var text = this._pillText;
+
+		while (icon.firstChild)
+			icon.removeChild(icon.firstChild);
+
+		var cls = 'isp-pill';
+
+		if (this.paused) {
+			cls += ' is-paused';
+			icon.appendChild(E('span', { 'class': 'isp-dot' }));
+			text.textContent = _('已暂停');
+		}
+		else if (this.busy) {
+			cls += ' is-busy';
+			var spin = svgIcon('refresh', 13);
+			spin.className = 'isp-ico isp-spin';
+			icon.appendChild(spin);
+			text.textContent = _('刷新中…');
+		}
+		else {
+			icon.appendChild(E('span', { 'class': 'isp-dot' }));
+			text.textContent = _('自动刷新 ' + REFRESH_SEC + 's');
+		}
+
+		pill.className = cls;
 	},
 
 	/* ---------------- 运营商卡片 ---------------- */
@@ -259,8 +361,9 @@ return view.extend({
 				routeText = active[0].iface + ' ' + active[0].pct + '%';
 			}
 
+			var packets = +r.packets || 0;
 			var pct = maxPackets > 0
-				? Math.max(2, Math.round((+r.packets || 0) * 100 / maxPackets))
+				? Math.max(2, Math.round(packets * 100 / maxPackets))
 				: 0;
 
 			box.appendChild(E('article', {
@@ -272,7 +375,7 @@ return view.extend({
 					E('span', { 'class': 'isp-op-ico' }, [ svgIcon(GLYPH_FOR[r.src] || 'other', 20) ])
 				]),
 				E('div', {}, [
-					E('span', { 'class': 'isp-big' }, [ r.exists ? fmtNum(r.packets) : '—' ]),
+					E('span', { 'class': 'isp-big' }, [ r.exists ? fmtNum(packets) : '—' ]),
 					E('span', { 'class': 'isp-unit' }, [ _('命中包') ])
 				]),
 				E('div', { 'class': 'isp-op-sub' }, [
@@ -285,9 +388,16 @@ return view.extend({
 					E('span', {}, [ routeText ]),
 					E('span', { 'class': 'isp-tag' }, [ r.policy ])
 				]),
-				E('div', { 'class': 'isp-meter' }, [
-					E('i', { 'style': 'width:' + pct + '%' })
-				])
+				/* 零流量时不画进度条：2% 的最小宽度会缩成一个孤零零的色点，
+				   看起来像渲染坏了。改成一个「—」，标题里说明原因。 */
+				packets > 0
+					? E('div', { 'class': 'isp-meter' }, [
+						E('i', { 'style': 'width:' + pct + '%' })
+					])
+					: E('div', {
+						'class': 'isp-meter-empty',
+						'title': r.exists ? _('暂无命中流量') : _('集合尚未生效')
+					}, [ '—' ])
 			]));
 		});
 	},
@@ -326,13 +436,19 @@ return view.extend({
 				return s.policy + ' ' + s.pct + '%';
 			}).join(' · ');
 
+			/* 这一列只剩 1fr 的窄位，塞「online · tracking active · IP:up」必然被
+			   ellipsis 截成 "tracking activ…"。正文只留两个字，全文进 title。 */
+			var detail = state
+				+ (info.tracking ? ' · tracking ' + info.tracking : '')
+				+ (tracks ? ' · ' + tracks : '');
+
 			list.appendChild(E('div', { 'class': cls }, [
 				E('span', { 'class': 'isp-dot' }),
 				E('span', { 'class': 'isp-line-name' }, [ iface ]),
-				E('span', { 'class': 'isp-line-track' }, [
-					state + (info.tracking ? ' · tracking ' + info.tracking : '') +
-					(tracks ? ' · ' + tracks : '')
-				]),
+				E('span', {
+					'class': 'isp-line-track',
+					'title': iface + ' · ' + detail
+				}, [ stateText(state) ]),
 				E('span', { 'class': 'isp-line-pct' }, [ shares || _('未参与策略') ])
 			]));
 		});
@@ -453,7 +569,14 @@ return view.extend({
 			E('span', {}, [
 				_('下次更新：'),
 				E('b', {}, [ d.next_cron && d.next_cron !== '-' ? d.next_cron : _('未知') ]),
-				d.cron ? E('span', { 'class': 'isp-tag' }, [ d.cron ]) : ''
+				/* 裸 cron 表达式（17 4 * * *）对普通用户等于没写；翻成「每天 04:17」，
+				   原始表达式退到 title 里，排障时鼠标一悬停就能看到。 */
+				d.cron
+					? E('span', {
+						'class': 'isp-tag',
+						'title': _('cron 表达式：') + d.cron
+					}, [ humanCron(d.cron) || d.cron ])
+					: ''
 			]),
 			E('span', {}, [
 				_('最近校验：'),
@@ -490,6 +613,8 @@ return view.extend({
 		this.status = [];
 		this.health = {};
 		this.paused = false;
+		this.busy = false;
+		this._inflight = null;
 
 		var pauseLabel = E('span', {}, [_('暂停刷新')]);
 		var pauseBtn = E('button', {
@@ -502,23 +627,20 @@ return view.extend({
 				pauseBtn.appendChild(svgIcon(self.paused ? 'play' : 'pause', 16));
 				pauseBtn.appendChild(E('span', {}, [ self.paused ? _('继续刷新') : _('暂停刷新') ]));
 
-				while (statePill.firstChild)
-					statePill.removeChild(statePill.firstChild);
-				statePill.className = 'isp-pill' + (self.paused ? ' is-paused' : '');
-				statePill.appendChild(E('span', { 'class': 'isp-dot' }));
-				statePill.appendChild(E('span', {}, [
-					self.paused ? _('已暂停') : _('自动刷新 ' + REFRESH_SEC + 's')
-				]));
+				self.paintPill();
 
 				if (!self.paused)
 					self.refresh();
 			}
 		}, [ svgIcon('pause', 16), pauseLabel ]);
 
-		var statePill = E('span', { 'class': 'isp-pill' }, [
-			E('span', { 'class': 'isp-dot' }),
-			E('span', {}, [ _('自动刷新 ' + REFRESH_SEC + 's') ])
+		this._pillIcon = E('span', { 'class': 'isp-pill-ico' });
+		this._pillText = E('span', {});
+		var statePill = this._pill = E('span', { 'class': 'isp-pill' }, [
+			this._pillIcon,
+			this._pillText
 		]);
+		this.paintPill();
 
 		var actions = E('div', { 'class': 'isp-actions' }, [
 			E('button', {
@@ -588,11 +710,17 @@ return view.extend({
 
 		this.refresh();
 
-		poll.add(function() {
-			if (self.paused)
+		/* 自带定时器替代 LuCI 的 poll（见文件头注释）：暂停即停，页面被换走即收摊。 */
+		this.timer = window.setInterval(function() {
+			if (!document.getElementById('isp-time')) {
+				window.clearInterval(self.timer);
+				self.timer = null;
 				return;
-			return self.refresh();
-		}, REFRESH_SEC);
+			}
+			if (self.paused || self.busy)
+				return;
+			self.refresh();
+		}, REFRESH_SEC * 1000);
 
 		return container;
 	},

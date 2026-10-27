@@ -143,11 +143,21 @@ return view.extend({
 			]);
 		}
 
-		var result = E('pre', { 'id': 'cfg-out', 'class': 'isp-out', 'hidden': '' }, ['']);
+		var result = E('pre', { 'id': 'cfg-out', 'class': 'isp-out is-empty', 'hidden': '' }, ['']);
 
+		/* 没有输出时保持 hidden：主题的 pre{display:block} 会盖掉 hidden 属性，
+		   CSS 里配了 .isp-out[hidden]{display:none!important}，这里只管切换属性。 */
 		function showResult(text) {
-			result.textContent = text;
-			result.removeAttribute('hidden');
+			if (text) {
+				result.textContent = text;
+				result.removeAttribute('hidden');
+				result.classList.remove('is-empty');
+			}
+			else {
+				result.textContent = '';
+				result.setAttribute('hidden', '');
+				result.classList.add('is-empty');
+			}
 			result.scrollTop = 0;
 		}
 
@@ -674,10 +684,15 @@ return view.extend({
 				]),
 				E('div', { 'class': 'isp-btn-row' }, [
 					E('span', { 'class': 'isp-line-name' }, [_('出线方式')]),
-					modeSel,
-					E('span', { 'class': 'isp-tag' }, [
-						_('bind 依赖 dnsmasq @接口；mark 用 nft 打标，OpenClash 接管 DNS 时更稳')
-					])
+					modeSel
+				]),
+				/* 这行解释原来挤在 .isp-tag 胶囊里，窄屏换成两行后首尾字符被圆角压掉，
+				   看着像被截断。改成普通说明段落：整段换行显示，title 再兜一次全文。 */
+				E('div', {
+					'class': 'isp-note',
+					'title': _('bind 依赖 dnsmasq @接口；mark 用 nft 打标，OpenClash 接管 DNS 时更稳')
+				}, [
+					_('bind 依赖 dnsmasq @接口；mark 用 nft 打标，OpenClash 接管 DNS 时更稳')
 				])
 			]),
 

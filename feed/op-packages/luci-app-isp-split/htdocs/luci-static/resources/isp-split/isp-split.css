@@ -91,6 +91,33 @@
 	background: var(--isp-warn);
 }
 
+/* 刷新中：徽标转中文「刷新中…」并让图标转圈，替代主题自带的英文 Refreshing 提示 */
+.isp-pill.is-busy {
+	color: var(--isp-text);
+	border-color: var(--isp-border-strong);
+}
+
+.isp-pill .isp-ico {
+	display: inline-flex;
+	align-items: center;
+}
+
+.isp-spin {
+	display: inline-flex;
+	animation: isp-rotate 0.9s linear infinite;
+	transform-origin: 50% 50%;
+}
+
+@keyframes isp-rotate {
+	to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.isp-spin {
+		animation: none;
+	}
+}
+
 /* ---------------------------------------------------------------- 卡片网格 */
 
 .isp-cards {
@@ -220,11 +247,22 @@
 .isp-meter > i {
 	display: block;
 	height: 100%;
-	min-width: 2px;
 	border-radius: 999px;
 	background: var(--isp-accent, var(--isp-accent-other));
 	opacity: 0.85;
 	transition: width 0.4s ease;
+}
+
+/* 零流量卡片：不画进度条（否则 0% 只剩一个孤点），改成一行占位「—」 */
+.isp-meter-empty {
+	margin-top: 10px;
+	height: 6px;
+	display: flex;
+	align-items: center;
+	font-size: 0.8rem;
+	line-height: 1;
+	color: var(--isp-muted);
+	font-variant-numeric: tabular-nums;
 }
 
 /* ---------------------------------------------------------------- 列表 / 表格 */
@@ -329,11 +367,16 @@
 	white-space: nowrap;
 }
 
-/* 长的说明性标签（如出线方式解释）允许换行，避免窄屏把页面撑宽 */
+/* 长的说明性标签（如出线方式解释）允许换行，避免窄屏把页面撑宽。
+   圆角从 999px 收敛成 8px：胶囊形的半圆端在换行后会把首尾字符压在弧线上，
+   看起来像被截断；直角一点的说明条才容得下两行完整文字。 */
 .isp-btn-row .isp-tag {
 	white-space: normal;
+	word-break: break-word;
 	max-width: 100%;
-	line-height: 1.45;
+	padding: 4px 10px;
+	border-radius: 8px;
+	line-height: 1.5;
 }
 
 .isp-tag.is-ok {
@@ -407,6 +450,13 @@
 	background: var(--isp-card-bg);
 	color: var(--isp-text);
 	margin: 0;
+}
+
+/* 没有输出时不留空盒子：hidden 属性必须真的生效（主题里有 pre{display:block}，
+   单靠 hidden 会被作者样式盖掉，只剩一个 22px 高的空边框）。 */
+.isp-out[hidden],
+.isp-out.is-empty {
+	display: none !important;
 }
 
 /* ---------------------------------------------------------------- 表单（配置页） */
@@ -567,7 +617,17 @@
 	display: flex;
 	flex-wrap: wrap;
 	gap: 8px;
+	align-items: center;
 	margin-top: 10px;
+}
+
+/* 表单下方的整段说明（如「出线方式」的解释）：允许换行，不加胶囊边框 */
+.isp-note {
+	margin-top: 8px;
+	font-size: 0.78rem;
+	line-height: 1.55;
+	color: var(--isp-muted);
+	overflow-wrap: anywhere;
 }
 
 .isp-test-result {
@@ -586,14 +646,15 @@
 }
 
 .isp-footer-actions {
-	position: sticky;
-	bottom: 0;
+	/* 曾经是 position:sticky; bottom:0 —— 会浮在视口底部盖住 DNS 表最后两行。
+	   保存按钮放在正常文档流里即可，页脚用一条上边框跟内容分开。 */
 	display: flex;
 	flex-wrap: wrap;
 	gap: 8px;
-	padding: 10px 0;
-	background: var(--background-color-high, transparent);
-	z-index: 2;
+	margin: 4px 0 8px 0;
+	padding: 12px 0 0 0;
+	border-top: 1px solid var(--isp-border);
+	background: transparent;
 }
 
 /* ---------------------------------------------------------------- 响应式 */
