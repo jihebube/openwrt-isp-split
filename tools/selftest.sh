@@ -1230,13 +1230,15 @@ else
 	ng "OpenClash 未启用仍告警"
 fi
 
-echo "== 12. 多数据源管线（0.2.0）"
-# 目标：证明"骨架"在不改变默认行为的前提下工作
+echo "== 12. 多数据源管线（0.2.1 默认双源）"
+# 目标：证明"默认双源"在不破坏老配置的前提下工作
 #   1. 老配置（没有 ISP_SOURCES）行为与 0.1.x 完全一致
-#   2. 双源正常：diff 通过，数据更新，存档落盘
-#   3. 校验源挂：降级继续（退出 0），连续 3 天失败后升级为拒绝（退出 3）
-#   4. 分歧超阈值：拒绝更新（退出 3）+ quarantine 留档 + 旧数据不动
-#   5. 主源挂：冻结（非 0 退出），旧数据不动
+#   2. 0.2.1 默认模板：yfgao 主源 + clang 校验 + ISP_VERIFY_ENABLE=1 自动生效
+#   3. 用户改 ISP_SOURCES 后，sources.tsv 里旧源（如单源时代的 ispip）被清理
+#   4. 双源正常：diff 通过，数据更新，存档落盘
+#   5. 校验源挂：降级继续（退出 0），连续 3 天失败后升级为拒绝（退出 3）
+#   6. 分歧超阈值：拒绝更新（退出 3）+ quarantine 留档 + 旧数据不动
+#   7. 主源挂：冻结（非 0 退出），旧数据不动
 # 全部离线：用假 uclient-fetch 把 URL 映射到 tools/fixtures/multisource。
 
 MS=$TMP/ms
@@ -1261,8 +1263,12 @@ chmod +x "$MS/bin/uclient-fetch"
 
 cp "$FIX/multisource/clang/chinatelecom.txt" "$MS/mirror/ispip.clang.cn/chinatelecom.txt"
 cp "$FIX/multisource/clang/unicom_cnc.txt" "$MS/mirror/ispip.clang.cn/unicom_cnc.txt"
+cp "$FIX/multisource/clang/cmcc.txt" "$MS/mirror/ispip.clang.cn/cmcc.txt"
+cp "$FIX/multisource/clang/cernet.txt" "$MS/mirror/ispip.clang.cn/cernet.txt"
 cp "$FIX/multisource/yfgao/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
 cp "$FIX/multisource/yfgao/unicom.txt" "$MS/mirror/china-operator-ip.yfgao.com/unicom.txt"
+cp "$FIX/multisource/yfgao/cmcc.txt" "$MS/mirror/china-operator-ip.yfgao.com/cmcc.txt"
+cp "$FIX/multisource/yfgao/cernet.txt" "$MS/mirror/china-operator-ip.yfgao.com/cernet.txt"
 
 cat > "$MS/ms.conf" <<'MS_CONF'
 ISP_TABLE="
@@ -1357,7 +1363,42 @@ else
 	sed 's/^/    /' "$MS/diff.log"
 fi
 
-# --- 12.2 老配置单源兼容（必须与 0.1.x 一致） ---
+# --- 12.2 0.2.1 默认模板：主源 yfgao + 校验自动启用 ---
+# 直接使用仓库里的 files/etc/isp-split.conf（含完整 10 行 ISP_TABLE），
+# 验证模板本身能跑通：4 类启用运营商全部映射，另外 6 类未映射且关闭应被跳过。
+cp "$ROOT/files/etc/isp-split.conf" "$MS/default.conf"
+
+if grep -q '^yfgao:primary:' "$ROOT/files/etc/isp-split.conf" &&
+	grep -q '^clang:verify:' "$ROOT/files/etc/isp-split.conf" &&
+	grep -q '^ISP_VERIFY_ENABLE=1' "$ROOT/files/etc/isp-split.conf"; then
+	ok "0.2.1 默认模板：yfgao 主源 + clang 校验 + 校验默认开启"
+else
+	ng "0.2.1 默认模板的源声明/开关不正确"
+fi
+
+rm -rf "$MS/base-default"
+if _ms_run "$MS/default.conf" "$MS/base-default" fetch >"$MS/default.log" 2>&1 &&
+	[ -s "$MS/base-default/data/chinatelecom.txt" ] &&
+	[ -s "$MS/base-default/data/cernet.txt" ] &&
+	[ -d "$MS/base-default/raw/clang" ]; then
+	ok "默认模板直接可跑：4 类启用运营商全部映射，校验源自动参与 diff"
+else
+	ng "默认模板 fetch 失败或未自动启用校验"
+	sed 's/^/    /' "$MS/default.log" 2>/dev/null
+fi
+
+if _ms_run "$MS/default.conf" "$MS/base-default" health --json 2>/dev/null |
+	grep -q '"verify_enabled":true' &&
+	_ms_run "$MS/default.conf" "$MS/base-default" health --json 2>/dev/null |
+	grep -q '"name":"clang","label":"clang","role":"verify".*"status":"ok"'; then
+	ok "默认模板的 health --json 标出 verify_enabled=true / clang 正常"
+else
+	ng "默认模板的 health --json 未标出校验已启用"
+	_ms_run "$MS/default.conf" "$MS/base-default" health --json 2>&1 |
+		sed 's/^/    /'
+fi
+
+# --- 12.4 老配置单源兼容（必须与 0.1.x 一致） ---
 rm -rf "$MS/base-legacy"
 if _ms_run "$MS/legacy.conf" "$MS/base-legacy" fetch >"$MS/legacy.log" 2>&1 &&
 	[ -s "$MS/base-legacy/data/chinatelecom.txt" ] &&
@@ -1377,7 +1418,7 @@ else
 	ng "老配置的源健康度未显示 ispip"
 fi
 
-# --- 12.3 校验源挂：降级继续 ---
+# --- 12.5 校验源挂：降级继续 ---
 rm -f "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
 rm -rf "$MS/base-degrade"
 _ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >"$MS/degrade.log" 2>&1
@@ -1402,7 +1443,7 @@ else
 	ng "plan 未输出数据源健康度"
 fi
 
-# --- 12.4 连续失败达到上限：升级为拒绝更新 ---
+# --- 12.6 连续失败达到上限：升级为拒绝更新 ---
 _ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >/dev/null 2>&1
 _ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >/dev/null 2>&1
 if _ms_run "$MS/ms.conf" "$MS/base-degrade" fetch >"$MS/escalate.log" 2>&1; then
@@ -1417,7 +1458,7 @@ else
 	fi
 fi
 
-# --- 12.5 分歧超阈值：拒绝 + quarantine 留档 + 旧数据不动 ---
+# --- 12.7 分歧超阈值：拒绝 + quarantine 留档 + 旧数据不动 ---
 cp "$FIX/multisource/yfgao-drift/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
 cp "$FIX/multisource/yfgao/unicom.txt" "$MS/mirror/china-operator-ip.yfgao.com/unicom.txt"
 rm -rf "$MS/base-drift"
@@ -1451,7 +1492,7 @@ else
 	find "$MS/base-drift/quarantine" -type f 2>/dev/null | sed 's/^/    /'
 fi
 
-# --- 12.6 主源不可用：冻结，旧数据不动 ---
+# --- 12.8 主源不可用：冻结，旧数据不动 ---
 rm -rf "$MS/base-freeze"
 cp "$FIX/multisource/yfgao/chinanet.txt" "$MS/mirror/china-operator-ip.yfgao.com/chinanet.txt"
 _ms_run "$MS/ms.conf" "$MS/base-freeze" fetch >/dev/null 2>&1
@@ -1470,7 +1511,7 @@ else
 	ng "主源失败后数据被改动"
 fi
 
-# --- 12.7 非法源角色被拒绝 ---
+# --- 12.9 非法源角色被拒绝 ---
 if _ms_run "$MS/badrole.conf" "$MS/base-bad" fetch >/dev/null 2>&1; then
 	ng "非法源角色（mirror）仍被接受"
 else
