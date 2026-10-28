@@ -204,6 +204,21 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
   校验源 [ispip.clang.cn](https://ispip.clang.cn)），本仓库只负责分流逻辑
 - 欢迎提交 PR；shell 请保持 busybox ash 兼容（禁止 bash 专属语法），改动请跑 `sh tools/selftest.sh`
 
+## 致谢
+
+站在这些项目的肩膀上，感谢：
+
+| 项目 | 贡献 |
+|---|---|
+| [OpenWrt](https://openwrt.org) & [LuCI](https://github.com/openwrt/luci) | 本项目生存的土壤——所有运行时框架（uci / rpcd / ubus / LuCI view API）都来自它们 |
+| [dl12345/mwan3](https://github.com/dl12345/mwan3)（mwan3-nft） | **本项目的基石**。nftables 原生的多 WAN 策略路由，`render_config_ipsets` + `loadfile` 机制让“1.3 万条网段交给 mwan3 自动管理”成为可能——没有它就没有这个项目 |
+| [gaoyifan/china-operator-ip](https://github.com/gaoyifan/china-operator-ip) | 默认主数据源。BGP AS_PATH 口径的运营商网段分类，MIT 许可，每日 GitHub Actions 自动更新 |
+| [ispip.clang.cn](https://ispip.clang.cn)（[@clangcn](https://github.com/clangcn/everyday-update-cn-isp-ip)） | 默认校验数据源，每日更新的运营商 CIDR。作为第二意见与主源交叉验证 |
+| [felixonmars/dnsmasq-china-list](https://github.com/felixonmars/dnsmasq-china-list) | 外部域名清单的兼容格式来源（`DOMAIN_LIST_DIR` 直接吃它的 `server=/域名/` 格式） |
+| [misakaio/chnroutes2](https://github.com/misakaio/chnroutes2) | `audit` 角色数据源（每小时更新的中国全网宣告段，可用于月度边界体检） |
+
+以及所有提交 issue、在非 x86 平台做实测反馈、帮忙传播的朋友们——分流工具的正确性最终要靠真实网络来验证。
+
 ## 许可
 
 本仓库代码 [MIT](LICENSE)。数据来源的许可红线：
