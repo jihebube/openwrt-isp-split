@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
-PKG_VERSION:=0.2.2
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -19,7 +19,7 @@ define Package/isp-split
 #   Kwrt 源里 nft 版的包名是 mwan3-nft，与其他源命名不一致。
 #   nftables 版 mwan3 是硬性前提，由 install.sh 与 router-preflight 检查，
 #   并在 description 里说明。
-  DEPENDS:=+nftables +curl
+  DEPENDS:=+nftables +curl +socat
   PKGARCH:=all
 endef
 

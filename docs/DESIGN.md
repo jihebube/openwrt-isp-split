@@ -109,6 +109,98 @@ mwan3 严格按配置文件顺序渲染 `mwan3_rules` 链，而 `uci add` 只能
 - mwan3 将标记存入 conntrack（`ct mark set`）并在子链入口以 `mark & 0x3f00 == 0` 作前置条件，因此已建立连接的后续包不会再次进入规则链——实测每个连接只有首包触发集合查找
 - 集合为 interval + auto-merge 的红黑树实现，典型 4 个启用集合约 2300 个元素占内核内存约 344 kB（约 150 B/元素，x86_64 实测示例）
 
+## 观测面：线路体检（0.3.0）
+
+分流解决“包走哪条线”，线路体检回答“这条线本身怎么样”。它是**只读观测面**：
+不写 mwan3 配置、不改 nft 规则、不装常驻进程；每次体检结束后除缓存和日志外
+不留下任何状态。
+
+### 探测路径：为什么必须绑设备
+
+路由器自己发起的探测同样经过 `inet mwan3 mwan3_output`，目标 IP 若落在
+`@isp_tel/@isp_uni` 等集合里，mwan3 会按策略打标，把探针带到另一条线：
+
+- 只绑源 IP（如 `netcat -s`）不够：`ip route get ... from <src> mark 0x500`
+  仍会选择策略表里的另一条设备；
+- `curl --interface <l3_device>` 与 `socat ...,so-bindtodevice=<l3_device>`
+  通过 `SO_BINDTODEVICE` 把 `oif` 带进路由查找，设备绑定优先于 mark。
+
+因此：
+
+| 探测 | 绑定方式 |
+|---|---|
+| 出口 IP | `curl --interface <l3_device>` |
+| 四段延迟 | `curl --interface <l3_device> --resolve <域名>:443:<已校验 IP>` |
+| UDP STUN | `socat -T <n> - UDP4:<ip>:<port>,bind=:<同一本地端口>,so-bindtodevice=<l3_device>` |
+| DNS | 系统 resolver；不承诺按线解析，解析后用 `@isp_*` 校验归属 |
+
+`l3_device` 取 `ifstatus <接口> | jsonfilter -e '@.l3_device'`，PPPoE 下是
+`pppoe-wan1` 而不是底层 VLAN；这与 `dns` 子命令的 `policy_device()` 同源。
+
+### 目标从哪来：域名清单 + 集合校验
+
+不从 `@isp_*` 的上万条 CIDR 里随机抽 IP：命中 443 的概率低、行为像端口扫描，
+也无法保证是“该运营商的真实业务节点”。正确做法是：
+
+1. `LINE_CHECK_TARGETS` 维护每家 2 个域名；
+2. 运行时用系统 DNS 解析；
+3. 对每个 IPv4 执行 `nft get element inet mwan3 <set> "{ IP }"`，命中才认为
+   是“同运营商目标”；
+4. `curl --resolve` 把连接钉到这个 IP，避免二次解析换节点；
+5. 全部失败才用 `LINE_CHECK_BASELINE` 做跨网连通性基线，并标记
+   `mode=baseline`、延迟项上限 15 分。
+
+HTTP 用 `GET + Range: bytes=0-0` 和浏览器 UA：实测 `www.chinatelecom.com.cn`
+对默认 curl UA 返回 412，换浏览器 UA 后 200；HEAD 在多个站点被 403/520。
+
+### NAT：五态，不做 NAT1-4
+
+RFC 3489 的完整分类需要 `CHANGE-REQUEST` / `OTHER-ADDRESS` 和至少 3 个
+探测点；公网 STUN 服务器基本不配合（实测 bilibili 只回原地址，其余超时）。
+所以 0.3.0 只承诺行为描述：
+
+```
+公网（可直接映射） / 锥形 NAT（未细分） / 对称或多出口 NAT / CGNAT（含多层 NAT） / 未知
+```
+
+判定逻辑（同一本地端口、两个不同 IP 的 Binding Response）：
+
+| 观测 | 判定 |
+|---|---|
+| WAN IP ∈ `100.64.0.0/10` | CGNAT（优先于 STUN） |
+| 任一映射是私网/CGNAT | 多层 NAT → CGNAT 档 |
+| 两个映射 `IP:port` 完全相同且 WAN 公网、端口未转换 | 公网 |
+| 两个映射完全相同（有转换） | 锥形 |
+| 两个映射不同 | 对称/多出口 |
+| 都超时或坏包 | 未知 |
+
+解析器校验 magic cookie、transaction id、消息类型和属性边界；32/84 字节
+响应与坏包 fixture 由 `tools/linecheck-fixtures.sh` 生成并进入 selftest。
+UDP 3478 被阻断时只把 NAT 标“未知”，不影响延迟/归属地/评分其他项。
+
+### 评分是可解释的，不是黑盒
+
+总分 100 = 出口类型 30 + 延迟 30 + 稳定性 25 + 可用性 15。每条得分都带
+`reason`，并列出硬上限（CGNAT/对称/丢包>20%/同网>160ms → 69 分上限）。
+阈值是工程初值，只用于**同一路由器多条线横向比较**，不跨地区比较；后续可用
+真实线路校准。JSON 里保留 `breakdown`、`caps` 和原始样本，LuCI 不允许只显示
+一个总分。
+
+### 隐私边界
+
+归属地是唯一的第三方请求：只发送每条 WAN 的**出口公网 IP**，不发内网地址、
+设备名、MAC 或流量内容。默认百度（HTTPS）优先、ip-api（HTTP）兜底，按
+“IP + provider”缓存 24h。`LINE_CHECK_GEO=0` 时不发任何请求；关闭后仍可用
+本地集合判断运营商大类。UI 与文档都显式写出“ip-api 使用 HTTP 不加密”。
+
+### 缓存与预算
+
+- 结果按 WAN 集合缓存到 `state/linecheck/`，`LINE_CHECK_MIN_INTERVAL` 内
+  重复调用直接返回（`cached=true`、`age`），`--force` 绕过；
+- 单条 WAN 有 `LINE_CHECK_BUDGET` 预算，超时后跳过剩余 STUN/归属地并标注，
+  避免 rpcd/LuCI 超时；
+- 目标失败早停（连续两次失败换下一个），正常路径通常 3-10 秒。
+
 ## 与代理（OpenClash / sing-box）共存
 
 | 组件 | 挂载点 | 标记 |

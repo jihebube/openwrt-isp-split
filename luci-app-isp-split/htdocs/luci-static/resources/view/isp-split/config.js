@@ -125,7 +125,8 @@ return view.extend({
 			policies: [],
 			isp: [],
 			dns: [],
-			domains: []
+			domains: [],
+			lc: { enable: true, geo: true, provider: 'auto', interval: 60 }
 		};
 
 		out.split('\n').forEach(function(line) {
@@ -146,6 +147,14 @@ return view.extend({
 				model.dns.push({ policy: f[1], dns: f[2], test: null });
 			else if (f[0] === 'domain' && f.length >= 3)
 				model.domains.push({ domain: f[1], policy: f[2] });
+			else if (f[0] === 'line_check_enable')
+				model.lc.enable = (f[1] || '1') === '1';
+			else if (f[0] === 'line_check_geo')
+				model.lc.geo = (f[1] || '1') === '1';
+			else if (f[0] === 'line_check_provider')
+				model.lc.provider = f[1] || 'auto';
+			else if (f[0] === 'line_check_interval')
+				model.lc.interval = parseInt(f[1], 10) || 60;
 		});
 
 		if (!model.isp.length) {
@@ -528,6 +537,83 @@ return view.extend({
 			}
 		}, [ svgIcon('plus'), E('span', {}, [_('添加域名')]) ]);
 
+		/* ============================================================ 三、线路体检 */
+
+		var lcEnable = E('input', { 'type': 'checkbox', 'checked': model.lc.enable ? '' : null });
+		lcEnable.addEventListener('change', function() { model.lc.enable = lcEnable.checked; });
+
+		var lcGeo = E('input', { 'type': 'checkbox', 'checked': model.lc.geo ? '' : null });
+		lcGeo.addEventListener('change', function() {
+			model.lc.geo = lcGeo.checked;
+			lcProvider.disabled = !lcGeo.checked;
+		});
+
+		var lcProvider = E('select', { 'class': 'cbi-input-select', 'disabled': model.lc.geo ? null : '' },
+			[
+				['auto', _('自动（百度优先，失败转 ip-api）')],
+				['baidu', _('只用百度（HTTPS）')],
+				['ip-api', _('只用 ip-api（HTTP，明文）')],
+				['off', _('关闭')]
+			].map(function(o) {
+				return E('option', { 'value': o[0], 'selected': model.lc.provider === o[0] ? '' : null }, [ o[1] ]);
+			}));
+		lcProvider.addEventListener('change', function() { model.lc.provider = lcProvider.value; });
+
+		var lcInterval = E('input', {
+			'type': 'number', 'class': 'cbi-input-text', 'min': '15', 'max': '3600',
+			'value': String(model.lc.interval || 60)
+		});
+		var lcIntervalErr = errBox();
+		lcInterval.addEventListener('input', function() {
+			var n = parseInt(lcInterval.value, 10);
+			model.lc.interval = isNaN(n) ? 0 : n;
+			if (model.lc.interval < 15 || model.lc.interval > 3600) {
+				setErr(lcIntervalErr, _('必须是 15-3600 之间的整数秒'));
+				model.lc._valid = false;
+			} else {
+				setErr(lcIntervalErr, '');
+				model.lc._valid = true;
+			}
+		});
+		model.lc._valid = !(model.lc.interval < 15 || model.lc.interval > 3600);
+
+		var lcSection = E('section', { 'class': 'isp-section' }, [
+			E('h3', {}, [ _('线路体检') ]),
+			E('p', { 'class': 'isp-desc' }, [
+				_('对每条 WAN 做出口类型、四段延迟、NAT 与归属地检查。体检只读，不修改 mwan3/nft 规则。')
+			]),
+			E('table', { 'class': 'isp-form-table' }, [
+				E('tbody', {}, [
+					E('tr', {}, [
+						E('td', { 'data-th': _('启用') }, [
+							E('label', { 'class': 'isp-switch' }, [ lcEnable, E('span') ]),
+							E('div', { 'class': 'lc-hint' }, [ _('关闭后命令行与页面都不再执行体检') ])
+						]),
+						E('td', { 'data-th': _('归属地查询') }, [
+							E('label', { 'class': 'isp-switch' }, [ lcGeo, E('span') ]),
+							E('div', { 'class': 'lc-hint' }, [
+								_('关闭后不发起任何第三方归属地请求，卡片显示“未查询”')
+							])
+						])
+					]),
+					E('tr', {}, [
+						E('td', { 'data-th': _('归属地服务商') }, [ lcProvider ]),
+						E('td', { 'data-th': _('最小间隔') }, [
+							E('div', { 'class': 'lc-inline' }, [
+								lcInterval, E('span', { 'class': 'lc-hint' }, [ _('秒（15-3600）') ])
+							]),
+							lcIntervalErr
+						])
+					])
+				])
+			]),
+			E('div', { 'class': 'isp-note lc-privacy-note' }, [
+				_('隐私说明：开启归属地后，体检会把每条 WAN 的出口公网 IP 发送给第三方（默认百度，失败时 ip-api.com）查询归属地。'),
+				_('只发送出口 IP，不发送内网地址、设备名、MAC、流量内容。ip-api 使用 HTTP，传输不加密；介意时请选择“关闭”或“只用百度”。'),
+				_('关闭后省/市显示“未查询”，但仍会用本地 @isp_* 集合判断运营商大类，不需要外发。')
+			])
+		]);
+
 		/* ============================================================ 四、数据源（只读） */
 
 		/* 数据源地址是 root 路径的下载入口，配置页不开放编辑：
@@ -616,7 +702,11 @@ return view.extend({
 				isp: ispVal,
 				dns: dnsVal,
 				dom: domVal,
-				mode: modeSel.value
+				mode: modeSel.value,
+				lcEnable: model.lc.enable ? '1' : '0',
+				lcGeo: model.lc.geo ? '1' : '0',
+				lcProvider: model.lc.provider,
+				lcInterval: String(model.lc.interval || 60)
 			};
 		}
 
@@ -630,6 +720,12 @@ return view.extend({
 			if (!model.isp.length) {
 				ui.addNotification(null, E('p', {}, [
 					_('至少保留一行运营商映射')
+				]), 'danger');
+				ok = false;
+			}
+			if (!model.lc._valid) {
+				ui.addNotification(null, E('p', {}, [
+					_('线路体检的最小间隔必须是 15-3600 之间的整数秒')
 				]), 'danger');
 				ok = false;
 			}
@@ -674,7 +770,11 @@ return view.extend({
 				'isp_table', v.isp,
 				'dns_table', v.dns,
 				'domain_split', v.dom,
-				'dns_mode', v.mode
+				'dns_mode', v.mode,
+				'line_check_enable', v.lcEnable,
+				'line_check_geo', v.lcGeo,
+				'line_check_provider', v.lcProvider,
+				'line_check_interval', v.lcInterval
 			]).then(function(r) {
 				showResult(((r.stdout || '') + (r.stderr || '')) || '(无输出)');
 				ui.addNotification(null, E('p', {}, [_('预检完成，配置未被修改')]), 'info');
@@ -698,6 +798,10 @@ return view.extend({
 				.then(function() { return step(['conf', 'set', 'dns_table', v.dns], log); })
 				.then(function() { return step(['conf', 'set', 'domain_split', v.dom], log); })
 				.then(function() { return step(['conf', 'set', 'dns_mode', v.mode], log); })
+				.then(function() { return step(['conf', 'set', 'line_check_enable', v.lcEnable], log); })
+				.then(function() { return step(['conf', 'set', 'line_check_geo', v.lcGeo], log); })
+				.then(function() { return step(['conf', 'set', 'line_check_provider', v.lcProvider], log); })
+				.then(function() { return step(['conf', 'set', 'line_check_interval', v.lcInterval], log); })
 				.then(function() {
 					if (!apply)
 						return null;
@@ -801,6 +905,9 @@ return view.extend({
 				]),
 				E('div', { 'class': 'isp-btn-row' }, [ addDomBtn ])
 			]),
+
+			/* ---- 线路体检 ---- */
+			lcSection,
 
 			/* ---- 数据源（只读） ---- */
 			E('section', { 'class': 'isp-section' }, [

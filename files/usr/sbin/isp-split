@@ -15,7 +15,7 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.2.2"
+ISP_VERSION="0.3.0"
 
 # 配置表里的注释行（# 开头，允许前导空白）必须在按空白展开之前整行删掉
 # （B-1）。否则 `for row in $ISP_TABLE` 会把 "#" 与后面的文字拆成两个
@@ -3209,6 +3209,14 @@ conf_get() {
 		awk -F: 'NF >= 2 { printf "dns\t%s\t%s\n", $1, $2 }'
 	_conf_table DOMAIN_SPLIT | tr -s ' \t' '\n' |
 		awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
+	_lc_g=$(_conf_val LINE_CHECK_GEO); [ -n "$_lc_g" ] || _lc_g=1
+	_lc_gp=$(_conf_val LINE_CHECK_GEO_PROVIDER); [ -n "$_lc_gp" ] || _lc_gp=auto
+	_lc_mi=$(_conf_val LINE_CHECK_MIN_INTERVAL); [ -n "$_lc_mi" ] || _lc_mi=60
+	_lc_en=$(_conf_val LINE_CHECK_ENABLE); [ -n "$_lc_en" ] || _lc_en=1
+	printf 'line_check_enable\t%s\n' "$_lc_en"
+	printf 'line_check_geo\t%s\n' "$_lc_g"
+	printf 'line_check_provider\t%s\n' "$_lc_gp"
+	printf 'line_check_interval\t%s\n' "$_lc_mi"
 }
 
 # ---- 配置字段白名单 ----
@@ -3389,6 +3397,25 @@ _conf_validate() {
 		*) die "DNS_MODE 只能是 bind 或 mark" ;;
 		esac
 		;;
+	LINE_CHECK_ENABLE | LINE_CHECK_GEO)
+		case "$_val" in
+		0 | 1) ;;
+		*) die "$_key 只能是 0 或 1" ;;
+		esac
+		;;
+	LINE_CHECK_GEO_PROVIDER)
+		case "$_val" in
+		auto | baidu | ip-api | off) ;;
+		*) die "LINE_CHECK_GEO_PROVIDER 只能是 auto / baidu / ip-api / off" ;;
+		esac
+		;;
+	LINE_CHECK_MIN_INTERVAL)
+		case "$_val" in
+		'' | *[!0-9]*) die "LINE_CHECK_MIN_INTERVAL 必须是整数秒（15-3600）" ;;
+		esac
+		[ "$_val" -ge 15 ] && [ "$_val" -le 3600 ] ||
+			die "LINE_CHECK_MIN_INTERVAL 必须在 15-3600 之间"
+		;;
 	*)
 		die "未知配置项 '$_key'"
 		;;
@@ -3406,7 +3433,11 @@ _conf_write() {
 	dns_table) _key=DNS_TABLE ;;
 	domain_split) _key=DOMAIN_SPLIT ;;
 	dns_mode) _key=DNS_MODE ;;
-	*) die "未知配置项 '$_key'，可选：isp_table / dns_table / domain_split / dns_mode" ;;
+	line_check_enable) _key=LINE_CHECK_ENABLE ;;
+	line_check_geo) _key=LINE_CHECK_GEO ;;
+	line_check_provider) _key=LINE_CHECK_GEO_PROVIDER ;;
+	line_check_interval) _key=LINE_CHECK_MIN_INTERVAL ;;
+	*) die "未知配置项 '$_key'，可选：isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval" ;;
 	esac
 
 	# 写入前必须通过白名单校验；失败即 die，绝不落盘
@@ -3490,7 +3521,7 @@ _conf_write() {
 conf_set() {
 	_key=${1:-}
 	_val=${2:-}
-	[ -n "$_key" ] || die "用法: isp-split conf set <isp_table|dns_table|domain_split|dns_mode> <值>"
+	[ -n "$_key" ] || die "用法: isp-split conf set <isp_table|dns_table|domain_split|dns_mode|line_check_enable|line_check_geo|line_check_provider|line_check_interval> <值>"
 	[ -f "$CONF" ] || die "找不到 $CONF"
 
 	# 允许用 | 代替换行（前端传参更省事）
@@ -3518,7 +3549,11 @@ conf_check() {
 	dns_table) _ck_key=DNS_TABLE ;;
 	domain_split) _ck_key=DOMAIN_SPLIT ;;
 	dns_mode) _ck_key=DNS_MODE ;;
-	*) die "未知配置项 '$_ck_key'，可选：isp_table / dns_table / domain_split / dns_mode" ;;
+	line_check_enable) _ck_key=LINE_CHECK_ENABLE ;;
+	line_check_geo) _ck_key=LINE_CHECK_GEO ;;
+	line_check_provider) _ck_key=LINE_CHECK_GEO_PROVIDER ;;
+	line_check_interval) _ck_key=LINE_CHECK_MIN_INTERVAL ;;
+	*) die "未知配置项 '$_ck_key'，可选：isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval" ;;
 	esac
 	_conf_validate "$_ck_key" "$_ck_val" || return $?
 	echo "$_ck_key 校验通过"
@@ -3867,6 +3902,1706 @@ cmd_uninstall() {
 	log "已卸载（nft 集合随 mwan3 reload 一并消失）"
 }
 
+# ---------------------------------------------------------------- linecheck
+#
+# 线路体检（0.3.0 MVP）：对每条 WAN 做
+#   1. 本机口 IP 分类（公网 / CGNAT / 私网）
+#   2. curl --interface 取出口公网 IP（与 WAN IP 交叉判断多层 NAT）
+#   3. 同运营商目标四段延迟（DNS / TCP / TLS / 首字节）+ 抖动 + 丢包
+#   4. 归属地（百度 / ip-api，可关；只发出口 IP）
+#   5. socat so-bindtodevice 双 STUN 探测（同一本地端口、两个不同 IP）
+#   6. 公开规则表评分 + 硬上限 + 一句话建议
+#
+# 设计约束（详见 LINE-CHECK-FEASIBILITY.md）：
+#   · 只承诺五态：公网 / 锥形 / 对称（或多出口）/ CGNAT / 未知，
+#     不做 NAT1-4 细分——公网 STUN 基本不支持 CHANGE-REQUEST。
+#   · TCP 用 curl --interface <l3_device>，UDP 用 socat so-bindtodevice，
+#     只绑源 IP 会被 mwan3 的 mark 带回另一条线。
+#   · 不改用户 nft 规则；失败只降级单项，不让整张卡变红。
+#   · 结果缓存 60s（LINE_CHECK_MIN_INTERVAL），--force 绕过。
+
+# 默认目标表。只存域名：运行时解析，再用 @isp_* 集合校验归属。
+# 不随机抽集合里的 IP（命中率低、像端口扫描、也无法保证 443 可用）。
+LC_DEFAULT_TARGETS='
+chinatelecom:www.chinatelecom.com.cn,www.21cn.com
+unicom_cnc:www.10010.com,www.chinaunicom.com.cn
+cmcc:www.migu.cn,www.10086.com.cn
+cernet:www.tsinghua.edu.cn,www.pku.edu.cn
+'
+# 默认 STUN：多服务器，运行时探测，失败自动换下一个。
+LC_DEFAULT_STUN='
+stun.miwifi.com:3478
+stun.douyucdn.cn:18000
+stun.freeswitch.org:3478
+stun.cloudflare.com:3478
+'
+LC_DEFAULT_ECHO='https://api.ipify.org,https://ipv4.icanhazip.com'
+# 部分站点对默认 curl UA 直接 412/418（实测 www.chinatelecom.com.cn），
+# 必须带浏览器 UA；Range 只取 1 字节，避免 CDN 把体检当成下载。
+LC_DEFAULT_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+LC_DEFAULT_ACCEPT='text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+
+LC_CACHE=$STATE_DIR/linecheck
+
+_lc_opt() { # <变量名> <默认值>
+	eval "_lc_o=\${$1-}"
+	if [ -z "$_lc_o" ]; then _lc_o=$2; fi
+	printf '%s' "$_lc_o"
+}
+
+_lc_now() { date +%s; }
+
+# /proc/uptime 是百分之一秒精度；比 date +%s 更适合测 STUN 的 10-200ms RTT。
+_lc_uptime_ms() {
+	awk '{ printf "%d", $1 * 1000 }' /proc/uptime 2>/dev/null || echo 0
+}
+
+_lc_json_esc() {
+	printf '%s' "${1:-}" |
+		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/ /g' |
+		tr -d '\r\n' |
+		sed -e 's/[[:cntrl:]]//g'
+}
+
+_lc_json_str() { # 输出带引号的 JSON 字符串
+	printf '"%s"' "$(_lc_json_esc "$1")"
+}
+
+_lc_int() {
+	case "${1:-}" in '' | *[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac
+}
+
+# ---- IPv4 ----
+
+_lc_ip_valid() {
+	case "${1:-}" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+	printf '%s' "$1" | awk -F. 'NF == 4 && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255 { ok = 1 } END { exit(ok ? 0 : 1) }'
+}
+
+
+_lc_in_net() { # <ip> <net> <bits>
+	# 用 awk 做 32 位比较：32 位 ARM/MIPS 上 busybox ash 的算术是 long，
+	# 直接 $(( )) 会把 192.168.x 这类 >2^31 的整数溢出成负数。
+	awk -v ip="$1" -v net="$2" -v bits="$3" 'BEGIN {
+		if (split(ip, a, ".") != 4 || split(net, b, ".") != 4) exit 1
+		ipn = ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+		nn  = ((b[1] * 256 + b[2]) * 256 + b[3]) * 256 + b[4]
+		scale = 2 ^ (32 - bits)
+		exit (int(ipn / scale) == int(nn / scale) ? 0 : 1)
+	}'
+}
+
+# public | cgnat | private | invalid
+_lc_ip_class() {
+	_ip=${1:-}
+	[ -n "$_ip" ] || { printf 'invalid'; return; }
+	_lc_ip_valid "$_ip" || { printf 'invalid'; return; }
+	case "$_ip" in
+	0.* | 127.* | 169.254.* | 198.18.* | 198.19.* | 224.* | 225.* | 226.* | 227.* | 228.* | 229.* | 230.* | 231.* | 232.* | 233.* | 234.* | 235.* | 236.* | 237.* | 238.* | 239.* | 255.*)
+		printf 'private'; return ;;
+	esac
+	_lc_in_net "$_ip" 100.64.0.0 10 && { printf 'cgnat'; return; }
+	_lc_in_net "$_ip" 10.0.0.0 8 && { printf 'private'; return; }
+	_lc_in_net "$_ip" 172.16.0.0 12 && { printf 'private'; return; }
+	_lc_in_net "$_ip" 192.168.0.0 16 && { printf 'private'; return; }
+	printf 'public'
+}
+
+# ---- 时间/数值 ----
+
+_lc_ms() { # curl 秒 -> 整数毫秒
+	case "${1:-}" in '' | *[!0-9.]*) printf '0' ;; esac
+	awk -v v="$1" 'BEGIN { if (v <= 0) { print 0; exit } printf "%d", int(v * 1000 + 0.5) }'
+}
+
+_lc_median() { # 空格分隔的整数列表
+	printf '%s\n' "$1" | tr ' ' '\n' | awk 'NF && $1 ~ /^[0-9]+$/ { a[n++] = $1 }
+		END {
+			if (n == 0) { print ""; exit }
+			for (i = 1; i < n; i++)
+				for (j = i + 1; j <= n; j++)
+					if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+			if (n % 2) print a[(n + 1) / 2]
+			else printf "%d", int((a[n / 2] + a[n / 2 + 1]) / 2 + 0.5)
+		}'
+}
+
+_lc_jitter() { # max-min
+	printf '%s\n' "$1" | tr ' ' '\n' | awk '
+		NF && $1 ~ /^[0-9]+$/ { if (n == 0 || $1 < mn) mn = $1; if (n == 0 || $1 > mx) mx = $1; n++ }
+		END { if (n < 2) print 0; else printf "%d", mx - mn }'
+}
+
+_lc_fmt_ms() {
+	case "${1:-}" in '' | *[!0-9]*) printf '—' ;; *) printf '%sms' "$1" ;; esac
+}
+
+# ---- 配置/表 ----
+
+_lc_targets_raw() { _lc_opt LINE_CHECK_TARGETS "$LC_DEFAULT_TARGETS"; }
+_lc_stun_raw() { _lc_opt LINE_CHECK_STUN_SERVERS "$LC_DEFAULT_STUN"; }
+_lc_echo_raw() { _lc_opt LINE_CHECK_ECHO_URLS "$LC_DEFAULT_ECHO"; }
+_lc_ua() { _lc_opt LINE_CHECK_UA "$LC_DEFAULT_UA"; }
+_lc_timeout() {
+	_t=$(_lc_int "$(_lc_opt LINE_CHECK_TIMEOUT 3)")
+	[ "$_t" -ge 1 ] 2>/dev/null || _t=3
+	[ "$_t" -le 10 ] 2>/dev/null || _t=10
+	printf '%s' "$_t"
+}
+_lc_budget() {
+	_b=$(_lc_int "$(_lc_opt LINE_CHECK_BUDGET 20)")
+	[ "$_b" -ge 8 ] 2>/dev/null || _b=20
+	printf '%s' "$_b"
+}
+
+# 运营商源名 -> nft 集合名（ISP_TABLE 第 2 列）
+
+_lc_set_for() { # <源名>
+	_old_ifs=$IFS
+	_want=$1
+	for _row in $ISP_TABLE; do
+		IFS=:
+		set -- $_row
+		IFS=$_old_ifs
+		[ "${1:-}" = "$_want" ] && { printf '%s' "${2:-}"; return 0; }
+	done
+	IFS=$_old_ifs
+	return 0
+}
+
+# IP 属于哪个运营商集合（本地判断，不外发）
+_lc_ip_isp() { # <ip>
+	_ip=${1:-}
+	_lc_ip_valid "$_ip" || return 0
+	command -v nft >/dev/null 2>&1 || return 0
+	nft list table inet mwan3 >/dev/null 2>&1 || return 0
+	_old_ifs=$IFS
+	for _row in $ISP_TABLE; do
+		IFS=:
+		set -- $_row
+		IFS=$_old_ifs
+		[ "${4:-0}" = "1" ] || continue
+		[ -n "${2:-}" ] || continue
+		if nft get element inet mwan3 "$2" "{ $_ip }" >/dev/null 2>&1; then
+			printf '%s' "$1"
+			return 0
+		fi
+	done
+	IFS=$_old_ifs
+	return 0
+}
+
+_lc_valid_host() {
+	case "${1:-}" in '' | *[!A-Za-z0-9._-]* | .* | *. | *..*) return 1 ;; esac
+	return 0
+}
+
+_lc_valid_port() {
+	case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+# 解析域名 -> 前 N 个 IPv4（系统 resolver；不承诺按线解析）
+_lc_resolve() { # <domain> [max]
+	_d=${1:-}
+	_n=${2:-3}
+	_lc_valid_host "$_d" || return 0
+	if [ -n "${ISP_SPLIT_LC_RESOLVE_IPS:-}" ]; then
+		printf '%s' "$ISP_SPLIT_LC_RESOLVE_IPS" | tr ',' '\n' | head -n "$_n"
+		return 0
+	fi
+	command -v nslookup >/dev/null 2>&1 || return 0
+	nslookup "$_d" 2>/dev/null | awk -v max="$_n" '
+		/^Name:/ { seen = 1; next }
+		seen && /^Address/ {
+			ip = $NF
+			if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && !(ip in got)) {
+				got[ip] = 1
+				print ip
+				n++
+				if (n >= max) exit
+			}
+		}
+	'
+}
+
+# ---- WAN 枚举 ----
+
+_lc_dev_ip() {
+	ip -4 addr show dev "$1" 2>/dev/null |
+		awk '/^[[:space:]]*inet / { sub(/\/.*/, "", $2); print $2; exit }'
+}
+
+# 输出 TSV：iface<TAB>device<TAB>up(0/1)<TAB>state<TAB>wan_ip
+_lc_wans() {
+	# 自检/夹具模式：ISP_SPLIT_LC_WANS="wan1|wan1|1|online|100.64.1.2 ..."
+	if [ -n "${ISP_SPLIT_LC_WANS:-}" ]; then
+		printf '%s\n' "$ISP_SPLIT_LC_WANS" | tr ' ' '\n' | while IFS='|' read -r _a _b _c _d _e; do
+			[ -n "$_a" ] || continue
+			printf '%s\t%s\t%s\t%s\t%s\n' "$_a" "${_b:-$_a}" "${_c:-1}" "${_d:-online}" "${_e:-}"
+		done
+		return 0
+	fi
+	command -v uci >/dev/null 2>&1 || return 0
+	_seen=" "
+	for _i in $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^=]*\)=interface$/\1/p'); do
+		_en=$(uci -q get "mwan3.$_i.enabled" 2>/dev/null)
+		[ "$_en" = "1" ] || continue
+		_fam=$(uci -q get "mwan3.$_i.family" 2>/dev/null)
+		[ "$_fam" = "ipv6" ] && continue
+		_dev=$(ifstatus "$_i" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+		[ -n "$_dev" ] || _dev=$(uci -q get "network.$_i.device" 2>/dev/null)
+		[ -n "$_dev" ] || continue
+		case "$_seen" in *" $_dev "*) continue ;; esac
+		_seen="$_seen$_dev "
+		_up=$(ifstatus "$_i" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+		case "$_up" in
+		true) _state=online; _upn=1 ;;
+		false) _state=offline; _upn=0 ;;
+		*) _state=unknown; _upn=0 ;;
+		esac
+		_ip=$(ifstatus "$_i" 2>/dev/null | jsonfilter -e '@.["ipv4-address"][0].address' 2>/dev/null)
+		[ -n "$_ip" ] || _ip=$(_lc_dev_ip "$_dev")
+		printf '%s\t%s\t%s\t%s\t%s\n' "$_i" "$_dev" "$_upn" "$_state" "$_ip"
+	done
+}
+
+# --wan 指定：接受 mwan3 逻辑接口名，也接受运行时设备名（如 pppoe-wan1 / br-lan）
+_lc_wan_one() {
+	_want=$1
+	case "$_want" in '' | *[!A-Za-z0-9_.-]*) return 1 ;; esac
+	if [ -n "${ISP_SPLIT_LC_WANS:-}" ]; then
+		printf '%s\n' "$ISP_SPLIT_LC_WANS" | tr ' ' '\n' | while IFS='|' read -r _a _b _c _d _e; do
+			[ "$_a" = "$_want" ] || [ "${_b:-}" = "$_want" ] || continue
+			printf '%s\t%s\t%s\t%s\t%s\n' "$_a" "${_b:-$_a}" "${_c:-1}" "${_d:-online}" "${_e:-}"
+			return 0
+		done
+		return 0
+	fi
+	_dev=$(ifstatus "$_want" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	_logical=$_want
+	if [ -z "$_dev" ]; then
+		if [ -d "/sys/class/net/$_want" ]; then
+			_dev=$_want
+		else
+			return 1
+		fi
+	fi
+	_up=$(ifstatus "$_want" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
+	case "$_up" in
+	true) _state=online; _upn=1 ;;
+	false) _state=offline; _upn=0 ;;
+	*)
+		# --wan 可以是裸设备（如 br-lan / pppoe-wan1）：ifstatus 不认，
+		# 用 operstate 判断，否则会把一条好好的线判成“未连接”。
+		if [ -d "/sys/class/net/$_dev" ]; then
+			case "$(cat "/sys/class/net/$_dev/operstate" 2>/dev/null)" in
+			up) _state=online; _upn=1 ;;
+			down) _state=offline; _upn=0 ;;
+			*)
+				# PPPoE 的 operstate 常是 unknown；看 ip link 的 UP 标志
+				if ip -o link show dev "$_dev" 2>/dev/null | grep -q '<[^>]*UP'; then
+					_state=online; _upn=1
+				else
+					_state=unknown; _upn=0
+				fi
+				;;
+			esac
+		else
+			_state=unknown
+			_upn=0
+		fi
+		;;
+	esac
+	[ -d "/sys/class/net/$_dev" ] || _upn=0
+	_ip=$(ifstatus "$_want" 2>/dev/null | jsonfilter -e '@.["ipv4-address"][0].address' 2>/dev/null)
+	[ -n "$_ip" ] || _ip=$(_lc_dev_ip "$_dev")
+	printf '%s\t%s\t%s\t%s\t%s\n' "$_logical" "$_dev" "$_upn" "$_state" "$_ip"
+}
+
+# ---- 出口 IP ----
+
+_lc_exit_ip() { # <device> -> ip 或空
+	_dev=$1
+	# 夹具模式：ISP_SPLIT_LC_EXIT_IPS="1.2.3.4,5.6.7.8"，none 表示失败
+	if [ -n "${ISP_SPLIT_LC_EXIT_IPS:-}" ]; then
+		printf '%s' "$ISP_SPLIT_LC_EXIT_IPS" | awk -v idx="${LC_IDX:-1}" -F, '
+			$idx != "none" && $idx ~ /^[0-9.]+$/ { print $idx }'
+		return 0
+	fi
+	command -v curl >/dev/null 2>&1 || return 0
+	_old_ifs=$IFS
+	IFS=,
+	for _u in $(_lc_echo_raw); do
+		IFS=$_old_ifs
+		_r=$(curl -sS --interface "$_dev" --connect-timeout 3 -m 5 \
+			-A "$(_lc_ua)" "$_u" 2>/dev/null | tr -d '[:space:]' | head -c 64)
+		_lc_ip_valid "$_r" && { printf '%s' "$_r"; return 0; }
+	done
+	IFS=$_old_ifs
+	return 0
+}
+
+# ---- 目标选择（报告 §3.3） ----
+
+_lc_target_domains() { # <源名> -> 空格分隔域名
+	_old_ifs=$IFS
+	for _row in $(_lc_targets_raw); do
+		IFS=:
+		set -- $_row
+		IFS=$_old_ifs
+		if [ "${1:-}" = "${_lc_t_src:-}" ]; then
+			printf '%s' "${2:-}" | tr ',' ' '
+			return 0
+		fi
+	done
+	IFS=$_old_ifs
+	return 0
+}
+
+_lc_target_groups() { # <源名>，只输出该运营商的域名；未知则交给跨网基线
+	_own=${1:-}
+	[ -n "$_own" ] || return 0
+	_old_ifs=$IFS
+	for _row in $(_lc_targets_raw); do
+		IFS=:
+		set -- $_row
+		IFS=$_old_ifs
+		[ "${1:-}" = "$_own" ] || continue
+		for _d in $(printf '%s' "${2:-}" | tr ',' ' '); do
+			printf '%s\t%s\n' "$_own" "$_d"
+		done
+	done
+	IFS=$_old_ifs
+}
+
+# ---- STUN ----
+#
+# 报文：00 01 00 00 21 12 A4 42 + 12 字节 transaction id（共 20 字节）。
+# 响应解析：XOR-MAPPED-ADDRESS(0x0020) / MAPPED-ADDRESS(0x0001)；
+# 端口 ^ 0x2112，IPv4 与 21 12 A4 42 逐字节异或；属性按 4 字节对齐。
+
+_lc_stun_build() { # <request-file> -> 打印 txid(24 hex)
+	_req=$1
+	{ printf '\000\001\000\000\041\022\244\102'; dd if=/dev/urandom bs=12 count=1 2>/dev/null; } >"$_req" ||
+		return 1
+	hexdump -v -n 12 -s 8 -e '12/1 "%02x"' "$_req"
+}
+
+_lc_hex2ip() { # 8 个 hex 字符 -> 点分十进制
+	_h=${1:-}
+	[ "${#_h}" -eq 8 ] || return 1
+	printf '%d.%d.%d.%d' \
+		"$((0x${_h%??????}))" \
+		"$((0x$(printf '%s' "$_h" | cut -c3-4)))" \
+		"$((0x$(printf '%s' "$_h" | cut -c5-6)))" \
+		"$((0x$(printf '%s' "$_h" | cut -c7-8)))"
+}
+
+# 解析 STUN 响应。成功打印 "ip port"，失败返回 1。
+# 校验：长度、消息类型 0x0101、magic cookie、transaction id、属性边界。
+_lc_stun_parse() { # <response-file> <expected-txid-hex>
+	_f=$1
+	_txid=$2
+	[ -f "$_f" ] || return 1
+	_hex=$(hexdump -v -e '1/1 "%02x"' "$_f" 2>/dev/null | tr -d ' \n')
+	[ -n "$_hex" ] || return 1
+	_len=$(( ${#_hex} / 2 ))
+	[ "$_len" -ge 20 ] || return 1
+	[ $((_len % 4)) -eq 0 ] || return 1
+	_type=$(printf '%s' "$_hex" | cut -c1-4)
+	[ "$_type" = "0101" ] || return 1
+	_magic=$(printf '%s' "$_hex" | cut -c9-16)
+	[ "$_magic" = "2112a442" ] || return 1
+	_got=$(printf '%s' "$_hex" | cut -c17-40)
+	[ "$_got" = "$_txid" ] || return 1
+	_mlen=$(printf '%s' "$_hex" | cut -c5-8)
+	_mlen=$((0x$_mlen))
+	# 声明的属性长度不能超出实际报文（坏包 fixture 会触发这里）
+	[ $((20 + _mlen)) -le "$_len" ] || return 1
+
+	_pos=20
+	_end=$((20 + _mlen))
+	while [ "$_pos" -lt "$_end" ]; do
+		[ $((_pos + 4)) -le "$_len" ] || return 1
+		_at=$(printf '%s' "$_hex" | cut -c$((_pos * 2 + 1))-$((_pos * 2 + 4)))
+		_al=$(printf '%s' "$_hex" | cut -c$((_pos * 2 + 5))-$((_pos * 2 + 8)))
+		_at=$((0x$_at))
+		_al=$((0x$_al))
+		_doff=$((_pos + 4))
+		[ $((_doff + _al)) -le "$_len" ] || return 1
+		case "$_at" in
+		32 | 1) # XOR-MAPPED-ADDRESS / MAPPED-ADDRESS
+			[ "$_al" -ge 8 ] || return 1
+			_fam=$(printf '%s' "$_hex" | cut -c$((_doff * 2 + 3))-$((_doff * 2 + 4)))
+			[ "$_fam" = "01" ] || return 1
+			_ph=$(printf '%s' "$_hex" | cut -c$((_doff * 2 + 5))-$((_doff * 2 + 8)))
+			_ih=$(printf '%s' "$_hex" | cut -c$((_doff * 2 + 9))-$((_doff * 2 + 16)))
+			_port=$((0x$_ph))
+			if [ "$_at" = "32" ]; then
+				_port=$((_port ^ 0x2112))
+				_b1=$((0x$(printf '%s' "$_ih" | cut -c1-2) ^ 0x21))
+				_b2=$((0x$(printf '%s' "$_ih" | cut -c3-4) ^ 0x12))
+				_b3=$((0x$(printf '%s' "$_ih" | cut -c5-6) ^ 0xA4))
+				_b4=$((0x$(printf '%s' "$_ih" | cut -c7-8) ^ 0x42))
+				_ip="$_b1.$_b2.$_b3.$_b4"
+			else
+				_ip=$(_lc_hex2ip "$_ih")
+			fi
+			case "$_ip" in 0.0.0.0) return 1 ;; esac
+			printf '%s %s' "$_ip" "$_port"
+			return 0
+			;;
+		esac
+		_pos=$((_doff + ((_al + 3) / 4) * 4))
+	done
+	return 1
+}
+
+# 一次 UDP Binding。成功打印 "mapped_ip mapped_port rtt_ms"，失败返回 1。
+_lc_stun_once() { # <device> <server_ip> <server_port> <local_port> <timeout>
+	_sdev=$1
+	_sip=$2
+	_sport=$3
+	_lport=$4
+	_sto=$5
+	_tmp=${TMPDIR:-/tmp}/isp-lc-stun.$$
+	_txid=$(_lc_stun_build "$_tmp.req" 2>/dev/null) || { rm -f "$_tmp.req"; return 1; }
+	_t0=$(_lc_uptime_ms)
+	socat -T "$_sto" - UDP4:"$_sip":"$_sport",bind=:"$_lport",so-bindtodevice="$_sdev" \
+		<"$_tmp.req" >"$_tmp.resp" 2>/dev/null
+	_rc=$?
+	_t1=$(_lc_uptime_ms)
+	if [ "$_rc" -ne 0 ]; then
+		rm -f "$_tmp.req" "$_tmp.resp"
+		return 1
+	fi
+	_res=$(_lc_stun_parse "$_tmp.resp" "$_txid")
+	rm -f "$_tmp.req" "$_tmp.resp"
+	[ -n "$_res" ] || return 1
+	printf '%s %s %s' "$_res" "$((_t1 - _t0))"
+}
+
+_lc_local_port() {
+	_p=$(hexdump -n 2 -e '1/2 "%u"' /dev/urandom 2>/dev/null | tr -d ' ')
+	case "$_p" in '' | *[!0-9]*) _p=$$ ;; esac
+	echo $((30000 + _p % 30001))
+}
+
+# 双探测点分类。参数：
+#   <wan_ip> <wan_class> <map1|-> <map2|-> <local_port>
+# map 形如 "1.2.3.4:40000"。
+# 输出：type|confidence|detail
+_lc_nat_verdict() {
+	_vwan=$1
+	_vclass=$2
+	_vm1=${3:--}
+	_vm2=${4:--}
+	_vlport=${5:-0}
+	[ "$_vm1" = "-" ] && _vm1=""
+	[ "$_vm2" = "-" ] && _vm2=""
+
+	_vip1=${_vm1%:*}
+	_vport1=${_vm1#*:}
+	_vip2=${_vm2%:*}
+	_vport2=${_vm2#*:}
+
+	if [ "$_vclass" = "cgnat" ]; then
+		printf 'cgnat|high|WAN IP %s 属于 100.64.0.0/10（运营商级 NAT）' "$_vwan"
+		return 0
+	fi
+	if [ -z "$_vm1" ] && [ -z "$_vm2" ]; then
+		printf 'unknown|unknown|两个探测点均无响应（UDP 3478 可能被阻断或服务器不可达）'
+		return 0
+	fi
+
+	# 映射地址是私网/CGNAT = 不止一层 NAT
+	for _vm in "$_vm1" "$_vm2"; do
+		[ -n "$_vm" ] || continue
+		case "$(_lc_ip_class "${_vm%:*}")" in
+		private | cgnat)
+			printf 'cgnat|high|出口映射为私网地址 %s，存在多层 NAT，端口映射不可用' "$_vm"
+			return 0
+			;;
+		esac
+	done
+
+	if [ -n "$_vm1" ] && [ -n "$_vm2" ]; then
+		if [ "$_vm1" = "$_vm2" ]; then
+			if [ "$_vclass" = "public" ] && [ "$_vip1" = "$_vwan" ] && [ "$_vport1" = "$_vlport" ]; then
+				printf 'public|high|两个探测点映射均为 %s，与 WAN IP/本地端口一致（无端口转换）' "$_vm1"
+			else
+				printf 'cone|high|两个探测点映射一致（%s），锥形 NAT（未细分）' "$_vm1"
+			fi
+			return 0
+		fi
+		printf 'symmetric|high|两个探测点映射不同（%s / %s），对称或多出口 NAT' "$_vm1" "$_vm2"
+		return 0
+	fi
+
+	# 只有一个探测点成功：不能交叉验证
+	_only=$_vm1
+	[ -n "$_only" ] || _only=$_vm2
+	if [ "$_vclass" = "public" ] && [ "${_only%:*}" = "$_vwan" ] && [ "${_only#*:}" = "$_vlport" ]; then
+		printf 'public|medium|单点映射 %s 与 WAN IP/本地端口一致；未能交叉验证' "$_only"
+	else
+		printf 'cone|medium|仅一个探测点成功（%s），按锥形处理，未能交叉验证' "$_only"
+	fi
+}
+
+_lc_stun_bad_detail() {
+	[ "$LC_STUN_TYPE" = "unknown" ] || return 0
+	case "$LC_STUN_MAPS" in
+	*"|bad|"*)
+		LC_STUN_DETAIL="STUN 响应校验失败（magic cookie / transaction id / 属性边界不符），已丢弃坏包"
+		;;
+	esac
+}
+
+# 探测结果全局变量：
+#   LC_STUN_OK(0/1) LC_STUN_TYPE LC_STUN_CONF LC_STUN_DETAIL
+#   LC_STUN_MAPS = 每行 server|ip|status|mapped|rtt
+_lc_stun_probe() { # <device> <wan_ip> <wan_class>
+	_pdev=$1
+	_pwan=$2
+	_pclass=$3
+	LC_STUN_OK=0
+	LC_STUN_TYPE=unknown
+	LC_STUN_CONF=unknown
+	LC_STUN_DETAIL=""
+	LC_STUN_MAPS=""
+
+	_lport=$(_lc_local_port)
+	LC_STUN_LPORT=$_lport
+	# STUN 固定 2s（可行性报告 §2.6 的 socat -T 2）：UDP 首包要么几十 ms
+	# 回来，要么就是被丢弃，等 3s 只会让整次体检越过 rpcd 预算。
+	_lsto=2
+
+	# 夹具目录模式：用真实二进制包走完整解析（selftest / VM 回归用）。
+	# 目录里放 stun-1.bin / stun-2.bin；空文件表示超时。
+	if [ -n "${ISP_SPLIT_LC_STUN_FIXTURE_DIR:-}" ]; then
+		_i=0
+		for _f in "$ISP_SPLIT_LC_STUN_FIXTURE_DIR/stun-1.bin" "$ISP_SPLIT_LC_STUN_FIXTURE_DIR/stun-2.bin"; do
+			_i=$((_i + 1))
+			if [ -s "$_f" ]; then
+				_m=$(_lc_stun_parse "$_f" 112233445566778899aabbcc)
+				if [ -n "$_m" ]; then
+					LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|ok|$(printf '%s' "$_m" | tr ' ' ':')|1
+"
+				else
+					LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|bad|-|-
+"
+				fi
+			else
+				LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|timeout|-|-
+"
+			fi
+		done
+		_m1=$(printf '%s
+' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{print $4; exit}')
+		_m2=$(printf '%s
+' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{n++; if(n==2){print $4; exit}}')
+		_v=$(_lc_nat_verdict "$_pwan" "$_pclass" "${_m1:--}" "${_m2:--}" "$_lport")
+		LC_STUN_TYPE=${_v%%|*}
+		_v=${_v#*|}
+		LC_STUN_CONF=${_v%%|*}
+		LC_STUN_DETAIL=${_v#*|}
+		[ "$LC_STUN_TYPE" != "unknown" ] && LC_STUN_OK=1
+		_lc_stun_bad_detail
+		return 0
+	fi
+
+	# 夹具模式：ISP_SPLIT_LC_STUN="ok:1.2.3.4:40000|timeout"
+	if [ -n "${ISP_SPLIT_LC_STUN:-}" ]; then
+		_i=0
+		_old_ifs=$IFS
+		IFS='|'
+		for _spec in $ISP_SPLIT_LC_STUN; do
+			_i=$((_i + 1))
+			IFS=$_old_ifs
+			case "$_spec" in
+			ok:*)
+				_val=${_spec#ok:}
+				_mapped=${_val%:*}
+				_mport=${_val#*:}
+				LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|ok|${_mapped}:${_mport}|1
+"
+				;;
+			bad)
+				LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|bad|-|-
+"
+				;;
+			*)
+				LC_STUN_MAPS="${LC_STUN_MAPS}fixture-${_i}|198.51.100.${_i}|timeout|-|-
+"
+				;;
+			esac
+		done
+		IFS=$_old_ifs
+		_m1=$(printf '%s\n' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{print $4; exit}')
+		_m2=$(printf '%s\n' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{n++; if(n==2){print $4; exit}}')
+		_v=$(_lc_nat_verdict "$_pwan" "$_pclass" "${_m1:--}" "${_m2:--}" "$_lport")
+		LC_STUN_TYPE=${_v%%|*}
+		_v=${_v#*|}
+		LC_STUN_CONF=${_v%%|*}
+		LC_STUN_DETAIL=${_v#*|}
+		[ "$LC_STUN_TYPE" != "unknown" ] && LC_STUN_OK=1
+		_lc_stun_bad_detail
+		return 0
+	fi
+
+	if [ "${ISP_SPLIT_LC_NO_SOCAT:-0}" = "1" ] || ! command -v socat >/dev/null 2>&1; then
+		LC_STUN_DETAIL="socat 未安装，无法做 UDP STUN；安装 socat 后可获得 NAT 类型（opkg install socat / apk add socat）"
+		LC_STUN_TYPE=unknown
+		LC_STUN_CONF=unknown
+		LC_STUN_LPORT=0
+		return 0
+	fi
+
+	# 解析服务器：每家只做一次 DNS，第一个 A 记录进主列表、第二个进备列表，
+	# 主列表优先（保证厂商多样性），避免对同一个失败域名反复 nslookup。
+	_srv_main=""
+	_srv_alt=""
+	_old_ifs=$IFS
+	for _s in $(_lc_stun_raw); do
+		IFS=$_old_ifs
+		_sh=${_s%:*}
+		_sp=${_s#*:}
+		_lc_valid_host "$_sh" || continue
+		_lc_valid_port "$_sp" || continue
+		_sips=$(_lc_resolve "$_sh" 2)
+		set -- $_sips
+		if [ $# -ge 1 ]; then
+			_dup=0
+			for _x in $_srv_main $_srv_alt; do
+				case "$_x" in "$1:"*) _dup=1 ;; esac
+			done
+			[ "$_dup" = "0" ] && _srv_main="$_srv_main $1:$_sp:$_sh"
+		fi
+		if [ $# -ge 2 ]; then
+			_dup=0
+			for _x in $_srv_main $_srv_alt; do
+				case "$_x" in "$2:"*) _dup=1 ;; esac
+			done
+			[ "$_dup" = "0" ] && _srv_alt="$_srv_alt $2:$_sp:$_sh"
+		fi
+	done
+	IFS=$_old_ifs
+	_srv_list="$_srv_main $_srv_alt"
+
+
+	if [ -z "$_srv_list" ]; then
+		LC_STUN_DETAIL="STUN 服务器域名全部解析失败（检查 DNS 或 LINE_CHECK_STUN_SERVERS）"
+		return 0
+	fi
+
+	_probe() { # <server-spec> <index>
+		_ps=$1
+		_pi=$2
+		_pip=${_ps%%:*}
+		_prest=${_ps#*:}
+		_pport=${_prest%%:*}
+		_phost=${_prest#*:}
+		_r=$(_lc_stun_once "$_pdev" "$_pip" "$_pport" "$_lport" "$_lsto")
+		_probe_ok=0
+		if [ -n "$_r" ]; then
+			set -- $_r
+			LC_STUN_MAPS="${LC_STUN_MAPS}${_phost}|${_pip}|ok|${1}:${2}|${3}
+"
+			_probe_ok=1
+		else
+			LC_STUN_MAPS="${LC_STUN_MAPS}${_phost}|${_pip}|timeout|-|-
+"
+		fi
+	}
+	_pn=0
+	_pok=0
+	for _s in $_srv_list; do
+		[ "$_pn" -ge 4 ] && break
+		[ -n "${LC_BUDGET:-}" ] && _lc_deadline_hit && break
+		[ "$_pok" -ge 2 ] && break
+		_pn=$((_pn + 1))
+		_probe "$_s" "$_pn"
+		[ "${_probe_ok:-0}" = "1" ] && _pok=$((_pok + 1))
+	done
+	# 一个都没成功且预算还够：把第一个再试一次（UDP 首包偶发丢包）
+	if [ "$_pok" -eq 0 ] && ! _lc_deadline_hit; then
+		set -- $_srv_list
+		_probe "$1" 1
+	fi
+
+	_m1=$(printf '%s\n' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{print $4; exit}')
+	_m2=$(printf '%s\n' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{n++; if(n==2){print $4; exit}}')
+	_v=$(_lc_nat_verdict "$_pwan" "$_pclass" "${_m1:--}" "${_m2:--}" "$_lport")
+	LC_STUN_TYPE=${_v%%|*}
+	_v=${_v#*|}
+	LC_STUN_CONF=${_v%%|*}
+	LC_STUN_DETAIL=${_v#*|}
+	[ "$LC_STUN_TYPE" != "unknown" ] && LC_STUN_OK=1
+	_lc_stun_bad_detail
+}
+
+# ---- 延迟 / 可用性 ----
+
+# DNS 段：curl 的 time_namelookup 只有在不钉 IP 时才有意义。
+# 这里单独发一个 http:// 请求（只取 DNS 计时，最多 2s），真正的四段测量
+# 用 --resolve 钉到已校验 IP，避免 GSLB 二次解析换 IP。
+_lc_dns_ms() { # <device> <domain>
+	_dv=$1
+	_dm=$2
+	if [ -n "${ISP_SPLIT_LC_LAT:-}" ]; then
+		printf '%s' "$(_lc_lat_get dns 0)"
+		return 0
+	fi
+	command -v curl >/dev/null 2>&1 || { printf '0'; return 0; }
+	_v=$(curl -sS --interface "$_dv" --connect-timeout 1 -m 2 -o /dev/null \
+		-w '%{time_namelookup}' "http://$_dm/" 2>/dev/null)
+	_lc_ms "${_v:-0}"
+}
+
+_lc_lat_get() { # <key> <default> 从 ISP_SPLIT_LC_LAT="dns=2,tcp=30,..." 取
+	_k=$1
+	_d=${2-}
+	printf '%s' "${ISP_SPLIT_LC_LAT:-}" | tr ',' '\n' | awk -F= -v k="$_k" -v d="$_d" '
+		$1 == k { print $2; found = 1; exit }
+		END { if (!found) print d }'
+}
+
+# 测量一个已校验目标：5 次尝试，前 3 次成功样本用于中位数/抖动。
+# 设置 LC_DNS_MS LC_TCP_MS LC_TLS_MS LC_TTFB_MS LC_TOTAL_MS
+#      LC_SAMPLES LC_JITTER LC_LOSS LC_ATTEMPTS LC_OK_COUNT
+#      LC_HTTP_CODE LC_AVAIL
+_lc_measure() { # <device> <domain> <ip> <timeout> [fast]
+	_mdev=$1
+	_mdom=$2
+	_mip=$3
+	_mto=$4
+	_mfast=${5:-0}
+	# 连接超时最多 2s：一条需要 >2s 才能建连的线已经不值得等 3s，
+	# 而且失败目标的早停能把整次体检压进 rpcd 预算。
+	_ct=$_mto
+	[ "$_ct" -gt 2 ] && _ct=2
+	LC_DNS_MS=$(_lc_dns_ms "$_mdev" "$_mdom")
+	LC_TCP_MS=""
+	LC_TLS_MS=""
+	LC_TTFB_MS=""
+	LC_TOTAL_MS=""
+	LC_SAMPLES=""
+	LC_JITTER=0
+	LC_LOSS=100
+	LC_ATTEMPTS=0
+	LC_OK_COUNT=0
+	LC_HTTP_CODE=0
+	LC_AVAIL=none
+
+	if [ -n "${ISP_SPLIT_LC_LAT:-}" ]; then
+		LC_TCP_MS=$(_lc_lat_get tcp 0)
+		LC_TLS_MS=$(_lc_lat_get tls 0)
+		LC_TTFB_MS=$(_lc_lat_get ttfb 0)
+		LC_TOTAL_MS=$(_lc_lat_get total 0)
+		LC_JITTER=$(_lc_lat_get jitter 0)
+		LC_LOSS=$(_lc_lat_get loss 0)
+		LC_HTTP_CODE=$(_lc_lat_get http 200)
+		LC_ATTEMPTS=$(_lc_lat_get attempts 5)
+		LC_OK_COUNT=$((LC_ATTEMPTS - (LC_ATTEMPTS * LC_LOSS / 100)))
+		LC_SAMPLES=$(_lc_lat_get samples "$LC_TCP_MS")
+		LC_AVAIL=$(_lc_lat_get avail)
+		[ -n "$LC_AVAIL" ] || _lc_avail_from "$LC_HTTP_CODE" 1 1
+		return 0
+	fi
+
+	command -v curl >/dev/null 2>&1 || return 0
+	_ua=$(_lc_ua)
+	_acc=$(_lc_opt LINE_CHECK_ACCEPT "$LC_DEFAULT_ACCEPT")
+	_best_code=0
+	_any_tls=0
+	_any_http=0
+	_http_code=0
+
+	while [ "$LC_ATTEMPTS" -lt 5 ]; do
+		LC_ATTEMPTS=$((LC_ATTEMPTS + 1))
+		_out=$(curl -sS --interface "$_mdev" --resolve "$_mdom:443:$_mip" \
+			--connect-timeout "$_ct" -m $((_ct * 2)) \
+			-A "$_ua" -H "Accept: $_acc" -r 0-0 -o /dev/null \
+			-w '%{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code} %{remote_ip}' \
+			"https://$_mdom/" 2>/dev/null)
+		_rc=$?
+		# curl 失败时 -w 仍会打印（多为 0 000），逐字段解析，不依赖退出码
+		set -- $_out
+		_c=${1:-0}
+		_a=${2:-0}
+		_s=${3:-0}
+		_t=${4:-0}
+		_code=${5:-000}
+		_rip=${6:-}
+		case "$_code" in '' | *[!0-9]*) _code=0 ;; esac
+		_http_code=$_code
+
+		if [ "$_rc" -eq 0 ] && [ -n "$_rip" ] && [ "$_rip" = "$_mip" ]; then
+			_tcpm=$(_lc_ms "$_c")
+			LC_OK_COUNT=$((LC_OK_COUNT + 1))
+			[ -z "$LC_TCP_MS" ] && LC_TCP_MS=$_tcpm
+			LC_SAMPLES="$LC_SAMPLES $_tcpm"
+			LC_TLS_MS=$(_lc_ms "$_a")
+			LC_TTFB_MS=$(_lc_ms "$_s")
+			LC_TOTAL_MS=$(_lc_ms "$_t")
+			_best_code=$_code
+			[ "$_a" != "0.000000" ] && [ "$_a" != "0" ] && _any_tls=1
+			[ "$_code" -gt 0 ] 2>/dev/null && _any_http=1
+		else
+			# 早停：跨网基线只试 1 次；同网目标最多 2 次。避免 5×超时拖死整页
+			[ "$LC_OK_COUNT" -eq 0 ] && { [ "$_mfast" = "1" ] || [ "$LC_ATTEMPTS" -ge 2 ]; } && break
+		fi
+		[ "$LC_OK_COUNT" -ge 3 ] && [ "$LC_ATTEMPTS" -ge 5 ] && break
+	done
+
+	LC_SAMPLES=$(printf '%s' "$LC_SAMPLES" | sed 's/^ *//')
+	if [ "$LC_OK_COUNT" -gt 0 ]; then
+		LC_TCP_MS=$(_lc_median "$LC_SAMPLES")
+		LC_JITTER=$(_lc_jitter "$LC_SAMPLES")
+		LC_LOSS=$(( (LC_ATTEMPTS - LC_OK_COUNT) * 100 / LC_ATTEMPTS ))
+		LC_HTTP_CODE=$_best_code
+		if [ "$_any_http" = "1" ]; then
+			case "$_best_code" in
+			2* | 3*) _lc_avail_from "$_best_code" 1 1 ;;
+			4*) _lc_avail_from "$_best_code" 1 1 ;;
+			5*) _lc_avail_from "$_best_code" 1 1 ;;
+			*) _lc_avail_from "$_best_code" "$_any_tls" 1 ;;
+			esac
+		elif [ "$_any_tls" = "1" ]; then
+			LC_AVAIL=tlsfail
+		else
+			LC_AVAIL=full
+		fi
+	else
+		if [ "$LC_DNS_MS" -gt 0 ] 2>/dev/null; then
+			LC_AVAIL=tcpfail
+		else
+			LC_AVAIL=dnsfail
+		fi
+		LC_HTTP_CODE=0
+	fi
+}
+
+_lc_avail_from() { # <http_code> <tls_ok> <tcp_ok>
+	case "${1:-0}" in
+	2* | 3*) LC_AVAIL=full ;;
+	4*) LC_AVAIL=waf ;;
+	5*) LC_AVAIL=http5xx ;;
+	*)
+		if [ "${2:-0}" = "1" ]; then LC_AVAIL=tlsfail
+		elif [ "${3:-0}" = "1" ]; then LC_AVAIL=tcpfail
+		else LC_AVAIL=dnsfail
+		fi
+		;;
+	esac
+}
+
+# ---- 归属地（只发出口 IP） ----
+
+_lc_geo_cache_get() { # <ip> <provider>
+	[ -f "$LC_CACHE/geo.tsv" ] || return 1
+	awk -F'\t' -v ip="$1" -v p="$2" -v now="$(_lc_now)" -v ttl="$(_lc_geo_ttl)" '
+		$1 == ip && $2 == p && (now - $4) < ttl { print $3; exit }' "$LC_CACHE/geo.tsv" 2>/dev/null
+}
+
+_lc_geo_ttl() {
+	_t=$(_lc_int "$(_lc_opt LINE_CHECK_GEO_TTL 86400)")
+	[ "$_t" -ge 60 ] 2>/dev/null || _t=86400
+	printf '%s' "$_t"
+}
+
+_lc_geo_cache_put() { # <ip> <provider> <text>
+	[ -n "${1:-}" ] || return 0
+	mkdir -p "$LC_CACHE" 2>/dev/null || return 0
+	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(_lc_now)" >>"$LC_CACHE/geo.tsv" 2>/dev/null || true
+	# 只保留最近 200 条，防止长期运行把 state 撑大
+	if [ -f "$LC_CACHE/geo.tsv" ]; then
+		tail -n 200 "$LC_CACHE/geo.tsv" >"$LC_CACHE/geo.tsv.$$" 2>/dev/null &&
+			mv -f "$LC_CACHE/geo.tsv.$$" "$LC_CACHE/geo.tsv" 2>/dev/null || rm -f "$LC_CACHE/geo.tsv.$$"
+	fi
+}
+
+_lc_geo_query() { # <ip> <provider>
+	case "$2" in
+	baidu)
+		_r=$(curl -sS -m 2 --connect-timeout 2 \
+			"https://opendata.baidu.com/api.php?query=$1&resource_id=6006&oe=utf8" 2>/dev/null)
+		[ -n "$_r" ] || return 1
+		_loc=$(printf '%s' "$_r" | jsonfilter -e '@.data[0].location' 2>/dev/null)
+		[ -n "$_loc" ] && [ "$_loc" != "null" ] || return 1
+		printf '%s' "$_loc"
+		;;
+	ip-api)
+		_r=$(curl -sS -m 2 --connect-timeout 2 \
+			"http://ip-api.com/json/$1?lang=zh-CN&fields=status,country,regionName,city,isp" 2>/dev/null)
+		[ -n "$_r" ] || return 1
+		_st=$(printf '%s' "$_r" | jsonfilter -e '@.status' 2>/dev/null)
+		[ "$_st" = "success" ] || return 1
+		_c=$(printf '%s' "$_r" | jsonfilter -e '@.country' 2>/dev/null)
+		_rg=$(printf '%s' "$_r" | jsonfilter -e '@.regionName' 2>/dev/null)
+		_ci=$(printf '%s' "$_r" | jsonfilter -e '@.city' 2>/dev/null)
+		_isp=$(printf '%s' "$_r" | jsonfilter -e '@.isp' 2>/dev/null)
+		printf '%s %s %s %s' "$_c" "$_rg" "$_ci" "$_isp" | sed 's/  */ /g; s/^ //; s/ $//'
+		;;
+	*) return 1 ;;
+	esac
+}
+
+# 设置 LC_GEO_STATUS(ok|off|noip|unknown) LC_GEO_TEXT LC_GEO_PROVIDER LC_GEO_IP
+_lc_geo() { # <exit_ip> <wan_ip> <wan_class>
+	_geo_en=$(_lc_opt LINE_CHECK_GEO 1)
+	_geo_prov=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
+	case "$_geo_prov" in auto | baidu | ip-api | off) ;; *) _geo_prov=auto ;; esac
+	LC_GEO_PROVIDER=$_geo_prov
+	LC_GEO_TEXT=""
+	LC_GEO_IP=""
+	if [ "$_geo_en" = "0" ] || [ "$_geo_prov" = "off" ]; then
+		LC_GEO_STATUS=off
+		return 0
+	fi
+	_ip=${1:-}
+	[ -n "$_ip" ] || { LC_GEO_STATUS=noip; return 0; }
+	LC_GEO_IP=$_ip
+
+	if [ -n "${ISP_SPLIT_LC_GEO_TEXT:-}" ]; then
+		LC_GEO_STATUS=ok
+		LC_GEO_TEXT=${ISP_SPLIT_LC_GEO_TEXT%%|*}
+		_p=${ISP_SPLIT_LC_GEO_TEXT#*|}
+		[ "$_p" != "$ISP_SPLIT_LC_GEO_TEXT" ] && LC_GEO_PROVIDER=$_p
+		return 0
+	fi
+
+	_provs="baidu ip-api"
+	[ "$_geo_prov" = "auto" ] || _provs=$_geo_prov
+	for _p in $_provs; do
+		_c=$(_lc_geo_cache_get "$_ip" "$_p")
+		if [ -n "$_c" ]; then
+			LC_GEO_STATUS=ok
+			LC_GEO_TEXT=$_c
+			LC_GEO_PROVIDER=$_p
+			return 0
+		fi
+		_t=$(_lc_geo_query "$_ip" "$_p")
+		if [ -n "$_t" ]; then
+			LC_GEO_STATUS=ok
+			LC_GEO_TEXT=$_t
+			LC_GEO_PROVIDER=$_p
+			_lc_geo_cache_put "$_ip" "$_p" "$_t"
+			return 0
+		fi
+	done
+	LC_GEO_STATUS=unknown
+}
+
+# ---- 评分（报告 §6 规则表 + 硬上限） ----
+
+_lc_grade() {
+	case "$1" in
+	'' | *[!0-9]*) printf 'D' ;;
+	*)
+		if [ "$1" -ge 85 ]; then printf 'A'
+		elif [ "$1" -ge 70 ]; then printf 'B'
+		elif [ "$1" -ge 50 ]; then printf 'C'
+		else printf 'D'; fi
+		;;
+	esac
+}
+
+_lc_lat_points() {
+	case "${1:-}" in '' | *[!0-9]* | 0) printf '0'; return ;; esac
+	if [ "$1" -le 20 ]; then printf '30'
+	elif [ "$1" -le 40 ]; then printf '26'
+	elif [ "$1" -le 70 ]; then printf '20'
+	elif [ "$1" -le 110 ]; then printf '12'
+	elif [ "$1" -le 160 ]; then printf '5'
+	else printf '0'; fi
+}
+
+_lc_stab_points() { # <jitter> <loss> -> 0-25
+	_j=${1:-0}
+	_l=${2:-100}
+	case "$_j" in '' | *[!0-9]*) _j=999 ;; esac
+	if [ "$_j" -le 5 ]; then _jp=15
+	elif [ "$_j" -le 15 ]; then _jp=10
+	elif [ "$_j" -le 30 ]; then _jp=5
+	else _jp=0; fi
+	case "$_l" in '' | *[!0-9]*) _l=100 ;; esac
+	if [ "$_l" -eq 0 ]; then _lp=10
+	elif [ "$_l" -le 20 ]; then _lp=6
+	elif [ "$_l" -le 50 ]; then _lp=2
+	else _lp=0; fi
+	printf '%s' $((_jp + _lp))
+}
+
+_lc_score() { # <nat> <tcp> <jitter> <loss> <avail> <same_isp> <wan_up>
+	_snat=$1
+	_stcp=$2
+	_sjit=${3:-0}
+	_sloss=${4:-100}
+	_savail=${5:-none}
+	_ssame=${6:-0}
+	_sup=${7:-0}
+
+	case "$_snat" in
+	public) _np=30 ;;
+	cone) _np=20 ;;
+	symmetric) _np=8 ;;
+	cgnat) _np=0 ;;
+	*) _np=10 ;;
+	esac
+	_lp=$(_lc_lat_points "$_stcp")
+	# 没有同运营商目标、只有跨网基线：延迟项最高 15 分
+	[ "$_ssame" = "1" ] || { [ "$_lp" -gt 15 ] && _lp=15; }
+	_sp=$(_lc_stab_points "$_sjit" "$_sloss")
+	case "$_savail" in
+	full) _ap=15 ;;
+	waf) _ap=12 ;;
+	http5xx | tlsfail) _ap=8 ;;
+	*) _ap=0 ;;
+	esac
+
+	if [ "$_sup" != "1" ]; then
+		# 线路没连上时四项都不该给分，明细也要如实显示 0，不能只把总分抹成 0
+		_np=0; _lp=0; _sp=0; _ap=0
+	fi
+	_tot=$((_np + _lp + _sp + _ap))
+	_caps=""
+	_capped=0
+	if [ "$_sup" != "1" ]; then
+		_tot=0
+		_capped=1
+		_caps="WAN 未连接/拨号失败：总分 0"
+	fi
+	case "$_snat" in
+	cgnat)
+		if [ "$_tot" -gt 69 ]; then _tot=69; _capped=1; fi
+		_caps="$_caps
+CGNAT/多层 NAT：总分上限 69"
+		;;
+	symmetric)
+		if [ "$_tot" -gt 69 ]; then _tot=69; _capped=1; fi
+		_caps="$_caps
+对称/多出口 NAT：总分上限 69"
+		;;
+	esac
+	case "$_sloss" in
+	'' | *[!0-9]*) _sloss=100 ;;
+	esac
+	if [ "$_sloss" -gt 20 ]; then
+		[ "$_tot" -gt 69 ] && _tot=69 && _capped=1
+		_caps="$_caps
+丢包 > 20%：总分上限 69"
+	fi
+	if [ "$_ssame" = "1" ] && { [ -z "$_stcp" ] || [ "$_stcp" -gt 160 ] 2>/dev/null; }; then
+		[ "$_tot" -gt 69 ] && _tot=69 && _capped=1
+		_caps="$_caps
+同网目标 >160ms 或全部超时：总分上限 69"
+	fi
+	_caps=$(printf '%s\n' "$_caps" | sed '/^$/d')
+
+	SC_TOTAL=$_tot
+	SC_GRADE=$(_lc_grade "$_tot")
+	SC_NAT_PTS=$_np
+	SC_LAT_PTS=$_lp
+	SC_STAB_PTS=$_sp
+	SC_AVAIL_PTS=$_ap
+	SC_CAPS=$_caps
+	SC_CAPPED=$_capped
+}
+
+_lc_advice() { # <label> <nat> <grade> <loss> <tcp> <same> <socat>
+	_adv_label=$1
+	_adv_nat=$2
+	_adv_grade=$3
+	_adv_loss=${4:-0}
+	_adv_tcp=${5:-}
+	_adv_same=${6:-0}
+	_adv_socat=${7:-1}
+
+	case "$_adv_nat" in
+	cgnat)
+		printf '%s 为 CGNAT/多层 NAT，端口映射不可用；如需外网访问请申请公网 IP，或使用 IPv6/内网穿透。' "$_adv_label" ;;
+	symmetric)
+		printf '%s 是对称/多出口 NAT，P2P 与端口映射成功率低；日常上网不受影响。' "$_adv_label" ;;
+	unknown)
+		if [ "$_adv_socat" = "0" ]; then
+			printf '%s 的 NAT 类型未知：socat 未安装，安装后可补测（不影响上网）。' "$_adv_label"
+		else
+			printf '%s 的 NAT 类型未知：UDP STUN 探测失败，可能被运营商阻断 3478；不影响上网。' "$_adv_label"
+		fi ;;
+	public)
+		if [ "$_adv_grade" = "A" ]; then
+			printf '%s 公网直连，质量良好，可作主用线路。' "$_adv_label"
+		else
+			printf '%s 公网直连，端口映射可用；当前质量一般，建议结合评分明细排查。' "$_adv_label"
+		fi ;;
+	cone)
+		printf '%s 为锥形 NAT（未细分），端口映射可能可用，需在防火墙放行后实测。' "$_adv_label" ;;
+	*)
+		printf '%s 线路状态未知，请先确认 WAN 已连接。' "$_adv_label" ;;
+	esac
+
+	if [ "$_adv_loss" -gt 20 ] 2>/dev/null; then
+		printf ' 丢包偏高（%s%%），建议检查光猫/线路质量。' "$_adv_loss"
+	elif [ -n "$_adv_tcp" ] && [ "$_adv_tcp" -gt 160 ] 2>/dev/null; then
+		printf ' 同网延迟偏高（%sms），建议检查线路拥塞或更换目标。' "$_adv_tcp"
+	elif [ "$_adv_same" != "1" ]; then
+		printf ' 未找到可用的同运营商目标，延迟为跨网参考值。'
+	fi
+}
+
+# ---- 输出 ----
+
+_lc_isp_label() {
+	_l=$(_isp_label "${1:-}")
+	[ -n "$_l" ] || _l="未知"
+	printf '%s' "$_l"
+}
+
+_lc_nat_label() {
+	case "$1" in
+	public) printf '公网（可直接映射）' ;;
+	cone) printf '锥形 NAT（未细分）' ;;
+	symmetric) printf '对称/多出口 NAT' ;;
+	cgnat) printf 'CGNAT / 多层 NAT' ;;
+	*) printf '未知（UDP 探测失败）' ;;
+	esac
+}
+
+_lc_class_label() {
+	case "$1" in
+	public) printf '公网' ;;
+	cgnat) printf 'CGNAT' ;;
+	private) printf '私网' ;;
+	*) printf '无地址' ;;
+	esac
+}
+
+_lc_avail_label() {
+	case "$1" in
+	full) printf 'DNS/TCP/TLS/HTTP 全通' ;;
+	waf) printf '可达但被 WAF 拦截（4xx）' ;;
+	http5xx) printf 'HTTP 5xx' ;;
+	tlsfail) printf 'TLS 握手失败' ;;
+	tcpfail) printf 'TCP 连接失败' ;;
+	dnsfail) printf 'DNS 解析失败' ;;
+	*) printf '未探测' ;;
+	esac
+}
+
+_lc_stun_probes_json() {
+	printf '['
+	_first=1
+	printf '%s\n' "$LC_STUN_MAPS" | while IFS='|' read -r _srv _sip _st _map _rtt; do
+		[ -n "$_srv" ] || continue
+		[ "$_first" = "1" ] || printf ','
+		_first=0
+		_rttn=0
+		case "$_rtt" in '' | *[!0-9]*) _rttn=0 ;; *) _rttn=$_rtt ;; esac
+		printf '{"server":%s,"ip":%s,"status":%s,"mapped":%s,"rtt_ms":%s}' \
+			"$(_lc_json_str "$_srv")" "$(_lc_json_str "$_sip")" \
+			"$(_lc_json_str "$_st")" \
+			"$([ "$_map" = "-" ] && printf 'null' || _lc_json_str "$_map")" \
+			"$_rttn"
+	done
+	printf ']'
+}
+
+_lc_target_json() {
+	if [ -z "${LC_T_DOMAIN:-}" ]; then
+		printf 'null'
+		return
+	fi
+	printf '{"domain":%s,"ip":%s,"isp":%s,"label":%s,"mode":%s,"validated":%s}' \
+		"$(_lc_json_str "$LC_T_DOMAIN")" "$(_lc_json_str "$LC_T_IP")" \
+		"$(_lc_json_str "$LC_T_ISP")" "$(_lc_json_str "$(_isp_label "$LC_T_ISP")")" \
+		"$(_lc_json_str "$LC_T_MODE")" \
+		"$([ "$LC_T_VALID" = "1" ] && printf 'true' || printf 'false')"
+}
+
+_lc_wan_json() {
+	_upj=false; [ "$LC_UP" = "1" ] && _upj=true
+	_exj=false; [ "$LC_EXIT_OK" = "1" ] && _exj=true
+	_mj=false; [ "$LC_MULTI" = "1" ] && _mj=true
+	_httpj=false; [ "${LC_HTTP_CODE:-0}" -ge 200 ] 2>/dev/null && [ "${LC_HTTP_CODE:-0}" -lt 500 ] 2>/dev/null && _httpj=true
+
+	_tcpj=null; [ -n "${LC_TCP_MS:-}" ] && _tcpj=$LC_TCP_MS
+	_dnsj=null; [ -n "${LC_DNS_MS:-}" ] && _dnsj=$LC_DNS_MS
+	_tlsj=null; [ -n "${LC_TLS_MS:-}" ] && _tlsj=$LC_TLS_MS
+	_ttfbj=null; [ -n "${LC_TTFB_MS:-}" ] && _ttfbj=$LC_TTFB_MS
+	_totalj=null; [ -n "${LC_TOTAL_MS:-}" ] && _totalj=$LC_TOTAL_MS
+	_exipj=null; [ -n "${LC_EXIT_IP:-}" ] && _exipj=$(_lc_json_str "$LC_EXIT_IP")
+	_wanipj=null; [ -n "${LC_WAN_IP:-}" ] && _wanipj=$(_lc_json_str "$LC_WAN_IP")
+	_geolocj=null; [ -n "${LC_GEO_TEXT:-}" ] && _geolocj=$(_lc_json_str "$LC_GEO_TEXT")
+
+	printf '{'
+	printf '"iface":%s,"device":%s,"up":%s,"state":%s,"wan_ip":%s,"ip_class":%s,' \
+		"$(_lc_json_str "$LC_IFACE")" "$(_lc_json_str "$LC_DEV")" "$_upj" \
+		"$(_lc_json_str "$LC_STATE")" "$_wanipj" "$(_lc_json_str "$LC_IP_CLASS")"
+	printf '"exit_ip":%s,"exit_ok":%s,"multi_nat":%s,"isp":%s,"isp_label":%s,' \
+		"$_exipj" "$_exj" "$_mj" "$(_lc_json_str "${LC_ISP:-}")" \
+		"$(_lc_json_str "$(_lc_isp_label "${LC_ISP:-}")")"
+	printf '"target":%s,' "$(_lc_target_json)"
+	printf '"latency":{"dns_ms":%s,"tcp_ms":%s,"tls_ms":%s,"ttfb_ms":%s,"total_ms":%s,"jitter_ms":%s,"loss_pct":%s,"attempts":%s,"ok_count":%s,"samples":[%s]},' \
+		"$_dnsj" "$_tcpj" "$_tlsj" "$_ttfbj" "$_totalj" \
+		"$(_lc_int "${LC_JITTER:-0}")" "$(_lc_int "${LC_LOSS:-100}")" \
+		"$(_lc_int "${LC_ATTEMPTS:-0}")" "$(_lc_int "${LC_OK_COUNT:-0}")" \
+		"$(printf '%s' "${LC_SAMPLES:-}" | tr ' ' ',' | sed 's/^,//; s/,$//')"
+	printf '"http":{"code":%s,"ok":%s},' "$(_lc_int "${LC_HTTP_CODE:-0}")" "$_httpj"
+	printf '"geo":{"status":%s,"provider":%s,"location":%s,"ip":%s},' \
+		"$(_lc_json_str "${LC_GEO_STATUS:-unknown}")" "$(_lc_json_str "${LC_GEO_PROVIDER:-}")" \
+		"$_geolocj" "$([ -n "${LC_GEO_IP:-}" ] && _lc_json_str "$LC_GEO_IP" || printf 'null')"
+
+	printf '"nat":{"type":%s,"label":%s,"confidence":%s,"detail":%s,"socat":%s,"local_port":%s,"probes":%s},' \
+		"$(_lc_json_str "$LC_STUN_TYPE")" "$(_lc_json_str "$(_lc_nat_label "$LC_STUN_TYPE")")" \
+		"$(_lc_json_str "$LC_STUN_CONF")" "$(_lc_json_str "$LC_STUN_DETAIL")" \
+		"$([ "${LC_SOCAT:-1}" = "1" ] && printf 'true' || printf 'false')" \
+		"$(_lc_int "${LC_STUN_LPORT:-0}")" "$(_lc_stun_probes_json)"
+
+	_lc_score_json
+	printf '}'
+}
+
+_lc_score_json() {
+	_nat_reason=${LC_STUN_DETAIL:-}
+	[ -n "$_nat_reason" ] || _nat_reason="WAN IP ${LC_WAN_IP:-} 分类为 $(_lc_class_label "$LC_IP_CLASS")"
+	_lat_val="TCP 建连 ${LC_TCP_MS:-—}ms"
+	[ -n "${LC_TCP_MS:-}" ] || _lat_val="不可达"
+	_lat_reason="同网目标 TCP 建连中位数 ${LC_TCP_MS:-—}ms"
+	[ "$LC_T_SAME" = "1" ] || _lat_reason="跨网基线（无同网目标），延迟项上限 15"
+	_stab_val="抖动 ${LC_JITTER:-0}ms / 丢包 ${LC_LOSS:-100}%"
+	_stab_reason="${LC_ATTEMPTS:-0} 次尝试，${LC_OK_COUNT:-0} 次成功"
+	_av_val=$(_lc_avail_label "$LC_AVAIL")
+
+	printf '"score":{"total":%s,"grade":%s,"breakdown":[' \
+		"$(_lc_int "$SC_TOTAL")" "$(_lc_json_str "$SC_GRADE")"
+	printf '{"key":"nat","label":"出口类型","value":%s,"points":%s,"max":30,"reason":%s},' \
+		"$(_lc_json_str "$(_lc_nat_label "$LC_STUN_TYPE")")" "$SC_NAT_PTS" "$(_lc_json_str "$_nat_reason")"
+	printf '{"key":"latency","label":"延迟","value":%s,"points":%s,"max":30,"reason":%s},' \
+		"$(_lc_json_str "$_lat_val")" "$SC_LAT_PTS" "$(_lc_json_str "$_lat_reason")"
+	printf '{"key":"stability","label":"稳定性","value":%s,"points":%s,"max":25,"reason":%s},' \
+		"$(_lc_json_str "$_stab_val")" "$SC_STAB_PTS" "$(_lc_json_str "$_stab_reason")"
+	printf '{"key":"availability","label":"可用性","value":%s,"points":%s,"max":15,"reason":%s}],' \
+		"$(_lc_json_str "$_av_val")" "$SC_AVAIL_PTS" "$(_lc_json_str "HTTP ${LC_HTTP_CODE:-0}")"
+	printf '"caps":[%s],"advice":%s}' \
+		"$(printf '%s\n' "$SC_CAPS" | awk 'NF{printf "%s%s", (n++ ? "," : ""), "\"" $0 "\""}')" \
+		"$(_lc_json_str "$LC_ADVICE")"
+}
+
+_lc_wan_text() {
+	_lbl=$(_lc_isp_label "${LC_ISP:-}")
+	_tgt="—"
+	if [ -n "${LC_T_DOMAIN:-}" ]; then
+		_tgt="${LC_T_DOMAIN} → ${LC_T_IP}（$(_isp_label "$LC_T_ISP")，$([ "$LC_T_MODE" = "same_isp" ] && printf '同网' || printf '跨网基线')）"
+	fi
+	_exit="—"
+	[ -n "${LC_EXIT_IP:-}" ] && _exit="${LC_EXIT_IP}（多层 NAT：$([ "$LC_MULTI" = "1" ] && printf '是' || printf '否')）"
+	_geo="未查询"
+	case "${LC_GEO_STATUS:-}" in
+	ok) _geo="${LC_GEO_TEXT}（${LC_GEO_PROVIDER}）" ;;
+	off) _geo="未查询（隐私开关关闭）" ;;
+	noip) _geo="无公网出口 IP，跳过" ;;
+	*) _geo="查询失败" ;;
+	esac
+	printf '== %s (%s)  %s\n' "$LC_IFACE" "$LC_DEV" "$([ "$LC_UP" = "1" ] && printf '在线' || printf '离线')"
+	printf '   WAN IP     %s（%s）\n' "${LC_WAN_IP:-—}" "$(_lc_class_label "$LC_IP_CLASS")"
+	printf '   出口 IP    %s\n' "$_exit"
+	printf '   运营商     %s\n' "$_lbl"
+	printf '   目标       %s\n' "$_tgt"
+	printf '   四段延迟   DNS %s · TCP %s · TLS %s · 首字节 %s · 合计 %s\n' \
+		"$(_lc_fmt_ms "${LC_DNS_MS:-}")" "$(_lc_fmt_ms "${LC_TCP_MS:-}")" \
+		"$(_lc_fmt_ms "${LC_TLS_MS:-}")" "$(_lc_fmt_ms "${LC_TTFB_MS:-}")" \
+		"$(_lc_fmt_ms "${LC_TOTAL_MS:-}")"
+	printf '   稳定性     抖动 %sms · 丢包 %s%%（%s 次尝试 / %s 次成功）\n' \
+		"${LC_JITTER:-0}" "${LC_LOSS:-100}" "${LC_ATTEMPTS:-0}" "${LC_OK_COUNT:-0}"
+	printf '   NAT        %s（置信度 %s）\n' "$(_lc_nat_label "$LC_STUN_TYPE")" "$LC_STUN_CONF"
+	[ -n "$LC_STUN_DETAIL" ] && printf '              %s\n' "$LC_STUN_DETAIL"
+	printf '   归属地     %s\n' "$_geo"
+	printf '   评分       %s / 100  %s\n' "$SC_TOTAL" "$SC_GRADE"
+	printf '              出口类型    %-18s %2s/30  %s\n' "$(_lc_nat_label "$LC_STUN_TYPE")" "$SC_NAT_PTS" "$LC_STUN_DETAIL"
+	printf '              延迟        %-18s %2s/30  %s\n' "$(_lc_fmt_ms "${LC_TCP_MS:-}")" "$SC_LAT_PTS" "$([ "$LC_T_SAME" = "1" ] && printf '同网目标' || printf '跨网基线，上限 15')"
+	printf '              稳定性      %-18s %2s/25  %s 次尝试 / %s 次成功\n' "抖动 ${LC_JITTER:-0}ms 丢包 ${LC_LOSS:-100}%" "$SC_STAB_PTS" "${LC_ATTEMPTS:-0}" "${LC_OK_COUNT:-0}"
+	printf '              可用性      %-18s %2s/15  HTTP %s\n' "$(_lc_avail_label "$LC_AVAIL")" "$SC_AVAIL_PTS" "${LC_HTTP_CODE:-0}"
+	if [ -n "$SC_CAPS" ]; then
+		printf '%s\n' "$SC_CAPS" | while IFS= read -r _cap; do
+			[ -n "$_cap" ] && printf '              上限        %s\n' "$_cap"
+		done
+	fi
+	printf '   建议       %s\n' "$LC_ADVICE"
+}
+
+# ---- 目标挑选 ----
+
+_lc_target_valid() { # <源名> <ip>
+	if [ "${ISP_SPLIT_LC_FORCE_SAME:-0}" = "1" ]; then
+		return 0
+	fi
+	_tset=$(_lc_set_for "$1")
+	[ -n "$_tset" ] || return 1
+	command -v nft >/dev/null 2>&1 || return 1
+	nft get element inet mwan3 "$_tset" "{ $2 }" >/dev/null 2>&1
+}
+
+_lc_deadline_hit() {
+	[ $(( $(_lc_now) - LC_START )) -ge "$LC_BUDGET" ]
+}
+
+# 依次尝试：同运营商目标（解析 + @isp_* 校验 + 5 次测量）→ 跨网基线。
+# 返回 0=同网目标 1=跨网基线 2=全部失败
+_lc_pick_target() { # <device> <isp>
+	_ptdev=$1
+	_ptisp=${2:-}
+	LC_T_DOMAIN=""
+	LC_T_IP=""
+	LC_T_ISP=""
+	LC_T_MODE=none
+	LC_T_VALID=0
+	LC_T_SAME=0
+
+	while IFS='	' read -r _src _dom; do
+		[ -n "${_dom:-}" ] || continue
+		_lc_deadline_hit && break
+		for _ip in $(_lc_resolve "$_dom" 2); do
+			_lc_target_valid "$_src" "$_ip" || continue
+			_lc_measure "$_ptdev" "$_dom" "$_ip" "$(_lc_timeout)"
+			if [ "${LC_OK_COUNT:-0}" -gt 0 ]; then
+				LC_T_DOMAIN=$_dom
+				LC_T_IP=$_ip
+				LC_T_ISP=$_src
+				LC_T_MODE=same_isp
+				LC_T_VALID=1
+				LC_T_SAME=1
+				return 0
+			fi
+		done
+	done <<EOF
+$(_lc_target_groups "$_ptisp")
+EOF
+
+	# 兜底：跨网基线只用于"链路是否通"，不计入同网延迟分
+	for _dom in $(printf '%s' "$(_lc_opt LINE_CHECK_BASELINE 'www.baidu.com,www.qq.com')" | tr ',' ' '); do
+		_lc_deadline_hit && break
+		for _ip in $(_lc_resolve "$_dom" 1); do
+			_lc_measure "$_ptdev" "$_dom" "$_ip" "$(_lc_timeout)" 1
+			if [ "${LC_OK_COUNT:-0}" -gt 0 ]; then
+				LC_T_DOMAIN=$_dom
+				LC_T_IP=$_ip
+				LC_T_ISP=""
+				LC_T_MODE=baseline
+				LC_T_VALID=0
+				LC_T_SAME=0
+				return 1
+			fi
+		done
+	done
+	return 2
+}
+
+# ---- 单条 WAN ----
+
+_lc_run_wan() { # <iface> <dev> <up> <state> <wan_ip>
+	LC_IFACE=$1
+	LC_DEV=$2
+	LC_UP=$3
+	LC_STATE=$4
+	LC_WAN_IP=$5
+	LC_IP_CLASS=$(_lc_ip_class "$LC_WAN_IP")
+	LC_EXIT_IP=""
+	LC_EXIT_OK=0
+	LC_MULTI=0
+	LC_ISP=""
+	LC_T_DOMAIN=""
+	LC_T_IP=""
+	LC_T_ISP=""
+	LC_T_MODE=none
+	LC_T_VALID=0
+	LC_T_SAME=0
+	LC_DNS_MS=0
+	LC_TCP_MS=""
+	LC_TLS_MS=""
+	LC_TTFB_MS=""
+	LC_TOTAL_MS=""
+	LC_SAMPLES=""
+	LC_JITTER=0
+	LC_LOSS=100
+	LC_ATTEMPTS=0
+	LC_OK_COUNT=0
+	LC_HTTP_CODE=0
+	LC_AVAIL=none
+	LC_GEO_STATUS=unknown
+	LC_GEO_TEXT=""
+	LC_GEO_PROVIDER=""
+	LC_GEO_IP=""
+	LC_STUN_OK=0
+	LC_STUN_TYPE=unknown
+	LC_STUN_CONF=unknown
+	LC_STUN_DETAIL=""
+	LC_STUN_MAPS=""
+	LC_STUN_LPORT=0
+
+	# 出口 IP：WAN down 时也试一次（可能只是 mwan3 track 失败，链路还在）
+	LC_EXIT_IP=$(_lc_exit_ip "$LC_DEV")
+	if _lc_ip_valid "$LC_EXIT_IP"; then
+		LC_EXIT_OK=1
+	else
+		LC_EXIT_IP=""
+	fi
+
+	# 只有"WAN IP 本身是公网、出口却是另一个公网 IP"才叫多层 NAT/代理；
+	# WAN 是私网/CGNAT 时，出口不同属于正常 NAT，不重复叫多层。
+	if [ "$LC_IP_CLASS" = "public" ] && [ "$LC_EXIT_OK" = "1" ] && [ "$LC_EXIT_IP" != "$LC_WAN_IP" ]; then
+		LC_MULTI=1
+	fi
+
+	# 线路运营商：先看 WAN IP（公网才有意义），再看出口 IP
+	if [ "$LC_IP_CLASS" = "public" ]; then
+		LC_ISP=$(_lc_ip_isp "$LC_WAN_IP")
+	fi
+	if [ -z "$LC_ISP" ] && [ "$LC_EXIT_OK" = "1" ]; then
+		LC_ISP=$(_lc_ip_isp "$LC_EXIT_IP")
+	fi
+	# 自检夹具：强制线路运营商（真实环境不设置，始终以 @isp_* 集合为准）
+	[ -n "${ISP_SPLIT_LC_ISP:-}" ] && LC_ISP=$ISP_SPLIT_LC_ISP
+
+	if [ "$LC_UP" != "1" ]; then
+		LC_STUN_DETAIL="WAN 未连接，跳过探测"
+		LC_GEO_STATUS=noip
+		LC_ADVICE="线路未连接，先检查拨号/物理链路。"
+		LC_STUN_LPORT=0
+		_lc_score "$LC_STUN_TYPE" "" 0 100 none 0 0
+		return 0
+	fi
+
+	# 1) 同网目标 + 四段延迟
+	_lc_pick_target "$LC_DEV" "$LC_ISP"
+	_pick=$?
+	[ "$_pick" = "2" ] && LC_T_MODE=none
+
+	if _lc_deadline_hit; then
+		LC_GEO_STATUS=noip
+		LC_GEO_TEXT=""
+		LC_STUN_DETAIL="超出单次体检预算（${LC_BUDGET}s），已跳过 STUN/归属地"
+		LC_STUN_TYPE=unknown
+		LC_STUN_CONF=unknown
+		_lc_score "$LC_STUN_TYPE" "${LC_TCP_MS:-}" "${LC_JITTER:-0}" "${LC_LOSS:-100}" "$LC_AVAIL" "$LC_T_SAME" "$LC_UP"
+		_lc_make_advice
+		return 0
+	fi
+
+	# 2) 归属地（只发出口 IP；出口取不到但 WAN IP 是公网时用 WAN IP）
+	_geo_ip=${LC_EXIT_IP:-}
+	if [ -z "$_geo_ip" ] && [ "$LC_IP_CLASS" = "public" ]; then
+		_geo_ip=$LC_WAN_IP
+	fi
+	_lc_geo "$_geo_ip" "$LC_WAN_IP" "$LC_IP_CLASS"
+
+	# 3) STUN 双探测
+	LC_STUN_LPORT=$(_lc_local_port)
+	_lc_stun_probe "$LC_DEV" "$LC_WAN_IP" "$LC_IP_CLASS"
+
+	# 4) 评分
+	_lc_score "$LC_STUN_TYPE" "${LC_TCP_MS:-}" "${LC_JITTER:-0}" "${LC_LOSS:-100}" "$LC_AVAIL" "$LC_T_SAME" "$LC_UP"
+	_lc_make_advice
+}
+
+_lc_make_advice() {
+	_alab=$(_isp_label "${LC_ISP:-}")
+	[ -n "$_alab" ] || _alab="WAN ${LC_IFACE}"
+	LC_ADVICE=$(_lc_advice "$_alab" "$LC_STUN_TYPE" "$SC_GRADE" "${LC_LOSS:-0}" "${LC_TCP_MS:-}" "$LC_T_SAME" "${LC_SOCAT:-1}")
+}
+
+# ---- 缓存 ----
+
+_lc_cache_serve() { # <json:0/1> <requested wans>
+	_cj=$1
+	_cw=$2
+	read -r _gen _int _geo _prov _soc _cwans <"$LC_CACHE/meta" 2>/dev/null || return 1
+	_now=$(_lc_now)
+	_age=$((_now - _gen))
+	[ "$_age" -ge 0 ] 2>/dev/null || return 1
+	[ "$_age" -lt "$_int" ] 2>/dev/null || return 1
+	for _w in $_cw; do
+		case " $_cwans " in *" $_w "*) ;; *) return 1 ;; esac
+		[ -f "$LC_CACHE/wan-$_w.json" ] || return 1
+		[ -f "$LC_CACHE/wan-$_w.txt" ] || return 1
+	done
+
+	if [ "$_cj" = "1" ]; then
+		printf '{"version":"%s","command":"linecheck","generated":%s,"cached":true,"age":%s,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[' \
+			"$ISP_VERSION" "$_gen" "$_age" "$_int" \
+			"$([ "$_geo" = "1" ] && printf true || printf false)" "$_prov" \
+			"$([ "$_soc" = "1" ] && printf true || printf false)"
+		_first=1
+		for _w in $_cw; do
+			[ "$_first" = "1" ] || printf ','
+			_first=0
+			cat "$LC_CACHE/wan-$_w.json"
+		done
+		printf '],"errors":'
+		cat "$LC_CACHE/errors.json" 2>/dev/null || printf '[]'
+		printf '}\n'
+	else
+		printf '线路体检 · v%s  %s（缓存，%s 秒前）\n' "$ISP_VERSION" "$(_lc_dt "$_gen")" "$_age"
+		_lc_privacy_line
+		for _w in $_cw; do
+			printf '\n'
+			cat "$LC_CACHE/wan-$_w.txt"
+		done
+		printf '\n提示：%s 秒内重复执行直接返回缓存；--force 强制重测。\n' "$_int"
+	fi
+	return 0
+}
+
+_lc_dt() {
+	date -d "@${1:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S'
+}
+
+_lc_privacy_line() {
+	if [ "$(_lc_opt LINE_CHECK_GEO 1)" = "1" ]; then
+		_lc_gp=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
+		[ "$_lc_gp" = "auto" ] && _lc_gp="百度优先，失败转 ip-api"
+		[ "$_lc_gp" = "off" ] && _lc_gp="关闭"
+		printf '隐私：归属地查询已开启，仅把每条线的出口公网 IP 发给 %s；不发送内网地址/设备名/MAC/流量内容。\n' "$_lc_gp"
+	else
+		printf '隐私：归属地查询已关闭，本次不发起任何第三方归属地请求。\n'
+	fi
+}
+
+# ---- 主命令 ----
+
+cmd_linecheck() {
+	_lc_json=0
+	_lc_force=0
+	_lc_only=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--json) _lc_json=1 ;;
+		--force) _lc_force=1 ;;
+		--wan)
+			shift
+			[ $# -gt 0 ] || die "用法: isp-split linecheck [--json] [--wan <接口>] [--force]"
+			_lc_only=$1
+			;;
+		-h | --help)
+			printf '用法: isp-split linecheck [--json] [--wan <接口>] [--force]\n'
+			return 0
+			;;
+		*)
+			die "未知参数 '$1'（用法: isp-split linecheck [--json] [--wan <接口>] [--force]）"
+			;;
+		esac
+		shift
+	done
+
+	[ "$(_lc_opt LINE_CHECK_ENABLE 1)" = "1" ] || die "线路体检已关闭（LINE_CHECK_ENABLE=0）"
+
+	LC_START=$(_lc_now)
+	LC_BUDGET=$(_lc_budget)
+	LC_INTERVAL=$(_lc_int "$(_lc_opt LINE_CHECK_MIN_INTERVAL 60)")
+	[ "$LC_INTERVAL" -ge 15 ] 2>/dev/null || LC_INTERVAL=60
+	[ "$LC_INTERVAL" -le 3600 ] 2>/dev/null || LC_INTERVAL=3600
+	LC_SOCAT=0
+	command -v socat >/dev/null 2>&1 && LC_SOCAT=1
+	[ "${ISP_SPLIT_LC_NO_SOCAT:-0}" = "1" ] && LC_SOCAT=0
+
+	mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+	# 收集 WAN
+	if [ -n "$_lc_only" ]; then
+		_lc_line=$(_lc_wan_one "$_lc_only") || {
+			if [ "$_lc_json" = "1" ]; then
+				printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[],"errors":["找不到接口 %s"]}\n' \
+					"$ISP_VERSION" "$LC_START" "$LC_INTERVAL" \
+					"$([ "$(_lc_opt LINE_CHECK_GEO 1)" = "1" ] && printf true || printf false)" \
+					"$(_lc_json_esc "$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)")" \
+					"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)" \
+					"$(_lc_json_esc "$_lc_only")"
+			else
+				printf '线路体检：找不到接口 %s（既不是 mwan3 接口，也不是运行时设备）\n' "$_lc_only" >&2
+			fi
+			return 1
+		}
+		_lc_wans_list=$_lc_line
+	else
+		_lc_wans_list=$(_lc_wans)
+	fi
+	_lc_wnames=$(printf '%s\n' "$_lc_wans_list" | awk -F'\t' 'NF>=2{print $1}' | tr '\n' ' ' | sed 's/ $//')
+
+	if [ -z "$_lc_wnames" ]; then
+		if [ "$_lc_json" = "1" ]; then
+			printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[],"errors":["没有启用的 WAN（检查 mwan3 接口 enabled=1）"]}\n' \
+				"$ISP_VERSION" "$LC_START" "$LC_INTERVAL" \
+				"$([ "$(_lc_opt LINE_CHECK_GEO 1)" = "1" ] && printf true || printf false)" \
+				"$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)" \
+				"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)"
+		else
+			printf '线路体检：没有启用的 WAN。先在 mwan3 里启用至少一个接口，或用 --wan 指定。\n'
+		fi
+		return 0
+	fi
+
+	# 缓存：60s 内直接返回；--force 绕过
+	if [ "$_lc_force" = "0" ] && [ -d "$LC_CACHE" ]; then
+		_lc_cache_serve "$_lc_json" "$_lc_wnames" && return 0
+	fi
+
+	_lc_tmp=$LC_CACHE.tmp.$$
+	rm -rf "$_lc_tmp"
+	mkdir -p "$_lc_tmp" || die "无法创建缓存目录 $_lc_tmp"
+
+	_first=1
+	_lc_errs=""
+	printf '%s\n' "$_lc_wans_list" | while IFS='	' read -r _if _dev _up _state _ip; do
+		[ -n "$_if" ] || continue
+		_lc_run_wan "$_if" "$_dev" "$_up" "$_state" "$_ip"
+		_lc_wan_json >"$_lc_tmp/wan-$_if.json"
+		_lc_wan_text >"$_lc_tmp/wan-$_if.txt"
+		[ -n "$LC_STUN_DETAIL" ] || true
+	done
+
+	# 上面 while 在管道子 shell 里，变量不会带回来；缓存文件已经落盘，
+	# 这里按文件重新组装，避免依赖子 shell 状态。
+	_lc_nowt=$(_lc_now)
+	_lc_geo_en=$(_lc_opt LINE_CHECK_GEO 1)
+	_lc_geo_prov=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
+	[ "$_lc_geo_en" = "0" ] && _lc_geo_prov=off
+	[ "$_lc_geo_prov" = "off" ] && _lc_geo_en=0
+	printf '%s %s %s %s %s %s\n' "$_lc_nowt" "$LC_INTERVAL" "$_lc_geo_en" "$_lc_geo_prov" "$LC_SOCAT" "$_lc_wnames" >"$_lc_tmp/meta"
+	printf '[]\n' >"$_lc_tmp/errors.json"
+
+	rm -rf "$LC_CACHE"
+	mv "$_lc_tmp" "$LC_CACHE" 2>/dev/null || { rm -rf "$_lc_tmp"; die "无法写入缓存目录 $LC_CACHE"; }
+
+	if [ "$_lc_json" = "1" ]; then
+		printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[' \
+			"$ISP_VERSION" "$_lc_nowt" "$LC_INTERVAL" \
+			"$([ "$_lc_geo_en" = "1" ] && printf true || printf false)" "$_lc_geo_prov" \
+			"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)"
+		_first=1
+		for _w in $_lc_wnames; do
+			[ "$_first" = "1" ] || printf ','
+			_first=0
+			cat "$LC_CACHE/wan-$_w.json"
+		done
+		printf '],"errors":[]}\n'
+	else
+		printf '线路体检 · v%s  %s\n' "$ISP_VERSION" "$(_lc_dt "$_lc_nowt")"
+		_lc_privacy_line
+		for _w in $_lc_wnames; do
+			printf '\n'
+			cat "$LC_CACHE/wan-$_w.txt"
+		done
+		printf '\n提示：%s 秒内重复执行直接返回缓存；--force 强制重测。\n' "$LC_INTERVAL"
+	fi
+	return 0
+}
+
+# 自检/单测可以只加载函数，不执行主分发（selftest.sh 用）。
+if [ "${ISP_SPLIT_LIB_ONLY:-0}" = "1" ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
 # ---------------------------------------------------------------- main
 
 # 三个表值都会被 `for row in $ISP_TABLE` 这种方式展开，而展开会做路径名
@@ -3906,6 +5641,7 @@ verify) cmd_verify ;;
 status) shift; cmd_status "$@" ;;
 health) shift; cmd_health "$@" ;;
 probe) cmd_probe ;;
+linecheck) shift; cmd_linecheck "$@" ;;
 rollback) cmd_rollback ;;
 dns) cmd_dns ;;
 conf) shift; cmd_conf "$@" ;;
@@ -3943,6 +5679,7 @@ uninstall) cmd_uninstall ;;
   status     查看条目数与命中统计
   health     数据源健康度 + 双线状态（--json 给 LuCI 用）
   probe      分线实测出口速度
+  linecheck  线路体检：公网/NAT/四段延迟/归属地/评分（--json，--wan，--force）
   dns        生成多线路 DNS 配置（域名按线路选 DNS）
   export     导出给代理侧用：export mihomo|singbox|text <目录>
   install    注册开机自启与每日更新

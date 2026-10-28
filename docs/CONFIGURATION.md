@@ -209,6 +209,97 @@ meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new \
 
 ---
 
+## 线路体检（LINE_CHECK_*）
+
+0.3.0 新增 `isp-split linecheck`：对每条启用的 WAN 依次做
+
+1. **本机口 IP 分类**：公网 / CGNAT（`100.64.0.0/10`）/ 私网；
+2. **出口 IP**：`curl --interface <l3_device>` 请求 `LINE_CHECK_ECHO_URLS`；
+   WAN IP 本身是公网、出口却是另一个公网 IP 时标“多层 NAT/代理”；
+3. **同运营商目标四段延迟**：域名清单 → DNS 解析 → 用 `@isp_*` 集合校验归属
+   → `curl --resolve` 钉住已验证 IP，5 次尝试；显示 DNS / TCP / TLS / 首字节，
+   评分用 TCP 建连中位数；
+4. **归属地**：只发送出口公网 IP，百度优先、ip-api 兜底，24h 缓存；
+5. **双 STUN**：`socat ...,so-bindtodevice=<l3_device>`，同一本地端口打两个
+   不同 IP 的服务器，判五态 NAT；
+6. **评分**：公开规则表 + 硬上限 + 完整明细 + 一句话建议。
+
+```sh
+isp-split linecheck                 # 人类可读
+isp-split linecheck --json          # 给 LuCI / 脚本
+isp-split linecheck --wan wan2      # 只体检指定接口（也接受 pppoe-wan1/br-lan 等设备名）
+isp-split linecheck --force         # 绕过 60s 结果缓存，强制重测
+```
+
+### 配置项
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LINE_CHECK_ENABLE` | `1` | 总开关；`0` 时命令直接拒绝执行，LuCI 显示已关闭 |
+| `LINE_CHECK_GEO` | `1` | 归属地隐私开关；`1` 允许把每条 WAN 的**出口公网 IP**发给第三方，`0` 完全不发请求 |
+| `LINE_CHECK_GEO_PROVIDER` | `auto` | `auto`（百度优先，失败转 ip-api）/ `baidu` / `ip-api` / `off` |
+| `LINE_CHECK_GEO_TTL` | `86400` | 同一出口 IP 的归属地缓存秒数（最小 60） |
+| `LINE_CHECK_MIN_INTERVAL` | `60` | 结果缓存与手动触发最小间隔（15-3600 秒）；`--force` 可绕过 |
+| `LINE_CHECK_TIMEOUT` | `3` | 单次探测超时（1-10 秒），curl 与 socat 共用 |
+| `LINE_CHECK_BUDGET` | `20` | 单条 WAN 的探测预算；超出后跳过剩余 STUN/归属地并在明细里标注 |
+| `LINE_CHECK_TARGETS` | 电信/联通/移动/教育网各 2 个域名 | 格式 `<运营商源名>:<域名1>,<域名2>`；源名必须与 `ISP_TABLE` 第一列一致。线路运营商由 WAN IP / 出口 IP 匹配 `@isp_*` 得出；两者都不在集合里时直接走跨网基线，不猜运营商 |
+| `LINE_CHECK_BASELINE` | `www.baidu.com,www.qq.com` | 同网目标全部失败时的跨网基线；只判连通性，延迟项最高 15 分 |
+| `LINE_CHECK_STUN_SERVERS` | miwifi / douyu / freeswitch / cloudflare（bilibili 可选） | `<域名或 IP>:<端口>`；运行时按厂商优先解析，同一本地端口探测，失败自动换下一个；公网 STUN 可达性会波动 |
+| `LINE_CHECK_ECHO_URLS` | `api.ipify.org,ipv4.icanhazip.com` | 出口 IP 回显服务，按顺序尝试 |
+| `LINE_CHECK_UA` | 浏览器 UA | 部分运营商站点对默认 curl UA 返回 412/418，必须带浏览器 UA |
+
+### 隐私声明
+
+开启 `LINE_CHECK_GEO=1` 后，体检会把**每条 WAN 的出口公网 IP**发送给第三方
+（默认百度，失败时 `ip-api.com`）查询归属地。
+
+- 只发送出口 IP，**不发送**内网地址、设备名、MAC、流量内容；
+- `ip-api` 使用 **HTTP**，传输不加密；介意时把 `LINE_CHECK_GEO_PROVIDER` 固定为 `baidu`；
+- `LINE_CHECK_GEO=0` 时不发起任何归属地请求，卡片显示“归属地：未查询（隐私开关关闭）”；
+- 关闭后仍可用本地 `@isp_*` 集合判断运营商大类（电信/联通/移动/教育网），不需要外发。
+
+### NAT 五态（不是 NAT1-4）
+
+| 观测 | 判定 | 含义 |
+|---|---|---|
+| WAN IP ∈ `100.64.0.0/10`，或 STUN 映射是私网/CGNAT | **CGNAT / 多层 NAT** | 端口映射不可用 |
+| 两个探测点映射一致，且公网 WAN IP/本地端口与映射完全一致 | **公网** | 无 NAT，可直接映射 |
+| 两个探测点映射一致，但 IP 或端口经过转换 | **锥形 NAT（未细分）** | 端口映射可能可用 |
+| 两个探测点映射不同 | **对称 / 多出口 NAT** | P2P、端口映射成功率低 |
+| 两个探测点都超时/坏包 | **未知** | UDP 3478 可能被阻断；不判死 |
+
+只在两个不同厂商的服务器结果一致时给 `high` 置信度；只有一个探测点成功给
+`medium`。公网 STUN 基本不支持 `CHANGE-REQUEST`，因此**不做** Full Cone /
+Restricted / Port-Restricted 细分。
+
+### 评分与硬上限
+
+| 维度 | 分值 | 规则 |
+|---|---:|---|
+| 出口类型 | 30 | 公网 30；锥形 20；对称 8；CGNAT 0；未知 10 |
+| 延迟 | 30 | 同网 TCP 建连中位数：≤20ms 30；≤40 26；≤70 20；≤110 12；≤160 5；>160/超时 0 |
+| 稳定性 | 25 | 抖动 ≤5/≤15/≤30ms → 15/10/5；丢包 0/≤20/≤50% → 10/6/2（可叠加，上限 25） |
+| 可用性 | 15 | DNS+TCP+TLS 且 HTTP<500 → 15；4xx → 12；5xx/TLS 失败 → 8；TCP/DNS 失败 → 0 |
+
+硬上限：WAN down → 0/D；CGNAT 或对称 NAT → 69/C；丢包 >20% → 69/C；
+同网目标 >160ms 或全超时 → 69/C；只有跨网基线时延迟项最高 15。
+档位：A ≥85，B 70-84，C 50-69，D <50。
+
+### 缓存与并发
+
+结果按“本次 WAN 集合”缓存到 `/etc/isp-split/state/linecheck/`：
+`LINE_CHECK_MIN_INTERVAL` 秒内重复执行直接返回上次 JSON/文本（`"cached":true`，
+`age` 为缓存年龄），不会重复打 STUN/CDN；`--force` 绕过。`--wan` 只体检并缓存
+指定线路，之后的全量调用会重新体检其余线路。
+
+### socat 缺失
+
+`socat` 是 `isp-split` 的包依赖（`DEPENDS+=+socat`）。若固件被裁剪或手动删除：
+体检仍可完成公网/CGNAT/私网、出口 IP、延迟、归属地与评分，NAT 项显示
+“未知（socat 未安装）”，并在建议里提示安装（`opkg install socat` / `apk add socat`）。
+
+---
+
 ## 多数据源（v0.2.1 默认双源）
 
 0.2.1 默认启用 **主源 + 校验源**（FIX12 方案 c）：

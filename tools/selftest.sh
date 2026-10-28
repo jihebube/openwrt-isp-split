@@ -2279,6 +2279,196 @@ else
 	ng "B-7 版本串不一致: script=$_v_script main=$_v_main luci=$_v_luci feed=$_v_feed1/$_v_feed2 release=$_r_main/$_r_luci/$_r_feed1/$_r_feed2"
 fi
 
+# ---- 16. 线路体检（0.3.0 透视更新） ----
+echo "== 16. 线路体检（0.3.0）"
+LCF=$TMP/lc-fix
+LCCONF=$TMP/lc.conf
+LCBASE=$TMP/lc-base
+rm -rf "$LCBASE" "$LCF"
+mkdir -p "$LCBASE"
+cp "$ROOT/files/etc/isp-split.conf" "$LCCONF"
+
+if sh "$ROOT/tools/linecheck-fixtures.sh" "$LCF" >/dev/null 2>&1 &&
+   [ "$(wc -c <"$LCF/stun-32.bin")" -eq 32 ] &&
+   [ "$(wc -c <"$LCF/stun-84.bin")" -eq 84 ]; then
+	ok "STUN fixture 生成（32/84 字节、超时、坏包）"
+else
+	ng "STUN fixture 生成失败"
+fi
+
+# 只加载函数，不执行主分发
+lc_lib() {
+	(
+		ISP_SPLIT_CONF="$LCCONF" ISP_SPLIT_BASE="$LCBASE" ISP_SPLIT_LIB="$LIB" \
+			ISP_SPLIT_LIB_ONLY=1
+		export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB ISP_SPLIT_LIB_ONLY
+		. "$ROOT/files/usr/sbin/isp-split"
+		"$@"
+	)
+}
+
+# 16.1 IP 分类（公网 / CGNAT / 私网 / 非法）
+_lc_bad=0
+for _pair in \
+	100.64.1.2:cgnat 100.127.255.254:cgnat 100.128.0.1:public \
+	10.1.2.3:private 172.16.5.4:private 172.32.1.1:public \
+	192.168.1.1:private 8.8.8.8:public 127.0.0.1:private \
+	198.18.0.1:private 1.2.3.256:invalid bad:invalid; do
+	_ip=${_pair%:*}
+	_want=${_pair#*:}
+	_got=$(lc_lib _lc_ip_class "$_ip")
+	[ "$_got" = "$_want" ] || { _lc_bad=1; echo "    $_ip 期望 $_want，实际 $_got"; }
+done
+[ "$_lc_bad" -eq 0 ] && ok "IP 分类：公网 / CGNAT / 私网 / 非法（12 组边界）" ||
+	ng "IP 分类存在错误"
+
+# 16.2 NAT 五态判定
+_lc_nat() { lc_lib _lc_nat_verdict "$@" | cut -d'|' -f1; }
+_lc_bad=0
+[ "$(_lc_nat 100.64.1.2 cgnat 1.2.3.4:5 1.2.3.4:5 5)" = cgnat ] || _lc_bad=1
+[ "$(_lc_nat 203.0.113.5 public 203.0.113.5:5000 203.0.113.5:5000 5000)" = public ] || _lc_bad=1
+[ "$(_lc_nat 203.0.113.5 public 1.2.3.4:40000 1.2.3.4:40000 40000)" = cone ] || _lc_bad=1
+[ "$(_lc_nat 203.0.113.5 public 1.2.3.4:40000 1.2.3.5:40001 40000)" = symmetric ] || _lc_bad=1
+[ "$(_lc_nat 203.0.113.5 public - - 40000)" = unknown ] || _lc_bad=1
+[ "$(_lc_nat 203.0.113.5 public 10.0.0.5:40000 10.0.0.5:40000 40000)" = cgnat ] || _lc_bad=1
+[ "$_lc_bad" -eq 0 ] && ok "NAT 五态判定：CGNAT / 公网 / 锥形 / 对称 / 未知（+多层 NAT）" ||
+	ng "NAT 五态判定存在错误"
+
+# 16.3 STUN 纯 shell 解析（32/84 字节 + 坏包）
+_lc_parse() { lc_lib _lc_stun_parse "$1" 112233445566778899aabbcc; }
+_lc_bad=0
+for _f in stun-32 stun-84; do
+	[ "$(_lc_parse "$LCF/$_f.bin")" = "121.20.198.57 44653" ] || { _lc_bad=1; echo "    $_f 解析失败"; }
+done
+for _f in stun-timeout stun-bad-magic stun-bad-txid stun-bad-type stun-short stun-bad-len; do
+	[ -z "$(_lc_parse "$LCF/$_f.bin")" ] || { _lc_bad=1; echo "    $_f 应被拒绝"; }
+done
+[ "$_lc_bad" -eq 0 ] && ok "STUN 解析：32/84 字节成功，坏 magic/txid/type/长度/截断全部丢弃" ||
+	ng "STUN 解析存在错误"
+
+# 16.4 评分规则 + 硬上限
+_lc_score_res() {
+	(
+		ISP_SPLIT_CONF="$LCCONF" ISP_SPLIT_BASE="$LCBASE" ISP_SPLIT_LIB="$LIB" 			ISP_SPLIT_LIB_ONLY=1
+		export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB ISP_SPLIT_LIB_ONLY
+		. "$ROOT/files/usr/sbin/isp-split"
+		_lc_score "$@"
+		echo "$SC_TOTAL|$SC_GRADE|$SC_LAT_PTS|$SC_CAPS"
+	)
+}
+_lc_bad=0
+_r=$(_lc_score_res public 40 3 0 full 1 1)
+[ "${_r%%|*}" = "96" ] && [ "$(echo "$_r" | cut -d'|' -f2)" = "A" ] || { _lc_bad=1; echo "    全通公网: $_r"; }
+_r=$(_lc_score_res cgnat 30 5 0 full 1 1)
+[ "${_r%%|*}" = "66" ] && [ "$(echo "$_r" | cut -d'|' -f2)" = "C" ] || { _lc_bad=1; echo "    CGNAT: $_r"; }
+_r=$(_lc_score_res symmetric 45 10 0 full 1 1)
+[ "${_r%%|*}" = "63" ] && [ "$(echo "$_r" | cut -d'|' -f2)" = "C" ] || { _lc_bad=1; echo "    对称: $_r"; }
+_r=$(_lc_score_res public 40 12 30 full 1 1)
+[ "${_r%%|*}" = "69" ] && echo "$_r" | grep -q "丢包 > 20%" || { _lc_bad=1; echo "    丢包上限: $_r"; }
+# 跨网基线：30ms 原本 26 分，必须被压到 15
+_r=$(_lc_score_res public 30 3 0 full 0 1)
+[ "$(echo "$_r" | cut -d'|' -f3)" = "15" ] || { _lc_bad=1; echo "    跨网基线延迟项: $_r"; }
+[ "$_lc_bad" -eq 0 ] && ok "评分：96/A、CGNAT 66/C、对称 63/C、丢包上限 69/C、跨网延迟≤15" ||
+	ng "评分规则存在错误"
+
+# 16.5 JSON schema + 五态（夹具全离线）
+lc_run_conf() { # <conf> [args...]
+	_conf=$1
+	shift
+	ISP_SPLIT_CONF="$_conf" ISP_SPLIT_BASE="$LCBASE" \
+		ISP_SPLIT_LC_WANS="wan1|wan1|1|online|203.0.113.5 wan2|wan2|1|online|100.64.1.2" \
+		ISP_SPLIT_LC_EXIT_IPS="198.51.100.7,198.51.100.8" \
+		ISP_SPLIT_LC_LAT="dns=5,tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5" \
+		ISP_SPLIT_LC_FORCE_SAME=1 \
+		ISP_SPLIT_LC_STUN="ok:1.2.3.4:40000|ok:1.2.3.4:40000" \
+		ISP_SPLIT_LC_GEO_TEXT="河北省 唐山市 联通|baidu" \
+		ISP_SPLIT_LC_RESOLVE_IPS="124.236.19.250" \
+		ISP_SPLIT_LC_ISP="chinatelecom" \
+		sh "$ROOT/files/usr/sbin/isp-split" linecheck "$@"
+}
+lc_run() { lc_run_conf "$LCCONF" "$@"; }
+
+JQ=
+command -v jsonfilter >/dev/null 2>&1 && JQ=jsonfilter
+lc_run --json >"$TMP/lc1.json" 2>"$TMP/lc1.err"
+if [ -s "$TMP/lc1.json" ] && ! grep -q '^{"version":"0.3.0"' "$TMP/lc1.json"; then
+	ng "linecheck --json 顶层形状异常"
+elif [ -n "$JQ" ]; then
+	_v=$(jsonfilter -i "$TMP/lc1.json" -e '@.version' 2>/dev/null)
+	_n=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[*].iface' 2>/dev/null | wc -l)
+	_g=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[0].score.grade' 2>/dev/null)
+	_b=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[0].score.breakdown[*].key' 2>/dev/null | wc -l)
+	_t=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[1].score.total' 2>/dev/null)
+	_c=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[1].nat.type' 2>/dev/null)
+	if [ "$_v" = "0.3.0" ] && [ "$_n" = "2" ] && [ -n "$_g" ] && [ "$_b" = "4" ] &&
+	   [ -n "$_t" ] && [ "$_c" = "cgnat" ]; then
+		ok "JSON schema：version/2 条 WAN/score 四段明细/嵌套 NAT 完整"
+	else
+		ng "JSON schema 不完整: version=$_v wans=$_n grade=$_g breakdown=$_b total=$_t nat=$_c"
+	fi
+else
+	grep -q '"breakdown":\[' "$TMP/lc1.json" && grep -q '"caps":\[' "$TMP/lc1.json" &&
+		ok "JSON schema 关键字段存在（无 jsonfilter，仅结构检查）" ||
+		ng "JSON schema 关键字段缺失"
+fi
+
+# 16.6 缓存命中 / --force / --wan
+sleep 1
+lc_run --json >"$TMP/lc2.json" 2>/dev/null
+lc_run --json --force >"$TMP/lc3.json" 2>/dev/null
+lc_run --json --wan wan2 >"$TMP/lc4.json" 2>/dev/null
+if [ -n "$JQ" ]; then
+	_c1=$(jsonfilter -i "$TMP/lc2.json" -e '@.cached')
+	_a1=$(jsonfilter -i "$TMP/lc2.json" -e '@.age')
+	_c2=$(jsonfilter -i "$TMP/lc3.json" -e '@.cached')
+	_n3=$(jsonfilter -i "$TMP/lc4.json" -e '@.wans[*].iface' 2>/dev/null | wc -l)
+	_i3=$(jsonfilter -i "$TMP/lc4.json" -e '@.wans[0].iface')
+	if [ "$_c1" = "true" ] && [ "$_a1" -ge 1 ] 2>/dev/null &&
+	   [ "$_c2" = "false" ] && [ "$_n3" = "1" ] && [ "$_i3" = "wan2" ]; then
+		ok "结果缓存：60s 内 cached=true（age=$_a1），--force 重算，--wan 只返回指定线"
+	else
+		ng "缓存/--force/--wan 异常: cached=$_c1 age=$_a1 force=$_c2 n=$_n3 iface=$_i3"
+	fi
+else
+	grep -q '"cached":true' "$TMP/lc2.json" && grep -q '"cached":false' "$TMP/lc3.json" &&
+		ok "缓存/--force 关键字段正确（无 jsonfilter）" || ng "缓存/--force 异常"
+fi
+
+# 16.7 socat 缺失降级（不能带 STUN 夹具，否则不会走 socat 缺失分支）
+lc_run_nostun() {
+	ISP_SPLIT_CONF="$LCCONF" ISP_SPLIT_BASE="$LCBASE" 		ISP_SPLIT_LC_WANS="wan1|wan1|1|online|203.0.113.5" 		ISP_SPLIT_LC_EXIT_IPS="198.51.100.7" 		ISP_SPLIT_LC_LAT="dns=5,tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5" 		ISP_SPLIT_LC_FORCE_SAME=1 ISP_SPLIT_LC_NO_SOCAT=1 		ISP_SPLIT_LC_GEO_TEXT="x|baidu" ISP_SPLIT_LC_RESOLVE_IPS="124.236.19.250" 		sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --force
+}
+lc_run_nostun >"$TMP/lc-socat.json" 2>/dev/null
+if grep -q '"socat":false' "$TMP/lc-socat.json" &&
+   grep -q '"type":"unknown"' "$TMP/lc-socat.json" &&
+   grep -q 'socat 未安装' "$TMP/lc-socat.json"; then
+	ok "socat 缺失：全局 socat=false、NAT 降级 unknown 并提示安装"
+else
+	ng "socat 缺失降级异常"
+fi
+
+# 16.8 归属地关闭：不发请求、状态 off
+sed 's/^LINE_CHECK_GEO=1$/LINE_CHECK_GEO=0/' "$LCCONF" >"$TMP/lc-geo0.conf"
+lc_run_conf "$TMP/lc-geo0.conf" --json --force >"$TMP/lc-geo0.json" 2>/dev/null
+if grep -q '"geo_enabled":false' "$TMP/lc-geo0.json" &&
+   grep -q '"status":"off"' "$TMP/lc-geo0.json"; then
+	ok "LINE_CHECK_GEO=0：JSON geo_enabled=false、状态 off，不发起第三方请求"
+else
+	ng "归属地关闭行为异常"
+fi
+
+# 16.9 坏包 fixture 走完整链路：两个探测点都坏 → 未知 + 明确提示
+mkdir -p "$TMP/lc-fxbad"
+cp "$LCF/stun-bad-magic.bin" "$TMP/lc-fxbad/stun-1.bin"
+cp "$LCF/stun-bad-txid.bin" "$TMP/lc-fxbad/stun-2.bin"
+( export ISP_SPLIT_LC_STUN_FIXTURE_DIR="$TMP/lc-fxbad"; lc_run --json --force ) >"$TMP/lc-bad.json" 2>/dev/null
+if grep -q '"type":"unknown"' "$TMP/lc-bad.json" &&
+   grep -q '响应校验失败' "$TMP/lc-bad.json"; then
+	ok "坏包 fixture：解析层丢弃，NAT 判未知且提示响应校验失败"
+else
+	ng "坏包 fixture 处理异常"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then
