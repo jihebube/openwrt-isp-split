@@ -6,16 +6,28 @@
 /*
  * LuCI「线路体检」页（0.3.0）
  *
- * 数据来自一次 `isp-split linecheck --json`（可选 --force）：
- *   · 服务端已按 LINE_CHECK_MIN_INTERVAL 做结果缓存，60s 内重复调用不会
- *     再打 STUN/CDN；本页只负责把缓存状态和倒计时显示清楚。
- *   · 页面不轮询、不自动重测：体检会访问第三方归属地服务并产生真实流量，
- *     必须由用户点「立即体检」触发。
- *   · 所有展示字段都来自 JSON，前端不猜 NAT 类型、不算分；评分规则与硬上限
- *     在 shell 侧唯一实现，避免两套口径。
+ * 设计注记（BUG-23，为什么 load() 里一行 exec 都没有）：
+ *   这个页面的黄金场景恰恰是“网络最差的时候”：用户怀疑某条线坏了才来体检。
+ *   而真实探测（STUN 多点 × 超时 + 双线 HTTP 采样）要 21-60 秒，网络越差越慢；
+ *   rpcd 的 exec 是硬超时（VM 上 /etc/config/rpcd timeout=30），超时后 promise
+ *   reject，LuCI 连 render 都不会进——页面只剩菜单，用户在最需要体检的时候
+ *   拿到一张白屏。所以：
+ *     · load() 只 fs.read 一份缓存快照（state/linecheck/last.json），零 exec；
+ *     · 没缓存就渲染“尚未体检”占位卡，按钮仍然可用；
+ *     · 点按钮 = 让 CLI 起一个后台探测进程（linecheck --background），然后页面
+ *       每 2.5s 读一次快照比较 generated，最长等 90s。
+ *
+ * 数据口径：评分、NAT 五态、四段延迟全部由 shell 侧算好写进 JSON，前端不猜、
+ * 不算分，避免两套规则。
  */
 
 var CMD = '/usr/sbin/isp-split';
+var CACHE = '/etc/isp-split/state/linecheck/last.json';
+var LOCK = '/etc/isp-split/state/linecheck.lock';
+var POLL_MS = 2500;
+var POLL_MAX_MS = 90000;
+/* 锁目录超过这个岁数就当崩溃残留，不再让页面“假装在体检” */
+var LOCK_STALE_S = 300;
 
 var ICONS = {
 	refresh: '<path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 4v7h-7"/>',
@@ -33,25 +45,26 @@ function svgIcon(name, size) {
 	return span;
 }
 
-function parseJson(res) {
+/* fs.read 解析出来的是字符串（不是 exec 的 {stdout}）；失败一律返回 null */
+function parseStr(s) {
 	try {
-		return JSON.parse(((res && res.stdout) || '').trim() || 'null');
+		var v = JSON.parse(String(s || '').trim() || 'null');
+		return (v && typeof v === 'object') ? v : null;
 	} catch (e) {
 		return null;
 	}
 }
 
-function execJson(args) {
-	return fs.exec(CMD, args).then(function(res) {
-		var data = parseJson(res);
-		if (res && res.code && !data) {
-			var out = ((res.stdout || '') + (res.stderr || '')).trim();
-			throw new Error(out || ('isp-split ' + args.join(' ') + ' 退出码 ' + res.code));
-		}
-		if (!data)
-			throw new Error('isp-split ' + args.join(' ') + ' 没有返回可解析的 JSON');
-		return data;
-	});
+function nowSec() {
+	return Math.floor(Date.now() / 1000);
+}
+
+function fmtAge(sec) {
+	if (sec < 90)
+		return sec + _(' 秒前');
+	if (sec < 3600)
+		return Math.round(sec / 60) + _(' 分钟前');
+	return Math.round(sec / 3600) + _(' 小时前');
 }
 
 function fmtMs(v) {
@@ -113,10 +126,6 @@ function targetText(t) {
 		' · ' + (t.mode === 'same_isp' ? _('同运营商') : _('跨网基线'));
 }
 
-function text(tag, cls, value) {
-	return E(tag, { 'class': cls }, [ value ]);
-}
-
 /* 一行 key/value；value 可以是字符串或 DOM 节点 */
 function row(label, value) {
 	return E('div', { 'class': 'lc-row' }, [
@@ -133,20 +142,28 @@ function seg(label, value) {
 }
 
 return view.extend({
+	/* 零 exec：只读缓存快照 + 看一眼锁（判断是否有体检在跑） */
 	load: function() {
-		return fs.exec(CMD, ['linecheck', '--json']).then(function(res) {
-			return { res: res, data: parseJson(res) };
-		}).catch(function(err) {
-			return { res: null, data: null, error: String(err) };
+		return fs.read(CACHE).then(function(s) {
+			return { raw: s, data: parseStr(s) };
+		}).catch(function() {
+			/* 文件不存在 / 权限不足 / 还没体检过：都按“尚未体检”处理 */
+			return { raw: null, data: null };
+		}).then(function(res) {
+			return L.resolveDefault(fs.stat(LOCK), null).then(function(st) {
+				var mt = (st && (+st.mtime || 0)) || 0;
+				res.running = !!mt && (nowSec() - mt) < LOCK_STALE_S;
+				return res;
+			}, function() { return res; });
 		});
 	},
 
 	render: function(loaded) {
 		var self = this;
-		this.data = loaded && loaded.data;
-		this.loadError = loaded && loaded.error;
-		this.nextAt = 0;
+		this.data = (loaded && loaded.data) || null;
+		this.baseGen = this.data ? (+this.data.generated || 0) : 0;
 		this.busy = false;
+		this._poll = null;
 
 		var cards = E('div', { 'id': 'lc-cards', 'class': 'isp-cards lc-cards' });
 		var meta = E('div', { 'id': 'lc-meta', 'class': 'lc-meta' });
@@ -157,8 +174,8 @@ return view.extend({
 
 		var runBtn = E('button', {
 			'class': 'cbi-button cbi-button-action lc-run',
-			'click': function() { self.run(true); }
-		}, [ svgIcon('pulse'), E('span', {}, [ _('立即体检') ]) ]);
+			'click': function() { self.run(); }
+		}, [ svgIcon('pulse'), E('span', {}, [ _('开始体检') ]) ]);
 		this.runBtn = runBtn;
 
 		var pill = E('span', { 'id': 'lc-pill', 'class': 'isp-pill' });
@@ -166,16 +183,16 @@ return view.extend({
 
 		this.paint();
 
-		/* 倒计时：只更新按钮文字，不触发任何请求 */
-		if (this._timer)
-			clearInterval(this._timer);
-		this._timer = setInterval(function() {
-			if (!self.runBtn || !self.runBtn.parentNode) {
-				clearInterval(self._timer);
-				return;
-			}
-			self.paintButton();
-		}, 1000);
+		/* 打开页面时如果已有一次后台体检在跑（例如刚才的探测还没结束、
+		   或者用户重开了本页），直接进轮询态，不要再点一次。
+		   但如果手上已经有一份没过期的快照，就不必陪着等——那可能只是一
+		   个崩溃残留的锁目录。 */
+		if (loaded && loaded.running) {
+			var age = this.data && this.data.generated
+				? nowSec() - (+this.data.generated) : 1e9;
+			if (age > (+((this.data || {}).interval) || 60))
+				this.poll(0);
+		}
 
 		return E('div', { 'class': 'isp-app cbi-map' }, [
 			E('link', { 'rel': 'stylesheet', 'href': L.resource('isp-split/isp-split.css') }),
@@ -183,7 +200,7 @@ return view.extend({
 			E('div', { 'class': 'isp-hero' }, [
 				E('h2', {}, [ _('线路体检') ]),
 				E('div', { 'class': 'isp-sub' }, [
-					_('逐条 WAN 检查出口类型、四段延迟、NAT 与归属地。只读探测，不改 mwan3/nft 规则；60 秒内重复执行直接返回缓存。')
+					_('逐条 WAN 检查出口类型、四段延迟、NAT 与归属地。只读探测，不改 mwan3/nft 规则；体检在后台跑，页面只读结果，不会卡住。')
 				]),
 				E('div', { 'class': 'isp-toolbar' }, [ runBtn, pill ])
 			]),
@@ -201,41 +218,103 @@ return view.extend({
 		]);
 	},
 
-	/* ---------------- 运行 ---------------- */
+	/* ---------------- 触发后台体检 ---------------- */
 
-	run: function(force) {
+	run: function() {
 		var self = this;
 		if (this.busy)
 			return;
-		var now = Math.floor(Date.now() / 1000);
-		if (force && this.nextAt && now < this.nextAt) {
-			ui.addNotification(null, E('p', {}, [
-				_('体检结果仍在缓存有效期内（还需 ') + (this.nextAt - now) + _(' 秒）。') +
-				_('服务端会直接返回缓存；如需强制重测请用命令行 --force。')
-			]), 'info');
-			return;
-		}
-
 		this.busy = true;
 		this.paintButton();
-		this.setMsg(_('正在体检：依次检查每条 WAN，通常 3-10 秒，线路差时最多约 20 秒…'), 'info');
+		this.setMsg(_('正在启动后台体检…'), 'info');
 
-		var args = ['linecheck', '--json'];
-		if (force)
-			args.push('--force');
-
-		execJson(args).then(function(data) {
-			self.data = data;
-			self.loadError = null;
-			self.nextAt = (+data.generated || now) + (+data.interval || 60);
-			self.busy = false;
-			self.paint();
-			self.setMsg(_('体检完成。'), 'ok');
+		fs.exec(CMD, ['linecheck', '--background']).then(function(res) {
+			var out = ((res && res.stdout) || '') + ((res && res.stderr) || '');
+			var d = parseStr((res && res.stdout) || '');
+			if (!d)
+				throw new Error(out.trim() || _('linecheck --background 没有返回可解析的状态'));
+			if (d.started && d.finished)
+				return self.reload(_('体检完成。'));
+			if (d.started)
+				return self.poll(d.pid);
+			if (d.running) {
+				self.setMsg(_('已有一次体检在跑（pid ') + d.pid + _('，已 ') + (d.elapsed || 0) +
+					_(' 秒），继续等它的结果…'), 'info');
+				return self.poll(d.pid);
+			}
+			if (d.cached) {
+				self.busy = false;
+				return self.reload(_('60 秒内刚测过，直接显示缓存结果（要强制重测请用命令行 --force）。'));
+			}
+			throw new Error(d.error || _('未知状态'));
 		}).catch(function(err) {
 			self.busy = false;
-			self.paintButton();
-			self.setMsg(_('体检失败：') + String(err), 'bad');
-			ui.addNotification(null, E('p', {}, [ _('体检失败：') + String(err) ]), 'danger');
+			self.stopPoll();
+			self.setMsg(_('启动体检失败：') + String(err), 'bad');
+			ui.addNotification(null, E('p', {}, [ _('启动体检失败：') + String(err) ]), 'danger');
+		});
+	},
+
+	/* 轮询：每 2.5s 读一次快照，generated 变大就渲染；最多 90s。 */
+	poll: function(pid) {
+		var self = this;
+		this.busy = true;
+		this.paintButton();
+		var start = Date.now();
+		if (this._poll)
+			clearInterval(this._poll);
+		this.setMsg(_('后台体检中（pid ') + (pid || 0) + _('），真实探测 20-60 秒，网络越差越慢…'), 'info');
+
+		this._poll = setInterval(function() {
+			/* 页面被切走/卸载后自己停，别在后台空转 */
+			if (!self.cardsBox || !document.body.contains(self.cardsBox)) {
+				self.stopPoll();
+				return;
+			}
+			var waited = Date.now() - start;
+			if (waited > POLL_MAX_MS) {
+				self.stopPoll();
+				self.setMsg(_('后台体检超过 90 秒还没出结果：可能线路极差或探测卡住。稍后重新打开本页即可看到结果，也可用命令行 isp-split linecheck --json 查看。'), 'bad');
+				return;
+			}
+			fs.read(CACHE).then(function(s) {
+				var d = parseStr(s);
+				if (!d || (+d.generated || 0) <= self.baseGen)
+					return;
+				self.data = d;
+				self.baseGen = +d.generated || 0;
+				self.paint();
+				self.stopPoll();
+				self.setMsg(_('体检完成。'), 'ok');
+			}).catch(function() { /* 还没写出来，下一轮再看 */ });
+			self.setMsg(_('后台体检中（已等待 ') + Math.round(waited / 1000) + _(' 秒）…'), 'info');
+		}, POLL_MS);
+	},
+
+	stopPoll: function() {
+		if (this._poll) {
+			clearInterval(this._poll);
+			this._poll = null;
+		}
+		this.busy = false;
+		this.paintButton();
+	},
+
+	reload: function(msg) {
+		var self = this;
+		return fs.read(CACHE).then(function(s) {
+			var d = parseStr(s);
+			if (d) {
+				self.data = d;
+				self.baseGen = +d.generated || 0;
+			}
+			self.stopPoll();
+			self.paint();
+			self.setMsg(msg || _('体检完成。'), 'ok');
+		}).catch(function() {
+			self.stopPoll();
+			self.paint();
+			self.setMsg(msg || _('还没有结果。'), 'info');
 		});
 	},
 
@@ -249,26 +328,28 @@ return view.extend({
 	paintButton: function() {
 		if (!this.runBtn)
 			return;
-		var now = Math.floor(Date.now() / 1000);
-		var left = this.nextAt ? Math.max(0, this.nextAt - now) : 0;
 		var span = this.runBtn.querySelector('span:last-child');
 		if (this.busy) {
 			this.runBtn.disabled = true;
 			if (span) span.textContent = _('体检中…');
-		} else if (left > 0) {
-			this.runBtn.disabled = true;
-			if (span) span.textContent = _('立即体检（') + left + _('s）');
 		} else {
 			this.runBtn.disabled = false;
-			if (span) span.textContent = _('立即体检');
+			if (span) span.textContent = this.data ? _('重新体检') : _('开始体检');
 		}
-		if (this.pill) {
-			this.pill.className = 'isp-pill' + (this.busy ? ' is-busy' : '');
-			this.pill.textContent = this.busy
-				? _('刷新中…')
-				: (this.data && this.data.cached
-					? _('缓存 · ') + (this.data.age || 0) + _(' 秒前')
-					: _('实时结果'));
+
+		if (!this.pill)
+			return;
+		this.pill.className = 'isp-pill' + (this.busy ? ' is-busy' : '');
+		if (this.busy) {
+			this.pill.textContent = _('后台体检中…');
+		} else if (this.data) {
+			var gen = +this.data.generated || 0;
+			var age = gen ? Math.max(0, nowSec() - gen) : 0;
+			var intv = +this.data.interval || 60;
+			this.pill.textContent = (gen ? fmtAge(age) : _('无时间戳')) +
+				(age <= intv ? _(' · 缓存有效') : _(' · 已过期'));
+		} else {
+			this.pill.textContent = _('尚未体检');
 		}
 	},
 
@@ -284,32 +365,33 @@ return view.extend({
 
 		this.paintButton();
 
-		if (this.loadError) {
-			this.cardsBox.appendChild(E('div', { 'class': 'isp-empty' }, [
-				_('读取线路体检失败：') + this.loadError
-			]));
-			return;
-		}
+		/* 没缓存：占位卡。绝不为了“有没有数据”去跑一次探测。 */
 		if (!this.data) {
-			this.cardsBox.appendChild(E('div', { 'class': 'isp-empty' }, [
-				_('没有拿到体检结果。检查 isp-split 是否已安装、服务是否正常。')
+			this.cardsBox.appendChild(E('div', { 'class': 'isp-card lc-placeholder' }, [
+				E('div', { 'class': 'lc-ph-head' }, [
+					svgIcon('pulse', 18),
+					E('strong', {}, [ _('尚未体检') ])
+				]),
+				E('p', { 'class': 'lc-ph-text' }, [
+					_('点上方「开始体检」：探测会在后台跑（逐条 WAN 检查出口类型、四段延迟、NAT、归属地），通常 20-60 秒，网络差时更久。本页不会卡住，中途可以离开。')
+				]),
+				E('p', { 'class': 'lc-ph-note' }, [
+					_('结果会缓存在设备上，60 秒内再次打开本页直接显示。')
+				])
 			]));
 			return;
 		}
 
 		var d = this.data;
-		if (!this.nextAt)
-			this.nextAt = (+d.generated || Math.floor(Date.now() / 1000)) + (+d.interval || 60);
-
+		var gen = +d.generated || 0;
+		var age = gen ? Math.max(0, nowSec() - gen) : 0;
+		var intv = +d.interval || 60;
 		var bits = [];
 		bits.push(_('版本 ') + (d.version || '?'));
-		if (d.generated)
-			bits.push(_('生成于 ') + new Date(+d.generated * 1000).toLocaleString());
-		if (d.cached)
-			bits.push(_('缓存结果 · ') + (d.age || 0) + _(' 秒前'));
-		else
-			bits.push(_('实时结果'));
-		bits.push(_('缓存间隔 ') + (d.interval || 60) + 's');
+		if (gen)
+			bits.push(_('生成于 ') + new Date(gen * 1000).toLocaleString() + '（' + fmtAge(age) + '）');
+		bits.push(age <= intv ? _('缓存有效') : _('已过期，可重新体检'));
+		bits.push(_('缓存间隔 ') + intv + 's');
 		bits.push(d.socat ? _('socat 可用') : _('socat 未安装（NAT 只能判未知）'));
 		bits.push(d.geo_enabled ? _('归属地查询开') : _('归属地查询关'));
 		this.metaBox.textContent = bits.join(' · ');
@@ -329,7 +411,6 @@ return view.extend({
 	},
 
 	card: function(w, d) {
-		var self = this;
 		var sc = w.score || {};
 		var nat = w.nat || {};
 		var lat = w.latency || {};

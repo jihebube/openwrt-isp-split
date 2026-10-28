@@ -2469,6 +2469,175 @@ else
 	ng "坏包 fixture 处理异常"
 fi
 
+# ---- 16.10 后台体检（BUG-23）：--background 起、last.json 落盘、锁释放 ----
+rm -rf "$LCBASE/state"
+lc_bg() { lc_run --background "$@"; }
+lc_ms_now() {
+	if [ -r /proc/uptime ]; then
+		awk '{ printf "%d", $1 * 1000 }' /proc/uptime
+	else
+		date +%s
+	fi
+}
+lc_wait_for() { # <秒> <测试表达式…>：等到条件成立
+	_i=0
+	while [ "$_i" -lt "$1" ]; do
+		shift
+		if eval "$*"; then return 0; fi
+		sleep 1
+		_i=$((_i + 1))
+	done
+	return 1
+}
+
+lc_bg >"$TMP/lc-bg1.json" 2>"$TMP/lc-bg1.err"
+_bg1_rc=$?
+if [ "$_bg1_rc" = "0" ] && grep -q '"started":true' "$TMP/lc-bg1.json" &&
+   ! grep -q '"wans"' "$TMP/lc-bg1.json"; then
+	ok "--background：立刻返回 started=true 的状态行，不带探测结果（调用方不被阻塞）"
+else
+	ng "--background 启动异常（rc=$_bg1_rc）：$(cat "$TMP/lc-bg1.json" 2>/dev/null)"
+fi
+
+if lc_wait_for 15 '[ -f "$LCBASE/state/linecheck/last.json" ]' &&
+   lc_wait_for 15 '[ ! -d "$LCBASE/state/linecheck.lock" ]'; then
+	ok "后台探测完成：last.json 落盘、锁目录自动释放（进程退出即解锁）"
+else
+	ng "后台探测收尾异常：last.json 或锁目录未按预期出现/消失"
+fi
+
+if [ -n "$JQ" ]; then
+	_bg_cmd=$(jsonfilter -i "$LCBASE/state/linecheck/last.json" -e '@.command' 2>/dev/null)
+	_bg_n=$(jsonfilter -i "$LCBASE/state/linecheck/last.json" -e '@.wans[*].iface' 2>/dev/null | wc -l)
+	_bg_gen=$(jsonfilter -i "$LCBASE/state/linecheck/last.json" -e '@.generated' 2>/dev/null)
+	if [ "$_bg_cmd" = "linecheck" ] && [ "$_bg_n" = "2" ] && [ "$_bg_gen" -gt 0 ] 2>/dev/null; then
+		ok "last.json 是完整快照：command=linecheck、2 条 WAN、generated=$_bg_gen（页面只读这一个文件）"
+	else
+		ng "last.json 内容异常: command=$_bg_cmd wans=$_bg_n generated=$_bg_gen"
+	fi
+else
+	grep -q '"command":"linecheck"' "$LCBASE/state/linecheck/last.json" &&
+		ok "last.json 是完整快照（无 jsonfilter，仅结构检查）" ||
+		ng "last.json 内容异常"
+fi
+
+# ---- 16.11 缓存新鲜时 --background 不再起探测 ----
+lc_bg >"$TMP/lc-bg2.json" 2>/dev/null
+if grep -q '"started":false' "$TMP/lc-bg2.json" && grep -q '"cached":true' "$TMP/lc-bg2.json"; then
+	ok "--background：60s 缓存仍新鲜时返回 started=false/cached=true，不重复探测"
+else
+	ng "--background 未正确短路新鲜缓存：$(cat "$TMP/lc-bg2.json" 2>/dev/null)"
+fi
+
+# ---- 16.12 锁去重：已有一次在跑时 --background 返回 running ----
+rm -rf "$LCBASE/state/linecheck" "$LCBASE/state/linecheck.lock"
+sleep 30 &
+_lc_fake=$!
+mkdir -p "$LCBASE/state/linecheck.lock"
+printf '%s\n' "$_lc_fake" >"$LCBASE/state/linecheck.lock/pid"
+date +%s >"$LCBASE/state/linecheck.lock/started"
+lc_bg >"$TMP/lc-bg3.json" 2>/dev/null
+if grep -q '"started":false' "$TMP/lc-bg3.json" && grep -q '"running":true' "$TMP/lc-bg3.json" &&
+   grep -q "\"pid\":$_lc_fake" "$TMP/lc-bg3.json" &&
+   [ ! -f "$LCBASE/state/linecheck/last.json" ]; then
+	ok "锁去重：已有体检在跑时 --background 只返回 running=true/pid，不重复起第二个探测"
+else
+	ng "锁去重失败：$(cat "$TMP/lc-bg3.json" 2>/dev/null)"
+fi
+
+# 前台 CLI 抢同一把锁：没有新鲜缓存时不能返回半截数据，退出码 4
+lc_run --json >"$TMP/lc-run-locked.json" 2>"$TMP/lc-run-locked.err"
+_locked_rc=$?
+if [ "$_locked_rc" = "4" ] && grep -q '"running":true' "$TMP/lc-run-locked.json"; then
+	ok "前台 linecheck --json 撞锁：输出 running=true 并以退出码 4 结束（不返回半截数据）"
+else
+	ng "前台撞锁行为异常（rc=$_locked_rc）：$(cat "$TMP/lc-run-locked.json" 2>/dev/null)"
+fi
+kill "$_lc_fake" 2>/dev/null
+wait "$_lc_fake" 2>/dev/null
+rm -rf "$LCBASE/state/linecheck.lock"
+
+# ---- 16.13 崩溃残留：pid 已死的 tmp 目录 + 半截缓存（BUG-24 的现场）----
+mkdir -p "$LCBASE/state/linecheck.tmp.999999" "$LCBASE/state/linecheck"
+: >"$LCBASE/state/linecheck/geo.tsv"
+lc_run --json --force >"$TMP/lc-recover.json" 2>/dev/null
+if [ ! -d "$LCBASE/state/linecheck.tmp.999999" ] &&
+   [ -f "$LCBASE/state/linecheck/meta" ] && [ -f "$LCBASE/state/linecheck/last.json" ]; then
+	ok "崩溃残留清理：pid 已死的 linecheck.tmp.* 被扫掉，半截缓存被替换成完整缓存"
+else
+	ng "崩溃残留清理异常：$(ls -d "$LCBASE"/state/linecheck* 2>/dev/null | tr '\n' ' ')"
+fi
+
+# 命中缓存的那次调用也要顺手扫掉死 pid 的探测目录（SIGKILL 走不到 trap）
+mkdir -p "$LCBASE/state/linecheck.tmp.888888"
+lc_run --json >"$TMP/lc-cached-sweep.json" 2>/dev/null
+if [ ! -d "$LCBASE/state/linecheck.tmp.888888" ] &&
+   grep -q '"cached":true' "$TMP/lc-cached-sweep.json"; then
+	ok "命中缓存的调用也会清理死 pid 的 linecheck.tmp.*（不必等下一次真实探测）"
+else
+	ng "命中缓存时未清理死 pid 探测目录"
+fi
+
+# ---- 16.14 trap 清理：正常退出与 SIGTERM 都要删掉探测目录和锁 ----
+lc_trap_probe() { # <模式 exit|term>
+	_it_tmp=$LCBASE/state/linecheck.tmp.$1
+	ISP_SPLIT_CONF="$LCCONF" ISP_SPLIT_BASE="$LCBASE" ISP_SPLIT_LIB_ONLY=1 \
+		sh -c '
+		. "$1" >/dev/null 2>&1
+		_d=$2
+		mkdir -p "$_d/linecheck.tmp.$3" "$_d/linecheck.lock"
+		_lc_tmp="$_d/linecheck.tmp.$3"
+		printf "%s\n" "$$" >"$_d/linecheck.lock/pid"
+		LC_LOCK_OWNER=1
+		_lc_trap_on
+		if [ "$4" = "term" ]; then
+			# 用 1s 循环而不是单个长 sleep：TERM 到来时 shell 能立刻进 trap
+			_n=0
+			while [ "$_n" -lt 30 ]; do sleep 1; _n=$((_n + 1)); done
+		else
+			exit 0
+		fi
+	' _ "$ROOT/files/usr/sbin/isp-split" "$LCBASE/state" "$1" "$2"
+}
+lc_trap_probe 424242 exit >/dev/null 2>&1
+if [ ! -d "$LCBASE/state/linecheck.tmp.424242" ] && [ ! -d "$LCBASE/state/linecheck.lock" ]; then
+	ok "trap 清理：正常退出后探测目录与锁都不残留"
+else
+	ng "trap 清理失败（exit 路径）：$(ls -d "$LCBASE"/state/linecheck* 2>/dev/null | tr '\n' ' ')"
+fi
+
+lc_trap_probe 424243 term >/dev/null 2>&1 &
+_lc_term_wrap=$!
+sleep 2
+# 锁里的 pid 就是那个 trap shell 自己的 pid
+_lc_term_pid=$(cat "$LCBASE/state/linecheck.lock/pid" 2>/dev/null)
+[ -n "$_lc_term_pid" ] && kill -TERM "$_lc_term_pid" 2>/dev/null
+wait "$_lc_term_wrap" 2>/dev/null
+if [ ! -d "$LCBASE/state/linecheck.tmp.424243" ] && [ ! -d "$LCBASE/state/linecheck.lock" ]; then
+	ok "trap 清理：SIGTERM（rpcd 超时/用户中断）也会删掉探测目录与锁"
+else
+	ng "trap 清理失败（TERM 路径）：$(ls -d "$LCBASE"/state/linecheck* 2>/dev/null | tr '\n' ' ')"
+fi
+
+# ---- 16.15 cached:true 短路：不探测、耗时 < 1 秒 ----
+lc_run --json --force >/dev/null 2>&1
+_t0=$(lc_ms_now)
+lc_run --json >"$TMP/lc-fast.json" 2>/dev/null
+_t1=$(lc_ms_now)
+_fast_dt=$((_t1 - _t0))
+if grep -q '"cached":true' "$TMP/lc-fast.json" && [ "$_fast_dt" -lt 1000 ]; then
+	ok "缓存短路：cached=true 且耗时 ${_fast_dt}ms（<1000ms），不再全量探测"
+else
+	ng "缓存短路异常：耗时 ${_fast_dt}ms，cached=$(grep -o '"cached":[a-z]*' "$TMP/lc-fast.json" 2>/dev/null)"
+fi
+
+# ---- 16.16 缓存不因 --force 之外的路径被“半截目录”破坏 ----
+if [ -z "$(ls -d "$LCBASE"/state/linecheck.tmp.* 2>/dev/null)" ]; then
+	ok "state 目录干净：没有任何 linecheck.tmp.* 残留"
+else
+	ng "state 目录仍有 tmp 残留：$(ls -d "$LCBASE"/state/linecheck.tmp.* 2>/dev/null | tr '\n' ' ')"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then

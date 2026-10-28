@@ -16,7 +16,7 @@
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
-- **线路体检（0.3.0）**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则
+- **线路体检（0.3.0）**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
 - **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
 - **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
 
@@ -102,7 +102,7 @@ isp-split status    # 各集合命中计数与流量
 | `diff` | 用存档重算主源 vs 校验源的分歧（超阈值退出码 3） | 无 |
 | `verify` / `probe` | 渲染核对 / 分线测速 | 无 |
 | `dnstest <策略>` | 测一条线路的 DNS 是否可用 | 无 |
-| `linecheck [--json] [--wan <接口>] [--force]` | 线路体检：出口类型 / 四段延迟 / NAT / 归属地 / 评分 | 无（只读探测） |
+| `linecheck [--json] [--wan <接口>] [--force] [--background]` | 线路体检：出口类型 / 四段延迟 / NAT / 归属地 / 评分 | 无（只读探测） |
 | `conf check` / `conf preview` | 只校验配置 / 预演未保存的改动 | 无 |
 | `export` | 导出给 mihomo / sing-box | 无 |
 | `stage` / `enable` | 灰度：先注入不渲染，确认后启用 | mwan3 |

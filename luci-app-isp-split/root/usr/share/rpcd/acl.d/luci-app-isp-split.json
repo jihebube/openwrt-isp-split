@@ -9,7 +9,8 @@
 				"/etc/isp-split.conf": [ "read" ],
 				"/etc/isp-split": [ "read" ],
 				"/etc/isp-split/*": [ "read" ],
-				"/etc/isp-split/state/*": [ "read" ]
+				"/etc/isp-split/state/*": [ "read" ],
+				"/etc/isp-split/state/linecheck/*": [ "read" ]
 			}
 		},
 		"write": {

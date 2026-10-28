@@ -288,9 +288,44 @@ Restricted / Port-Restricted 细分。
 ### 缓存与并发
 
 结果按“本次 WAN 集合”缓存到 `/etc/isp-split/state/linecheck/`：
-`LINE_CHECK_MIN_INTERVAL` 秒内重复执行直接返回上次 JSON/文本（`"cached":true`，
-`age` 为缓存年龄），不会重复打 STUN/CDN；`--force` 绕过。`--wan` 只体检并缓存
-指定线路，之后的全量调用会重新体检其余线路。
+
+| 文件 | 作用 |
+|---|---|
+| `meta` | `生成时间 间隔 geo socat WAN…`（epoch 秒，UTC，与本地时区无关） |
+| `last.json` | 最后一次完整结果，**LuCI 只读这一个文件** |
+| `wan-<接口>.json` / `.txt` | 单条 WAN 的机器/人类可读结果 |
+| `errors.json` | 整体性错误（如没有启用的 WAN） |
+
+`LINE_CHECK_MIN_INTERVAL` 秒内重复执行直接读缓存返回（`"cached":true`，`age`
+为缓存年龄），不探测、不访问网络，耗时 <1s；`--force` 绕过。`--wan` 只体检并
+缓存指定线路，之后的全量调用会重新体检其余线路。
+
+缓存有效的充要条件是 `meta` + `last.json` + 每条被请求 WAN 的 json/txt 都在；
+缺一个就按未命中处理并清理，不会出现“有目录但永远不命中”。探测过程写在
+`state/linecheck.tmp.<pid>`，退出时由 trap 删除，下次启动还会扫掉 pid 已死的
+残留（`linecheck.tmp.*` 不应长期存在）。
+
+#### `--background`（LuCI 用）
+
+```sh
+isp-split linecheck --background           # 立刻返回，探测在后台跑
+```
+
+真实探测可能 20-60s，而 rpcd 的 exec 硬超时是 30s，所以页面**不能**同步调用
+`linecheck --json`。`--background` 只做“要不要起、能不能起”，返回单行 JSON：
+
+| 返回 | 含义 |
+|---|---|
+| `{"started":true,"pid":N}` | 已在后台开始 |
+| `{"started":true,"finished":true}` | 1 秒内就跑完了（夹具/极快线路） |
+| `{"started":false,"running":true,"pid":N,"elapsed":S}` | 已有一次在跑，本次不重复探测 |
+| `{"started":false,"cached":true,"generated":N,"age":S}` | 缓存仍新鲜，没必要重测 |
+| `{"started":false,"error":"…"}` | 起不来（见 `state/linecheck.log`） |
+
+去重靠锁目录 `state/linecheck.lock`（`mkdir` 原子）；子进程用 `setsid` 脱离
+rpcd 会话，探测结束后原子替换缓存目录。前台 `linecheck` 也会抢同一把锁：
+已有体检在跑时，有新鲜缓存就返回缓存，否则输出 `"running":true` 并以退出码
+4 结束（不给脚本返回半截数据）。
 
 ### socat 缺失
 

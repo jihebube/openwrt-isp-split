@@ -3919,6 +3919,9 @@ cmd_uninstall() {
 #     只绑源 IP 会被 mwan3 的 mark 带回另一条线。
 #   · 不改用户 nft 规则；失败只降级单项，不让整张卡变红。
 #   · 结果缓存 60s（LINE_CHECK_MIN_INTERVAL），--force 绕过。
+#   · BUG-23：真实探测 21-60s，而 rpcd 的 exec 硬超时 30s。所以 LuCI 页面
+#     绝不在这里同步 exec：页面只读 state/linecheck/last.json，探测走
+#     `--background`（setsid 子进程 + 锁去重），完成后整目录原子替换。
 
 # 默认目标表。只存域名：运行时解析，再用 @isp_* 集合校验归属。
 # 不随机抽集合里的 IP（命中率低、像端口扫描、也无法保证 443 可用）。
@@ -4800,9 +4803,9 @@ _lc_avail_from() { # <http_code> <tls_ok> <tcp_ok>
 # ---- 归属地（只发出口 IP） ----
 
 _lc_geo_cache_get() { # <ip> <provider>
-	[ -f "$LC_CACHE/geo.tsv" ] || return 1
+	[ -f "$LC_GEO" ] || return 1
 	awk -F'\t' -v ip="$1" -v p="$2" -v now="$(_lc_now)" -v ttl="$(_lc_geo_ttl)" '
-		$1 == ip && $2 == p && (now - $4) < ttl { print $3; exit }' "$LC_CACHE/geo.tsv" 2>/dev/null
+		$1 == ip && $2 == p && (now - $4) < ttl { print $3; exit }' "$LC_GEO" 2>/dev/null
 }
 
 _lc_geo_ttl() {
@@ -4813,12 +4816,14 @@ _lc_geo_ttl() {
 
 _lc_geo_cache_put() { # <ip> <provider> <text>
 	[ -n "${1:-}" ] || return 0
-	mkdir -p "$LC_CACHE" 2>/dev/null || return 0
-	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(_lc_now)" >>"$LC_CACHE/geo.tsv" 2>/dev/null || true
+	# 写在缓存目录之外：缓存目录整体替换时不能把归属地缓存一起带走（旧实现
+	# 既丢缓存，又会在探测中途凭空造出一个没有 meta 的半截缓存目录）。
+	mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(_lc_now)" >>"$LC_GEO" 2>/dev/null || true
 	# 只保留最近 200 条，防止长期运行把 state 撑大
-	if [ -f "$LC_CACHE/geo.tsv" ]; then
-		tail -n 200 "$LC_CACHE/geo.tsv" >"$LC_CACHE/geo.tsv.$$" 2>/dev/null &&
-			mv -f "$LC_CACHE/geo.tsv.$$" "$LC_CACHE/geo.tsv" 2>/dev/null || rm -f "$LC_CACHE/geo.tsv.$$"
+	if [ -f "$LC_GEO" ]; then
+		tail -n 200 "$LC_GEO" >"$LC_GEO.$$" 2>/dev/null &&
+			mv -f "$LC_GEO.$$" "$LC_GEO" 2>/dev/null || rm -f "$LC_GEO.$$"
 	fi
 }
 
@@ -5411,46 +5416,189 @@ _lc_make_advice() {
 	LC_ADVICE=$(_lc_advice "$_alab" "$LC_STUN_TYPE" "$SC_GRADE" "${LC_LOSS:-0}" "${LC_TCP_MS:-}" "$LC_T_SAME" "${LC_SOCAT:-1}")
 }
 
-# ---- 缓存 ----
+# ---- 缓存 / 锁 / 原子落盘 ----
+#
+# BUG-24 复盘：旧实现把工作目录叫 <cache>.tmp.<pid>，而探测过程中
+# _lc_geo_cache_put 还会顺手 mkdir 出“只有 geo.tsv、没有 meta”的 <cache>
+# 目录；一旦本次探测被 rpcd 的 30s exec 超时（或 Ctrl-C / OOM）杀掉：
+#   · <cache> 里没有 meta  → 之后每次都被判“缓存未命中”，60s 间隔形同虚设；
+#   · <cache>.tmp.<pid>    → 没人清，state 目录里越堆越多（实测
+#                            linecheck.tmp.10058 就是这么来的）。
+# 现在：meta + last.json 是缓存有效性的充要条件；探测目录由 trap 清理；每次
+# 启动再扫一遍 pid 已死的残留；geo 缓存挪到 state/linecheck.geo.tsv，不再写进
+# 会被整体替换的缓存目录（旧实现每次探测都会把 geo 缓存一起丢掉）。
 
-_lc_cache_serve() { # <json:0/1> <requested wans>
-	_cj=$1
-	_cw=$2
-	read -r _gen _int _geo _prov _soc _cwans <"$LC_CACHE/meta" 2>/dev/null || return 1
-	_now=$(_lc_now)
-	_age=$((_now - _gen))
-	[ "$_age" -ge 0 ] 2>/dev/null || return 1
-	[ "$_age" -lt "$_int" ] 2>/dev/null || return 1
-	for _w in $_cw; do
-		case " $_cwans " in *" $_w "*) ;; *) return 1 ;; esac
+LC_CACHE=$STATE_DIR/linecheck
+LC_CACHE_PREV=$STATE_DIR/linecheck.prev
+LC_LOCK=$STATE_DIR/linecheck.lock
+LC_GEO=$STATE_DIR/linecheck.geo.tsv
+LC_LOG=$STATE_DIR/linecheck.log
+LC_LOCK_OWNER=0
+_lc_tmp=""
+
+_lc_cleanup() {
+	if [ -n "${_lc_tmp:-}" ] && [ -d "$_lc_tmp" ]; then
+		rm -rf "$_lc_tmp" 2>/dev/null
+	fi
+	if [ "${LC_LOCK_OWNER:-0}" = "1" ] && [ -d "$LC_LOCK" ]; then
+		[ "$(cat "$LC_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LC_LOCK" 2>/dev/null
+	fi
+	return 0
+}
+
+# 信号/退出统一收尾：ash 里 INT/TERM 的 trap 只执行处理函数就继续往下跑，
+# 所以信号分支必须显式 exit，否则探测会“被 Ctrl-C 了但还在跑”。
+_lc_trap_on() {
+	trap '_lc_cleanup' EXIT
+	trap '_lc_cleanup; exit 130' INT TERM HUP
+	return 0
+}
+
+# 崩溃残留清理。分两档：
+#   _lc_sweep_tmp   只删 pid 已死的探测目录——任何一次调用（包括命中缓存、
+#                   --background 直接返回）都可以安全执行，不会碰到正在跑的探测；
+#   _lc_sweep_cache 半截缓存/发布中间态——只在持锁时做，避免和发布者抢。
+_lc_sweep_tmp() {
+	for _d in "$STATE_DIR"/linecheck.tmp.*; do
+		[ -d "$_d" ] || continue
+		_p=${_d##*.}
+		case "$_p" in '' | *[!0-9]*) continue ;; esac
+		kill -0 "$_p" 2>/dev/null || rm -rf "$_d" 2>/dev/null
+	done
+	return 0
+}
+
+_lc_sweep_cache() {
+	if [ -d "$LC_CACHE" ] && { [ ! -f "$LC_CACHE/meta" ] || [ ! -f "$LC_CACHE/last.json" ]; }; then
+		rm -rf "$LC_CACHE" 2>/dev/null
+	fi
+	rm -rf "$LC_CACHE_PREV" 2>/dev/null
+	return 0
+}
+
+_lc_sweep() {
+	_lc_sweep_tmp
+	_lc_sweep_cache
+	return 0
+}
+
+# 0=拿到锁 1=已有体检在跑（LC_LOCK_PID/LC_LOCK_AGE） 2=建不了锁
+_lc_lock_try() {
+	LC_LOCK_PID=""
+	LC_LOCK_AGE=""
+	mkdir -p "$STATE_DIR" 2>/dev/null || return 2
+	if mkdir "$LC_LOCK" 2>/dev/null; then
+		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
+		_lc_now >"$LC_LOCK/started" 2>/dev/null
+		LC_LOCK_OWNER=1
+		return 0
+	fi
+	_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
+	_t=$(cat "$LC_LOCK/started" 2>/dev/null)
+	_age=$(( $(_lc_now) - ${_t:-0} ))
+	[ "$_age" -ge 0 ] 2>/dev/null || _age=0
+	if [ -n "$_p" ]; then
+		# 进程还活着且锁不超过 5 分钟：认定在跑（防 pid 复用导致的永久锁死）
+		if [ "$_age" -lt 300 ] && kill -0 "$_p" 2>/dev/null; then
+			LC_LOCK_PID=$_p
+			LC_LOCK_AGE=$_age
+			return 1
+		fi
+	else
+		# 另一个 --background 刚 mkdir 完、还没写 pid：按“在跑”处理，别抢
+		if [ "$_age" -lt 5 ]; then
+			LC_LOCK_AGE=$_age
+			return 1
+		fi
+	fi
+	rm -rf "$LC_LOCK" 2>/dev/null
+	mkdir "$LC_LOCK" 2>/dev/null || return 2
+	printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
+	_lc_now >"$LC_LOCK/started" 2>/dev/null
+	LC_LOCK_OWNER=1
+	return 0
+}
+
+# 缓存有效性：meta + last.json + 每条被请求的 WAN 的 json/txt 都在，且 age < interval。
+# 时间戳全是 `date +%s` 的 UTC epoch 秒（与本地时区无关）；age<0（时钟回拨）按失效处理。
+_lc_cache_load() { # <请求的 WAN 列表> -> _C_GEN/_C_INT/_C_GEO/_C_PROV/_C_SOC/_C_WANS
+	[ -f "$LC_CACHE/meta" ] || return 1
+	[ -f "$LC_CACHE/last.json" ] || return 1
+	read -r _C_GEN _C_INT _C_GEO _C_PROV _C_SOC _C_WANS <"$LC_CACHE/meta" 2>/dev/null || return 1
+	case "${_C_GEN:-}" in '' | *[!0-9]*) return 1 ;; esac
+	case "${_C_INT:-}" in '' | *[!0-9]*) return 1 ;; esac
+	[ "$_C_INT" -ge 15 ] 2>/dev/null || return 1
+	return 0
+}
+
+_lc_cache_fresh() { # <请求的 WAN 列表> -> _C_AGE；0=新鲜
+	[ -n "${1:-}" ] || return 1
+	_lc_cache_load "$1" || return 1
+	_C_AGE=$(( $(_lc_now) - _C_GEN ))
+	[ "$_C_AGE" -ge 0 ] 2>/dev/null || return 1
+	[ "$_C_AGE" -lt "$_C_INT" ] 2>/dev/null || return 1
+	for _w in $1; do
+		case " $_C_WANS " in *" $_w "*) ;; *) return 1 ;; esac
 		[ -f "$LC_CACHE/wan-$_w.json" ] || return 1
 		[ -f "$LC_CACHE/wan-$_w.txt" ] || return 1
 	done
+	return 0
+}
 
-	if [ "$_cj" = "1" ]; then
-		printf '{"version":"%s","command":"linecheck","generated":%s,"cached":true,"age":%s,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[' \
-			"$ISP_VERSION" "$_gen" "$_age" "$_int" \
-			"$([ "$_geo" = "1" ] && printf true || printf false)" "$_prov" \
-			"$([ "$_soc" = "1" ] && printf true || printf false)"
-		_first=1
-		for _w in $_cw; do
-			[ "$_first" = "1" ] || printf ','
-			_first=0
-			cat "$LC_CACHE/wan-$_w.json"
-		done
-		printf '],"errors":'
-		cat "$LC_CACHE/errors.json" 2>/dev/null || printf '[]'
-		printf '}\n'
+# 统一 JSON 输出：<basedir> 里放 wan-*.json / errors.json。
+# 新鲜结果、缓存回读、last.json 快照都走这一个函数，避免两套口径。
+_lc_json_emit() { # <basedir> <cached:0/1> <age>
+	printf '{"version":"%s","command":"linecheck","generated":%s,"cached":%s,"age":%s,"interval":%s,"geo_enabled":%s,"geo_provider":%s,"socat":%s,"wans":[' \
+		"$ISP_VERSION" "$_C_GEN" "$([ "$2" = "1" ] && printf true || printf false)" "$3" "$_C_INT" \
+		"$([ "$_C_GEO" = "1" ] && printf true || printf false)" "$(_lc_json_str "${_C_PROV:-auto}")" \
+		"$([ "$_C_SOC" = "1" ] && printf true || printf false)"
+	_first=1
+	for _w in ${_C_OUT:-}; do
+		[ "$_first" = "1" ] || printf ','
+		_first=0
+		cat "$1/wan-$_w.json" 2>/dev/null
+	done
+	printf '],"errors":'
+	cat "$1/errors.json" 2>/dev/null || printf '[]'
+	printf '}\n'
+}
+
+_lc_text_emit() { # <basedir> [cached-age]
+	if [ -n "${2:-}" ]; then
+		printf '线路体检 · v%s  %s（缓存，%s 秒前）\n' "$ISP_VERSION" "$(_lc_dt "$_C_GEN")" "$2"
 	else
-		printf '线路体检 · v%s  %s（缓存，%s 秒前）\n' "$ISP_VERSION" "$(_lc_dt "$_gen")" "$_age"
-		_lc_privacy_line
-		for _w in $_cw; do
-			printf '\n'
-			cat "$LC_CACHE/wan-$_w.txt"
-		done
-		printf '\n提示：%s 秒内重复执行直接返回缓存；--force 强制重测。\n' "$_int"
+		printf '线路体检 · v%s  %s\n' "$ISP_VERSION" "$(_lc_dt "$_C_GEN")"
+	fi
+	_lc_privacy_line
+	for _w in ${_C_OUT:-}; do
+		printf '\n'
+		cat "$1/wan-$_w.txt" 2>/dev/null
+	done
+	printf '\n提示：%s 秒内重复执行直接返回缓存；--force 强制重测。\n' "$_C_INT"
+}
+
+_lc_cache_serve() { # <json:0/1> <请求的 WAN 列表>
+	_lc_cache_fresh "${2:-}" || return 1
+	_C_OUT=$2
+	if [ "$1" = "1" ]; then
+		_lc_json_emit "$LC_CACHE" 1 "$_C_AGE"
+	else
+		_lc_text_emit "$LC_CACHE" "$_C_AGE"
 	fi
 	return 0
+}
+
+# 原子发布：整个目录对调。两个进程同时发布也不会把新目录塞进旧目录里
+# （旧写法 `mv tmp cache` 在 cache 已存在时会把 tmp 变成 cache 的子目录）。
+_lc_publish() { # <tmpdir>
+	rm -rf "$LC_CACHE_PREV" 2>/dev/null
+	[ -d "$LC_CACHE" ] && mv "$LC_CACHE" "$LC_CACHE_PREV" 2>/dev/null
+	if mv "$1" "$LC_CACHE" 2>/dev/null; then
+		rm -rf "$LC_CACHE_PREV" 2>/dev/null
+		return 0
+	fi
+	[ -d "$LC_CACHE_PREV" ] && [ ! -d "$LC_CACHE" ] && mv "$LC_CACHE_PREV" "$LC_CACHE" 2>/dev/null
+	return 1
 }
 
 _lc_dt() {
@@ -5468,33 +5616,115 @@ _lc_privacy_line() {
 	fi
 }
 
+# ---- 后台体检（BUG-23） ----
+#
+# 页面 load 只读 state/linecheck/last.json，探测由 `linecheck --background` 起一个
+# 脱离 rpcd 会话的子进程去跑；子进程完成后原子替换缓存目录（含 last.json），
+# 页面每 2-3s 读一次 last.json 比较 generated。
+#
+# 返回（永远是单行 JSON，页面据此决定轮询/直接渲染/报错）：
+#   {"started":true,"pid":N}                       已在后台开始
+#   {"started":true,"finished":true,...}           1 秒内就跑完了（夹具/极快线路）
+#   {"started":false,"running":true,"pid":N,...}   已有一次在跑，不重复起
+#   {"started":false,"cached":true,...}            60s 缓存仍新鲜，没必要重测
+#   {"started":false,"error":"..."}                起不来
+_lc_background() { # <force> <only>
+	_b_force=$1
+	_b_only=$2
+	if [ -n "$_b_only" ]; then
+		_b_wans=$_b_only
+	else
+		_b_wans=$(printf '%s\n' "$(_lc_wans)" | awk -F'\t' 'NF>=2{print $1}' | tr '\n' ' ' | sed 's/ $//')
+	fi
+	if [ "$_b_force" = "0" ] && _lc_cache_fresh "$_b_wans"; then
+		printf '{"command":"linecheck","background":true,"started":false,"cached":true,"generated":%s,"age":%s,"interval":%s}\n' \
+			"$_C_GEN" "$_C_AGE" "$_C_INT"
+		return 0
+	fi
+	_lc_lock_try
+	case $? in
+	1)
+		printf '{"command":"linecheck","background":true,"started":false,"running":true,"pid":%s,"elapsed":%s}\n' \
+			"${LC_LOCK_PID:-0}" "${LC_LOCK_AGE:-0}"
+		return 0
+		;;
+	2)
+		printf '{"command":"linecheck","background":true,"started":false,"error":"无法创建锁目录 %s"}\n' "$LC_LOCK"
+		return 1
+		;;
+	esac
+	_lc_sweep
+
+	_lc_self=${0:-/usr/sbin/isp-split}
+	case "$_lc_self" in
+	*/*) ;;
+	*) _lc_self=$(command -v "$_lc_self" 2>/dev/null) || _lc_self=/usr/sbin/isp-split ;;
+	esac
+	set -- linecheck --json --_worker
+	[ "$_b_force" = "1" ] && set -- "$@" --force
+	[ -n "$_b_only" ] && set -- "$@" --wan "$_b_only"
+
+	: >"$LC_LOG" 2>/dev/null || true
+	# setsid：脱离 rpcd 的会话/进程组，exec 返回后不会被一起收走。
+	# 三个 fd 全部重定向：父进程退出时 rpcd 的管道不能被子进程挂着，否则
+	# exec 仍然要等到探测结束（那正是 BUG-23 的另一半）。
+	if command -v setsid >/dev/null 2>&1; then
+		( setsid sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
+	else
+		( sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
+	fi
+
+	# 等子进程把 pid 写进锁（busybox sleep 不支持小数，最多等 1 秒）。
+	sleep 1
+	_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
+	if [ ! -d "$LC_LOCK" ]; then
+		# 1 秒内已经跑完（夹具/极快线路）：直接告诉页面读缓存
+		printf '{"command":"linecheck","background":true,"started":true,"finished":true,"pid":0}\n'
+		return 0
+	fi
+	if [ -z "$_p" ] || [ "$_p" = "$$" ]; then
+		rm -rf "$LC_LOCK" 2>/dev/null
+		LC_LOCK_OWNER=0
+		printf '{"command":"linecheck","background":true,"started":false,"error":"后台进程启动失败，见 %s"}\n' "$LC_LOG"
+		return 1
+	fi
+	printf '{"command":"linecheck","background":true,"started":true,"pid":%s,"started_at":%s}\n' \
+		"$_p" "$(cat "$LC_LOCK/started" 2>/dev/null || _lc_now)"
+	return 0
+}
+
 # ---- 主命令 ----
 
 cmd_linecheck() {
 	_lc_json=0
 	_lc_force=0
 	_lc_only=""
+	_lc_bg=0
+	_lc_worker=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--json) _lc_json=1 ;;
 		--force) _lc_force=1 ;;
+		--background) _lc_bg=1 ;;
+		--_worker) _lc_worker=1 ;;
 		--wan)
 			shift
-			[ $# -gt 0 ] || die "用法: isp-split linecheck [--json] [--wan <接口>] [--force]"
+			[ $# -gt 0 ] || die "用法: isp-split linecheck [--json] [--wan <接口>] [--force] [--background]"
 			_lc_only=$1
 			;;
 		-h | --help)
-			printf '用法: isp-split linecheck [--json] [--wan <接口>] [--force]\n'
+			printf '用法: isp-split linecheck [--json] [--wan <接口>] [--force] [--background]\n'
 			return 0
 			;;
 		*)
-			die "未知参数 '$1'（用法: isp-split linecheck [--json] [--wan <接口>] [--force]）"
+			die "未知参数 '$1'（用法: isp-split linecheck [--json] [--wan <接口>] [--force] [--background]）"
 			;;
 		esac
 		shift
 	done
 
 	[ "$(_lc_opt LINE_CHECK_ENABLE 1)" = "1" ] || die "线路体检已关闭（LINE_CHECK_ENABLE=0）"
+	[ "$_lc_worker" = "1" ] && _lc_json=1
 
 	LC_START=$(_lc_now)
 	LC_BUDGET=$(_lc_budget)
@@ -5506,6 +5736,24 @@ cmd_linecheck() {
 	[ "${ISP_SPLIT_LC_NO_SOCAT:-0}" = "1" ] && LC_SOCAT=0
 
 	mkdir -p "$STATE_DIR" 2>/dev/null || true
+	# 每次调用都先扫掉 pid 已死的探测目录（SIGKILL 走不到 trap）。命中缓存时
+	# 也扫，否则一个被 rpcd 超时杀掉的前台探测要等到缓存过期才有人收尸。
+	_lc_sweep_tmp
+
+	# 后台模式：只判断“要不要起”，绝不在这里探测。
+	if [ "$_lc_bg" = "1" ]; then
+		_lc_background "$_lc_force" "$_lc_only"
+		return $?
+	fi
+
+	if [ "$_lc_worker" = "1" ]; then
+		# 后台子进程：父进程已建好锁目录，这里接管（pid 改成自己），退出时删锁。
+		LC_LOCK_OWNER=1
+		mkdir -p "$LC_LOCK" 2>/dev/null || true
+		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
+		_lc_now >"$LC_LOCK/started" 2>/dev/null
+		_lc_trap_on
+	fi
 
 	# 收集 WAN
 	if [ -n "$_lc_only" ]; then
@@ -5528,30 +5776,76 @@ cmd_linecheck() {
 	fi
 	_lc_wnames=$(printf '%s\n' "$_lc_wans_list" | awk -F'\t' 'NF>=2{print $1}' | tr '\n' ' ' | sed 's/ $//')
 
+	_lc_geo_en=$(_lc_opt LINE_CHECK_GEO 1)
+	_lc_geo_prov=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
+	[ "$_lc_geo_en" = "0" ] && _lc_geo_prov=off
+	[ "$_lc_geo_prov" = "off" ] && _lc_geo_en=0
+	_C_GEO=$_lc_geo_en
+	_C_PROV=$_lc_geo_prov
+	_C_SOC=$LC_SOCAT
+	_C_INT=$LC_INTERVAL
+
+	# 没有可体检的 WAN：也发布一份 last.json，页面才不会空等 90 秒轮询。
+	# 这种缓存不会被 _lc_cache_fresh 当成命中（请求列表为空直接返回 1），
+	# 所以不会把后续真实 WAN 的结果挡掉。
 	if [ -z "$_lc_wnames" ]; then
+		_C_GEN=$LC_START
+		_C_OUT=""
+		_lc_tmp=$LC_CACHE.tmp.$$
+		rm -rf "$_lc_tmp"
+		if mkdir -p "$_lc_tmp" 2>/dev/null; then
+			printf '%s %s %s %s %s \n' "$LC_START" "$LC_INTERVAL" "$_lc_geo_en" "$_lc_geo_prov" "$LC_SOCAT" >"$_lc_tmp/meta"
+			printf '["没有启用的 WAN（检查 mwan3 接口 enabled=1）"]\n' >"$_lc_tmp/errors.json"
+			_lc_json_emit "$_lc_tmp" 0 0 >"$_lc_tmp/last.json"
+			_lc_publish "$_lc_tmp" || rm -rf "$_lc_tmp"
+			_lc_tmp=""
+		fi
 		if [ "$_lc_json" = "1" ]; then
-			printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[],"errors":["没有启用的 WAN（检查 mwan3 接口 enabled=1）"]}\n' \
-				"$ISP_VERSION" "$LC_START" "$LC_INTERVAL" \
-				"$([ "$(_lc_opt LINE_CHECK_GEO 1)" = "1" ] && printf true || printf false)" \
-				"$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)" \
-				"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)"
+			if [ -f "$LC_CACHE/last.json" ]; then
+				cat "$LC_CACHE/last.json"
+			else
+				printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[],"errors":["没有启用的 WAN（检查 mwan3 接口 enabled=1）"]}\n' \
+					"$ISP_VERSION" "$LC_START" "$LC_INTERVAL" \
+					"$([ "$_lc_geo_en" = "1" ] && printf true || printf false)" "$_lc_geo_prov" \
+					"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)"
+			fi
 		else
 			printf '线路体检：没有启用的 WAN。先在 mwan3 里启用至少一个接口，或用 --wan 指定。\n'
 		fi
 		return 0
 	fi
 
-	# 缓存：60s 内直接返回；--force 绕过
-	if [ "$_lc_force" = "0" ] && [ -d "$LC_CACHE" ]; then
-		_lc_cache_serve "$_lc_json" "$_lc_wnames" && return 0
+	_C_OUT=$_lc_wnames
+
+	# 缓存：60s 内直接返回；--force 绕过。读缓存阶段零探测、零网络。
+	if [ "$_lc_force" = "0" ] && [ "$_lc_worker" != "1" ] && _lc_cache_serve "$_lc_json" "$_lc_wnames"; then
+		return 0
+	fi
+
+	# 探测：加锁，避免和后台体检 / 另一个 CLI 撞车（BUG-23 的“重复点按钮”）。
+	if [ "$_lc_worker" != "1" ]; then
+		_lc_lock_try
+		case $? in
+		1)
+			if [ "$_lc_json" = "1" ]; then
+				printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"running":true,"pid":%s,"elapsed":%s,"wans":[],"errors":["已有体检在运行（pid %s，已 %s 秒），本次不重复探测"]}\n' \
+					"$ISP_VERSION" "$LC_START" "$LC_INTERVAL" "${LC_LOCK_PID:-0}" "${LC_LOCK_AGE:-0}" \
+					"${LC_LOCK_PID:-0}" "${LC_LOCK_AGE:-0}"
+			else
+				printf '已有体检在运行（pid %s，已 %s 秒），本次不重复探测。\n' "${LC_LOCK_PID:-0}" "${LC_LOCK_AGE:-0}" >&2
+			fi
+			return 4
+			;;
+		2) die "无法创建锁目录 $LC_LOCK" ;;
+		esac
+		_lc_trap_on
+		_lc_sweep
 	fi
 
 	_lc_tmp=$LC_CACHE.tmp.$$
 	rm -rf "$_lc_tmp"
 	mkdir -p "$_lc_tmp" || die "无法创建缓存目录 $_lc_tmp"
 
-	_first=1
-	_lc_errs=""
 	printf '%s\n' "$_lc_wans_list" | while IFS='	' read -r _if _dev _up _state _ip; do
 		[ -n "$_if" ] || continue
 		_lc_run_wan "$_if" "$_dev" "$_up" "$_state" "$_ip"
@@ -5562,37 +5856,19 @@ cmd_linecheck() {
 
 	# 上面 while 在管道子 shell 里，变量不会带回来；缓存文件已经落盘，
 	# 这里按文件重新组装，避免依赖子 shell 状态。
-	_lc_nowt=$(_lc_now)
-	_lc_geo_en=$(_lc_opt LINE_CHECK_GEO 1)
-	_lc_geo_prov=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
-	[ "$_lc_geo_en" = "0" ] && _lc_geo_prov=off
-	[ "$_lc_geo_prov" = "off" ] && _lc_geo_en=0
-	printf '%s %s %s %s %s %s\n' "$_lc_nowt" "$LC_INTERVAL" "$_lc_geo_en" "$_lc_geo_prov" "$LC_SOCAT" "$_lc_wnames" >"$_lc_tmp/meta"
+	_C_GEN=$(_lc_now)
+	printf '%s %s %s %s %s %s\n' "$_C_GEN" "$LC_INTERVAL" "$_lc_geo_en" "$_lc_geo_prov" "$LC_SOCAT" "$_lc_wnames" >"$_lc_tmp/meta"
 	printf '[]\n' >"$_lc_tmp/errors.json"
+	# last.json：LuCI 只读这一个文件，必须和 --json 输出逐字节一致。
+	_lc_json_emit "$_lc_tmp" 0 0 >"$_lc_tmp/last.json" || die "无法写入 $_lc_tmp/last.json"
 
-	rm -rf "$LC_CACHE"
-	mv "$_lc_tmp" "$LC_CACHE" 2>/dev/null || { rm -rf "$_lc_tmp"; die "无法写入缓存目录 $LC_CACHE"; }
+	_lc_publish "$_lc_tmp" || { rm -rf "$_lc_tmp"; die "无法写入缓存目录 $LC_CACHE"; }
+	_lc_tmp=""
 
 	if [ "$_lc_json" = "1" ]; then
-		printf '{"version":"%s","command":"linecheck","generated":%s,"cached":false,"age":0,"interval":%s,"geo_enabled":%s,"geo_provider":"%s","socat":%s,"wans":[' \
-			"$ISP_VERSION" "$_lc_nowt" "$LC_INTERVAL" \
-			"$([ "$_lc_geo_en" = "1" ] && printf true || printf false)" "$_lc_geo_prov" \
-			"$([ "$LC_SOCAT" = "1" ] && printf true || printf false)"
-		_first=1
-		for _w in $_lc_wnames; do
-			[ "$_first" = "1" ] || printf ','
-			_first=0
-			cat "$LC_CACHE/wan-$_w.json"
-		done
-		printf '],"errors":[]}\n'
+		cat "$LC_CACHE/last.json"
 	else
-		printf '线路体检 · v%s  %s\n' "$ISP_VERSION" "$(_lc_dt "$_lc_nowt")"
-		_lc_privacy_line
-		for _w in $_lc_wnames; do
-			printf '\n'
-			cat "$LC_CACHE/wan-$_w.txt"
-		done
-		printf '\n提示：%s 秒内重复执行直接返回缓存；--force 强制重测。\n' "$LC_INTERVAL"
+		_lc_text_emit "$LC_CACHE" ""
 	fi
 	return 0
 }
@@ -5680,6 +5956,7 @@ uninstall) cmd_uninstall ;;
   health     数据源健康度 + 双线状态（--json 给 LuCI 用）
   probe      分线实测出口速度
   linecheck  线路体检：公网/NAT/四段延迟/归属地/评分（--json，--wan，--force）
+             --background 后台探测并原子替换缓存（LuCI 用，立刻返回 JSON 状态）
   dns        生成多线路 DNS 配置（域名按线路选 DNS）
   export     导出给代理侧用：export mihomo|singbox|text <目录>
   install    注册开机自启与每日更新

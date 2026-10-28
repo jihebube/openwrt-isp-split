@@ -197,9 +197,40 @@ UDP 3478 被阻断时只把 NAT 标“未知”，不影响延迟/归属地/评�
 
 - 结果按 WAN 集合缓存到 `state/linecheck/`，`LINE_CHECK_MIN_INTERVAL` 内
   重复调用直接返回（`cached=true`、`age`），`--force` 绕过；
-- 单条 WAN 有 `LINE_CHECK_BUDGET` 预算，超时后跳过剩余 STUN/归属地并标注，
-  避免 rpcd/LuCI 超时；
-- 目标失败早停（连续两次失败换下一个），正常路径通常 3-10 秒。
+- 单条 WAN 有 `LINE_CHECK_BUDGET` 预算，超时后跳过剩余 STUN/归属地并标注；
+- 目标失败早停（连续两次失败换下一个），正常路径通常 3-10 秒，线路全超时
+  时 20-60 秒。
+
+### 观测面为什么必须异步（BUG-23）
+
+rpcd 的 `file exec` 是**硬超时**（默认 `/etc/config/rpcd` `timeout=30`），到点
+直接杀掉子进程并让 RPC reject。而 LuCI 的 `view.load()` 一旦 reject，整页
+`render()` 都不会执行——只剩菜单。
+
+于是有一个很讽刺的耦合：**用户最需要体检的场景（网络劣化）恰好是探测最慢的
+场景（每个目标/STUN 都要等到超时）**，同步 exec 在那时必然超过 30 秒，页面
+必然白屏；而白屏之后缓存也没写成，下一次打开又从零开始。
+
+所以页面与 CLI 的分工改成：
+
+| 阶段 | 谁做 | 做什么 | 耗时 |
+|---|---|---|---|
+| 打开页面 | LuCI | `fs.read state/linecheck/last.json`（另有 `fs.stat` 看锁） | <50ms，零 exec |
+| 点「开始体检」 | LuCI | `fs.exec isp-split linecheck --background` | ~1s（只起进程） |
+| 探测 | CLI 子进程 | `setsid` 脱离 rpcd 会话；持锁；探测；原子替换缓存目录 | 20-60s，不受 rpcd 超时影响 |
+| 等结果 | LuCI | 每 2.5s 读 `last.json` 比较 `generated`，最长 90s | 仅读文件 |
+
+配套约束：
+
+- `--background` 只做三件事：判断缓存是否还新鲜、抢锁、fork，**绝不探测**；
+- 锁是 `mkdir state/linecheck.lock`（原子），锁里写 pid + started；进程没了或
+  锁超过 5 分钟视为崩溃残留，自动清掉重来；
+- 探测过程写在 `state/linecheck.tmp.<pid>`，`trap` 在 EXIT/INT/TERM 清理；
+  启动时再扫一遍 pid 已死的残留（SIGKILL 走不到 trap）；
+- 缓存发布是“整目录 `mv` 对调”，先写 `last.json` 再换目录，所以页面永远读到
+  一份完整快照，不会读到写了一半的 JSON；
+- 归属地缓存放在 `state/linecheck.geo.tsv`（缓存目录之外），否则每次发布都会
+  把它一起换掉，而且会在探测中途造出一个没有 `meta` 的半截缓存目录（BUG-24）。
 
 ## 与代理（OpenClash / sing-box）共存
 

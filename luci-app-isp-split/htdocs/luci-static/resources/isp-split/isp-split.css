@@ -1064,6 +1064,41 @@
 	cursor: default;
 }
 
+/* 尚未体检时的占位卡（BUG-23：没缓存也必须有一个能看的页面，不能白屏） */
+.lc-placeholder {
+	grid-column: 1 / -1;
+	display: block;
+	padding: 18px 20px;
+}
+
+.lc-ph-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 8px;
+	font-size: 0.95rem;
+	color: var(--isp-text);
+}
+
+.lc-ph-head .isp-ico {
+	color: var(--isp-primary);
+}
+
+.lc-ph-text {
+	margin: 0 0 8px 0;
+	font-size: 0.84rem;
+	line-height: 1.65;
+	color: var(--isp-muted);
+}
+
+.lc-ph-note {
+	margin: 0;
+	font-size: 0.78rem;
+	line-height: 1.6;
+	color: var(--isp-muted);
+	opacity: 0.85;
+}
+
 @media (max-width: 520px) {
 	.lc-cards {
 		grid-template-columns: 1fr;
