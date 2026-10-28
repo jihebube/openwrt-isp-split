@@ -354,7 +354,13 @@ return view.extend({
 			box.removeChild(box.firstChild);
 
 		var rows = (this.status || []).filter(function(r) {
-			return r && r.set !== '兜底';
+			/* B-1：注释行不是运营商行。shell 侧已过滤，这里兜底，
+			   防止旧脚本/手工数据在总览页多出一张卡片。 */
+			if (!r || r.set === '兜底')
+				return false;
+			if (/^\s*#/.test(String(r.set || '')) || /^\s*#/.test(String(r.src || '')))
+				return false;
+			return true;
 		});
 
 		if (!rows.length) {

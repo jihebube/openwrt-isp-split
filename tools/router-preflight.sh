@@ -132,12 +132,23 @@ if command -v dnsmasq >/dev/null 2>&1; then
 	else
 		bad "dnsmasq 不支持 conf-dir，多线路 DNS 功能不可用"
 	fi
-	if dnsmasq --version 2>/dev/null | grep -q "no-nftset"; then
-		warn "dnsmasq 编译时去掉了 nftset —— mwan3 原生的域名→nftset 不可用"
-		warn "  （本项目的 server=/域名/IP@接口 不受影响）"
-	else
-		ok "dnsmasq 支持 nftset"
-	fi
+	# 域名→nftset 钉线的前置条件（F-5）：OpenWrt 基础版 dnsmasq 是
+	# no-ipset no-nftset，必须 dnsmasq-full。只提示，不阻断。
+	_nft_opts=$(dnsmasq --version 2>/dev/null |
+		sed -n 's/^Compile time options:[[:space:]]*//p' | head -1)
+	case " $_nft_opts " in
+	*" no-nftset "*)
+		warn "dnsmasq 未编译 nftset（no-nftset）—— 域名钉线不可用"
+		warn "  （server=/域名/IP@接口 的多线路 DNS 不受影响；需要钉线请装 dnsmasq-full）"
+		;;
+	*" nftset "* | *" +nftset "*)
+		ok "dnsmasq 支持 nftset（域名钉线的前置条件满足）"
+		;;
+	*)
+		warn "无法从 dnsmasq --version 确认 nftset 能力（缺少 Compile time options）"
+		warn "  按不支持处理：域名钉线不可用（多线路 DNS 不受影响）"
+		;;
+	esac
 else
 	bad "缺少 dnsmasq"
 fi

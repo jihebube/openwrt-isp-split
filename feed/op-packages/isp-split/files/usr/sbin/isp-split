@@ -15,7 +15,14 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.2.1-logo"
+ISP_VERSION="0.2.2"
+
+# 配置表里的注释行（# 开头，允许前导空白）必须在按空白展开之前整行删掉
+# （B-1）。否则 `for row in $ISP_TABLE` 会把 "#" 与后面的文字拆成两个
+# token，注释片段被当成数据行。只改内存，不写回配置文件。
+_strip_comments() {
+	printf '%s\n' "$1" | sed 's/^[[:space:]]*#.*$//' | sed '/^[[:space:]]*$/d'
+}
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
@@ -47,9 +54,10 @@ DNSMASQ_SERVICE=${DNSMASQ_SERVICE:-/etc/init.d/dnsmasq}
 # 但 ISP_TABLE 的最后一列会变成 "1\r"，`[ "$4" = "1" ]` 永远不成立：
 # plan 只剩一张空表、status 只剩兜底行、apply 报"没有启用的运营商"，
 # 而真正的原因（行尾多了一个 \r）完全看不出来。这里在入口统一去掉。
-ISP_TABLE=$(printf '%s' "${ISP_TABLE:-}" | tr -d '\r')
-DNS_TABLE=$(printf '%s' "${DNS_TABLE:-}" | tr -d '\r')
-DOMAIN_SPLIT=$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')
+# 注释行也在同一处删掉（B-1）：删除必须发生在任何按空白展开之前。
+ISP_TABLE=$(_strip_comments "$(printf '%s' "${ISP_TABLE:-}" | tr -d '\r')")
+DNS_TABLE=$(_strip_comments "$(printf '%s' "${DNS_TABLE:-}" | tr -d '\r')")
+DOMAIN_SPLIT=$(_strip_comments "$(printf '%s' "${DOMAIN_SPLIT:-}" | tr -d '\r')")
 
 # ---- 多数据源（0.2.1 默认双源）----
 # ISP_SOURCES 为空 = 单源兼容模式：仍按 ISP_MIRROR/<源名>.txt 拉取，
@@ -1453,7 +1461,7 @@ cmd_apply() {
 	# 取第一个 enabled=1 的行，而不是无条件取第一行：用户禁用第一个
 	# 运营商后，wire 不会为它建集合，旧写法会让每日 refresh 永久失败。
 	_fs=""
-	for _row in $(_conf_val ISP_TABLE 2>/dev/null); do
+	for _row in $(_conf_table ISP_TABLE 2>/dev/null); do
 		_old_ifs=$IFS
 		IFS=':'
 		set -- $_row
@@ -1596,6 +1604,112 @@ _write_rule() {
 	} >> "$WORK/rules.txt"
 }
 
+# ---- 孤儿 ipset 段收敛（B-4）----
+# 段名可以改名/删除/禁用，但 mwan3 的 config ipset 段不会自己消失：
+# 旧段仍然 enabled=1、loadfile 指向旧数据文件，mwan3 下次 reload 照样
+# 建集合、灌元素，永久驻留。旧版 uninstall 也只看"当前表里的名字"，
+# 连卸载都清不掉。
+#
+# 识别方式只有一个：isp_split=1 标记（_wire_ipset 写入）。绝不按 isp_
+# 前缀猜 —— 用户自己的 mwan3 ipset 段可能也叫 isp_xxx。没有标记的段
+# （0.2.1-happy 之前的旧版本写的）一律不动，只在日志里列出来。
+#
+# 当前仍有效的集合名：ISP_TABLE 里第 4 列=1 的行。DNS_TABLE 不引用
+# ipset，但把它的字段也纳入保护集合，避免同名段被误删（保守兜底）。
+_keep_set_names() {
+	_ks=" "
+	for _row in $ISP_TABLE; do
+		[ -n "$_row" ] || continue
+		_old_ifs=$IFS
+		IFS=':'
+		set -- $_row
+		IFS=$_old_ifs
+		[ $# -ge 4 ] || continue
+		[ "$4" = "1" ] || continue
+		_ks="$_ks$2 "
+	done
+	for _row in ${DNS_TABLE:-}; do
+		[ -n "$_row" ] || continue
+		_old_ifs=$IFS
+		IFS=':'
+		set -- $_row
+		IFS=$_old_ifs
+		for _f in "$@"; do
+			case "$_f" in "" | *[!A-Za-z0-9_]*) continue ;; esac
+			_ks="$_ks$_f "
+		done
+	done
+	printf '%s\n' "$_ks"
+}
+
+# 所有 config rule 引用的 ipset 名（空格分隔，带前后空格便于整词匹配）
+_rule_ipset_refs() {
+	_ri=" "
+	for _ri_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=rule$/\1/p'); do
+		_ri_v=$(uci -q get "mwan3.$_ri_sec.ipset" 2>/dev/null) || continue
+		for _ri_x in $_ri_v; do
+			case "$_ri_x" in "" | *[!A-Za-z0-9_]*) continue ;; esac
+			_ri="$_ri$_ri_x "
+		done
+	done
+	printf '%s\n' "$_ri"
+}
+
+_prune_orphan_ipsets() {
+	[ -f "$CFG_MWAN3" ] || return 0
+	_po_keep=$(_keep_set_names)
+	_po_refs=$(_rule_ipset_refs)
+	_po_changed=0
+	for _po_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=ipset$/\1/p'); do
+		_po_name=$(uci -q get "mwan3.$_po_sec.name" 2>/dev/null) || continue
+		[ -n "$_po_name" ] || continue
+		# 仍被当前启用的行引用：保留
+		case "$_po_keep" in *" $_po_name "*) continue ;; esac
+		# 没有标记的段不是本工具写的（或旧版本写的）：绝不删
+		if [ "$(uci -q get "mwan3.$_po_sec.isp_split" 2>/dev/null)" != "1" ]; then
+			case "$_po_name" in
+			isp_*)
+				log "提示：ipset 段 $_po_sec（$_po_name）没有 isp_split 标记，保留不动（旧版本或用户自建）"
+				;;
+			esac
+			continue
+		fi
+		# 仍被任何 mwan3 规则引用：删了会让 mwan3 渲染失败，只告警
+		case "$_po_refs" in
+		*" $_po_name "*)
+			log "警告：孤儿 ipset 段 $_po_sec（$_po_name）仍被 mwan3 规则引用，保留"
+			continue
+			;;
+		esac
+		if uci -q delete "mwan3.$_po_sec" 2>/dev/null; then
+			log "已清理孤儿 ipset 段 $_po_sec（$_po_name）"
+			_po_changed=1
+		else
+			log "警告：清理 ipset 段 $_po_sec 失败，保留"
+		fi
+	done
+	[ "$_po_changed" = "1" ] && uci -q commit mwan3 2>/dev/null
+	return 0
+}
+
+# 卸载：按 isp_split=1 标记删除所有本工具的 ipset 段。
+# 不能按"当前 ISP_TABLE 的名字"删：改名/删除的旧段会漏掉，永远清不掉。
+# 无标记的段一律不碰。
+_uninstall_ipsets() {
+	_ui_n=0
+	for _ui_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=ipset$/\1/p'); do
+		[ "$(uci -q get "mwan3.$_ui_sec.isp_split" 2>/dev/null)" = "1" ] || continue
+		uci -q delete "mwan3.$_ui_sec" 2>/dev/null && _ui_n=$((_ui_n + 1))
+	done
+	uci -q commit mwan3 2>/dev/null
+	[ "$_ui_n" -gt 0 ] &&
+		log "已删除 $_ui_n 个带 isp_split 标记的 ipset 段（含改名/删除的孤儿段）"
+	return 0
+}
+
 cmd_wire() {
 	_openclash_fakeip_warn
 	need_nft
@@ -1651,6 +1765,9 @@ cmd_wire() {
 
 	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	log "规则已注入（备份: $WORK/mwan3.bak）"
+	# 5. 收敛孤儿 ipset 段：必须放在规则块重写之后 —— 改名时旧规则
+	# 这一刻才消失；若在注入前做，旧规则仍引用旧段，会被误判成"保留"。
+	_prune_orphan_ipsets
 	/etc/init.d/mwan3 reload
 	_fallback_counter ||
 		log "警告：兜底计数规则未安装成功（status 的兜底行会缺失或为旧值），可稍后重跑 isp-split apply"
@@ -1748,8 +1865,9 @@ cmd_verify() {
 		echo "⚠ DNS 旁路规则缺失（mwan3 重启会清掉运行时插入的规则）"
 		echo "  恢复：isp-split dns   （或 isp-split wire）"
 	fi
-	if [ "$(nft list chain inet mwan3 mwan3_rules 2>/dev/null | grep -c "counter name")" -eq 0 ] &&
-	   [ -n "${DNS_TABLE:-}" ]; then
+	# 兜底计数器由 COUNT_FALLBACK 控制，与 DNS_TABLE 无关（B-2）。
+	if [ "${COUNT_FALLBACK:-1}" = "1" ] &&
+	   [ "$(nft list chain inet mwan3 mwan3_rules 2>/dev/null | grep -c "counter name")" -eq 0 ]; then
 		echo "⚠ 兜底计数规则缺失（同上）"
 		echo "  恢复：isp-split apply"
 	fi
@@ -1760,6 +1878,23 @@ cmd_verify() {
 
 
 # ---------------------------------------------------------------- plan (dry-run)
+
+# dnsmasq 是否编译了 nftset（域名→nftset 钉线的前置条件，F-5）。
+# 返回：0=支持，1=不支持，2=没有 dnsmasq。
+# OpenWrt 基础版 dnsmasq 的编译选项是 no-ipset no-nftset，必须装
+# dnsmasq-full 才有。这里只检测并提示，不阻断、不改变任何行为。
+_dnsmasq_nftset() {
+	command -v dnsmasq >/dev/null 2>&1 || return 2
+	_dn_opts=$(dnsmasq --version 2>/dev/null |
+		sed -n 's/^Compile time options:[[:space:]]*//p' | head -1)
+	# 没有 Compile time options 行的老版本无法证明支持，按不支持处理
+	[ -n "$_dn_opts" ] || return 1
+	case " $_dn_opts " in
+	*" no-nftset "*) return 1 ;;
+	*" nftset "* | *" +nftset "*) return 0 ;;
+	esac
+	return 1
+}
 
 # 只读预演：不写任何文件、不发任何 uci/nft 改动。
 cmd_plan() {
@@ -1813,7 +1948,7 @@ cmd_plan() {
 	done
 	[ "$_dp_any" = "1" ] || echo "  （无）"
 	echo "  说明: 未启用项不会被 apply 写入；残留的 nft 规则会在下次 wire 重写规则块时移除，"
-	echo "        mwan3 ipset 配置段与对应 nft 集合会在 uninstall 时清理。"
+	echo "        mwan3 ipset 配置段（带 isp_split=1 标记）会在下次 wire 与 uninstall 时清理。"
 
 	echo
 	echo "dnsmasq confdir（多线路 DNS 片段写入位置）:"
@@ -1850,6 +1985,24 @@ cmd_plan() {
 	*)
 		echo "  当前值: 未设置；未发现 dnsmasq 实际运行配置"
 		echo "  将使用默认目录: $DNSMASQ_DEFAULT_DIR（不修改 UCI confdir）"
+		;;
+	esac
+
+	echo
+	echo "dnsmasq nftset 能力（域名钉线的前置条件；本版本只检测，不启用钉线）:"
+	_dnsmasq_nftset
+	_nf=$?
+	case "$_nf" in
+	0)
+		echo "  ✓ 支持 nftset（dnsmasq 编译选项含 nftset）"
+		;;
+	1)
+		echo "  ⚠ 不支持 nftset（dnsmasq 编译选项为 no-nftset 或缺少该选项）"
+		echo "    域名钉线不可用；多线路 DNS 的 server=/域名/IP@接口 不受影响。"
+		echo "    需要域名→nftset 时请安装 dnsmasq-full。"
+		;;
+	*)
+		echo "  ⚠ 未找到 dnsmasq，无法检测 nftset 能力"
 		;;
 	esac
 
@@ -2173,8 +2326,10 @@ cmd_status() {
 			grep -oE "packets [0-9]+ bytes [0-9]+" | head -1)
 		_fp=$(echo "$_fb" | awk '{print $2}')
 		_fb_b=$(echo "$_fb" | awk '{print $4}')
+		# 与其余行走同一个 _human 换算，否则这一列是裸字节数、
+		# 既不对齐也没有单位（B-3）。--json 里的 bytes 保持纯数字。
 		printf '%-14s %-10s %10s %12s %10s  %s\n' \
-			"兜底" "-" "-" "${_fp:-0}" "${_fb_b:-0}" "未命中集合"
+			"兜底" "-" "-" "${_fp:-0}" "$(_human "${_fb_b:-0}")" "未命中集合"
 	fi
 	echo
 	echo "注: 命中包/流量为连接首包统计（ct state new；后续包由 conntrack 恢复标记，不再经过规则链）。"
@@ -3035,6 +3190,12 @@ _conf_val() {
 	' "${2:-$CONF}"
 }
 
+# 取配置表的值并删掉注释行。conf_get / apply 直接读文件，不能只依赖入口
+# 那次清理（B-1）。必须先整行删注释、再按空白展开，顺序不能反。
+_conf_table() {
+	_strip_comments "$(_conf_val "$1")"
+}
+
 conf_get() {
 	[ -f "$CONF" ] || die "找不到 $CONF"
 	printf 'dns_mode\t%s\n' "$(_conf_val DNS_MODE)"
@@ -3042,11 +3203,11 @@ conf_get() {
 		"$(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p' | tr '\n' ' ')"
 	# 值支持两种书写格式：多行（每行一条）或单行空格分隔。
 	# 先把所有空白折叠成换行，再按冒号拆字段——两种格式统一处理。
-	_conf_val ISP_TABLE | tr -s ' \t' '\n' |
+	_conf_table ISP_TABLE | tr -s ' \t' '\n' |
 		awk -F: 'NF >= 4 { printf "isp\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4 }'
-	_conf_val DNS_TABLE | tr -s ' \t' '\n' |
+	_conf_table DNS_TABLE | tr -s ' \t' '\n' |
 		awk -F: 'NF >= 2 { printf "dns\t%s\t%s\n", $1, $2 }'
-	_conf_val DOMAIN_SPLIT | tr -s ' \t' '\n' |
+	_conf_table DOMAIN_SPLIT | tr -s ' \t' '\n' |
 		awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
 }
 
@@ -3103,6 +3264,11 @@ _row_check() {
 
 # 直接对一整行做校验（不拆字段的调用点用）
 _row_check_row() {
+	# 双保险（B-1）：入口已删注释行，这里再挡一次带前导空白的 # 行，
+	# 避免将来新增调用点绕过入口清理时又把注释当数据。
+	case "$1" in
+	'#'* | [[:space:]]*'#'*) return 0 ;;
+	esac
 	_rr_ifs=$IFS
 	IFS=':'
 	set -- $1
@@ -3134,6 +3300,12 @@ _valid_ipv4() {
 _conf_validate() {
 	_key=$1
 	_val=$2
+	# 注释行不参与校验（B-1）：整行删掉后再按空白拆字段。清理必须发生在
+	# 空白展开之前，否则 "# 说明:xxx" 会被拆成 "#" 和 "说明:xxx" 两段。
+	# 这里只改局部副本，写回文件的内容仍保留用户注释。
+	case "$_key" in
+	ISP_TABLE | DNS_TABLE | DOMAIN_SPLIT) _val=$(_strip_comments "$_val") ;;
+	esac
 	case "$_val" in
 	*'$'* | *'`'* | *'"'* | *"'"* | *'\'* | *';'* | *'|'*)
 		die "配置值含不允许的字符（\$ \` \" ' \\ ; |）"
@@ -3684,17 +3856,8 @@ cmd_uninstall() {
 			cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	fi
 
-	for row in $ISP_TABLE; do
-		_old_ifs=$IFS
-		IFS=':'
-		set -- $row
-		IFS=$_old_ifs
-		case "$row" in \#*) continue ;; esac
-		[ $# -ge 2 ] || continue
-		_valid_name "$2" || continue
-		uci -q delete "mwan3.ipset_$2" 2>/dev/null
-	done
-	uci -q commit mwan3
+	# 按标记删，而不是按当前表名：改名/删除的孤儿段也要清掉（B-4）。
+	_uninstall_ipsets
 	/etc/init.d/mwan3 reload >/dev/null 2>&1
 
 	# 恢复 dnsmasq confdir 原值（状态文件在 $BASE 里，必须先恢复再删目录）

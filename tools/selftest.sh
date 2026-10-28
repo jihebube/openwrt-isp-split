@@ -1978,6 +1978,307 @@ else
 	ng "归因工具出现了写操作：$(grep -E '^(add|delete|insert|flush|replace)' "$TMP/ca/s2/calls" 2>/dev/null | head -3)"
 fi
 
+echo "== 15. 0.2.2 回归（B-1/B-2/B-3/B-4/B-7/F-5）"
+B123=$TMP/b123
+mkdir -p "$B123/bin"
+cat > "$B123/bin/nft" <<'FAKE_NFT_B123'
+#!/bin/sh
+[ "$1" = "-a" ] && shift
+cmd=$1; shift
+case "$cmd" in
+list)
+	case "$*" in
+	"table inet mwan3") exit 0 ;;
+	"chain inet mwan3 mwan3_rules")
+		cat <<'NFT_CHAIN'
+table inet mwan3 {
+	chain mwan3_rules {
+		ip daddr @isp_a meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only
+	}
+}
+NFT_CHAIN
+		exit 0
+		;;
+	"chain inet mwan3 mwan3_output") exit 1 ;;
+	"counter inet mwan3 isp_fallback")
+		echo 'counter isp_fallback { packets 944 bytes 119518 }'
+		exit 0
+		;;
+	"set inet mwan3 "*) exit 1 ;;
+	esac
+	;;
+esac
+exit 0
+FAKE_NFT_B123
+cat > "$B123/bin/uci" <<'FAKE_UCI_B123'
+#!/bin/sh
+case "$*" in
+*"show mwan3"*)
+	printf 'mwan3.wan_only=policy\nmwan3.wanb_only=policy\n'
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI_B123
+chmod +x "$B123/bin/nft" "$B123/bin/uci"
+
+mkdir -p "$B123/tmp"
+b123_run() { # $1=conf $2=command...
+	_c=$1
+	shift
+	(
+		PATH="$B123/bin:$PATH"
+		TMPDIR="$B123/tmp"
+		ISP_SPLIT_CONF="$_c"
+		ISP_SPLIT_BASE="$B123/base"
+		ISP_SPLIT_LIB="$LIB"
+		ISP_SPLIT_MWAN3="$B123/mwan3"
+		DNSMASQ_CONF_GLOB="$B123/no-such-dnsmasq.conf.*"
+		DNSMASQ_DEFAULT_DIR="$B123/dnsmasq.d"
+		export PATH TMPDIR ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB \
+			ISP_SPLIT_MWAN3 DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
+		sh "$ROOT/files/usr/sbin/isp-split" "$@"
+	)
+}
+
+# ---- B-1：注释行（含前导空白）不得进入 conf get / plan ----
+cat > "$B123/conf-b1" <<'B1_CONF'
+DNS_MODE="bind"
+DNS_TABLE="
+wan_only:223.5.5.5
+# 移动先观察一段时间:wanb_only:119.29.29.29
+"
+DOMAIN_SPLIT="
+# 域名注释:bilibili.com:wanb_only
+bilivideo.com:wanb_only
+"
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+   # 前导空白的注释:isp_cmcc:wanb_only:0
+unicom_cnc:isp_uni:wanb_only:1
+"
+B1_CONF
+_b1_get=$(b123_run "$B123/conf-b1" conf get 2>/dev/null)
+_b1_isp=$(printf '%s\n' "$_b1_get" | grep -c '^isp	')
+_b1_dns=$(printf '%s\n' "$_b1_get" | grep -c '^dns	')
+_b1_dom=$(printf '%s\n' "$_b1_get" | grep -c '^domain	')
+if [ "$_b1_isp" -eq 2 ] && [ "$_b1_dns" -eq 1 ] && [ "$_b1_dom" -eq 1 ] &&
+   ! printf '%s\n' "$_b1_get" | grep -q '移动先观察'; then
+	ok "B-1 conf get 跳过注释行（2 运营商 / 1 DNS / 1 域名）"
+else
+	ng "B-1 conf get 仍把注释当数据行: isp=$_b1_isp dns=$_b1_dns domain=$_b1_dom"
+	printf '%s\n' "$_b1_get" | sed 's/^/    /'
+fi
+
+b123_run "$B123/conf-b1" plan > "$B123/plan.out" 2>&1
+_b1_rc=$?
+if [ "$_b1_rc" -eq 0 ] && grep -q 'isp_tel' "$B123/plan.out" &&
+   ! grep -q '错误: ISP_TABLE 的源名' "$B123/plan.out" &&
+   grep -q 'dnsmasq nftset 能力' "$B123/plan.out"; then
+	ok "B-1 带注释的 ISP_TABLE 下 plan 正常完成（并输出 nftset 检测项）"
+else
+	ng "B-1 plan 仍因注释行失败（rc=$_b1_rc）"
+	sed 's/^/    /' "$B123/plan.out" | tail -12
+fi
+
+# 双保险：_row_check_row 对带前导空白的注释行直接放行
+if ( ISP_SPLIT_CONF="$B123/conf-b1" ISP_SPLIT_BASE="$B123/base" \
+	ISP_SPLIT_LIB="$LIB" \
+	export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	_row_check_row '   # 注释:isp_x:wan_only:0' ) >/dev/null 2>&1; then
+	ok "B-1 _row_check_row 放行带前导空白的注释行"
+else
+	ng "B-1 _row_check_row 仍把注释行判成非法数据"
+fi
+
+# ---- B-2：verify 兜底提示只看 COUNT_FALLBACK，与 DNS_TABLE 无关 ----
+cat > "$B123/conf-b2a" <<'B2A_CONF'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+COUNT_FALLBACK="1"
+B2A_CONF
+cat > "$B123/conf-b2b" <<'B2B_CONF'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE="wan_only:223.5.5.5"
+DOMAIN_SPLIT=""
+COUNT_FALLBACK="0"
+B2B_CONF
+# 假 nft 的链里没有 counter name：COUNT_FALLBACK=1 必须提示
+b123_run "$B123/conf-b2a" verify > "$B123/v-a.out" 2>&1
+# COUNT_FALLBACK=0 时即使 DNS_TABLE 有值也不能误报
+b123_run "$B123/conf-b2b" verify > "$B123/v-b.out" 2>&1
+if grep -q '兜底计数规则缺失' "$B123/v-a.out" &&
+   ! grep -q '兜底计数规则缺失' "$B123/v-b.out"; then
+	ok "B-2 verify 兜底提示由 COUNT_FALLBACK 决定（1=提示，0=不提示）"
+else
+	ng "B-2 verify 兜底提示判定仍错误"
+	echo "    COUNT_FALLBACK=1 + DNS_TABLE 空:"
+	grep '兜底计数' "$B123/v-a.out" | sed 's/^/      /'
+	echo "    COUNT_FALLBACK=0 + DNS_TABLE 有值:"
+	grep '兜底计数' "$B123/v-b.out" | sed 's/^/      /'
+fi
+
+# ---- B-3：status 兜底行必须有单位换算 ----
+cat > "$B123/conf-b3" <<'B3_CONF'
+ISP_TABLE="a:isp_a:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+COUNT_FALLBACK="1"
+B3_CONF
+b123_run "$B123/conf-b3" status > "$B123/status.out" 2>&1
+_b3_row=$(grep '^兜底' "$B123/status.out" | head -1)
+case "$_b3_row" in
+*116.7KiB*) _b3_ok=1 ;;
+*) _b3_ok=0 ;;
+esac
+if [ "$_b3_ok" = "1" ] && ! printf '%s' "$_b3_row" | grep -q '119518'; then
+	ok "B-3 status 兜底行流量已换算为 116.7KiB（不再是裸字节）"
+else
+	ng "B-3 status 兜底行仍是裸字节: $_b3_row"
+fi
+
+# ---- B-4：wire 收敛带标记的孤儿 ipset 段，uninstall 按标记全删 ----
+B4=$TMP/b4
+mkdir -p "$B4/bin"
+cat > "$B4/bin/uci" <<'FAKE_UCI_B4'
+#!/bin/sh
+S=${FAKE_UCI_STATE:?}
+[ "$1" = "-q" ] && shift
+cmd=$1
+shift
+case "$cmd" in
+show)
+	[ "${1:-}" = "mwan3" ] || exit 1
+	cat "$S/show" 2>/dev/null
+	exit 0
+	;;
+get)
+	p=${1#mwan3.}
+	sec=${p%%.*}
+	rest=${p#*.}
+	[ "$rest" = "$p" ] && exit 1
+	[ -f "$S/data/$sec.$rest" ] || exit 1
+	cat "$S/data/$sec.$rest"
+	exit 0
+	;;
+delete)
+	sec=${1#mwan3.}
+	[ -f "$S/data/$sec.name" ] || exit 1
+	rm -f "$S/data/$sec".*
+	grep -v "^mwan3\.$sec=" "$S/show" > "$S/show.new" 2>/dev/null
+	mv "$S/show.new" "$S/show"
+	exit 0
+	;;
+commit)
+	echo commit >> "$S/commit.log"
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI_B4
+chmod +x "$B4/bin/uci"
+cat > "$B4/conf" <<'B4_CONF'
+ISP_TABLE="
+telecom:isp_tel:wan_only:1
+unicom:isp_uni:wanb_only:1
+cmcc:isp_cmcc:wanb_only:0
+"
+DNS_TABLE="wan_only:223.5.5.5"
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+B4_CONF
+: > "$B4/mwan3"
+
+b4_state() {
+	rm -rf "$1"
+	mkdir -p "$1/data"
+	cat > "$1/show" <<'B4_SHOW'
+mwan3.wan_only=policy
+mwan3.ipset_isp_tel=ipset
+mwan3.ipset_isp_uni=ipset
+mwan3.ipset_isp_cmcc=ipset
+mwan3.ipset_isp_old=ipset
+mwan3.ipset_isp_keep=ipset
+mwan3.ipset_isp_legacy=ipset
+mwan3.mywg=ipset
+mwan3.rule_tel=rule
+B4_SHOW
+	# 段名是 ipset_<集合名>；当前启用：isp_tel / isp_uni；
+	# 禁用：isp_cmcc；改名遗留：isp_old；无标记旧段：isp_legacy。
+	printf 'isp_tel\n' > "$1/data/ipset_isp_tel.name"
+	printf '1\n' > "$1/data/ipset_isp_tel.isp_split"
+	printf 'isp_uni\n' > "$1/data/ipset_isp_uni.name"
+	printf '1\n' > "$1/data/ipset_isp_uni.isp_split"
+	printf 'isp_cmcc\n' > "$1/data/ipset_isp_cmcc.name"
+	printf '1\n' > "$1/data/ipset_isp_cmcc.isp_split"
+	printf 'isp_old\n' > "$1/data/ipset_isp_old.name"
+	printf '1\n' > "$1/data/ipset_isp_old.isp_split"
+	printf 'isp_keep\n' > "$1/data/ipset_isp_keep.name"
+	printf '1\n' > "$1/data/ipset_isp_keep.isp_split"
+	printf 'isp_legacy\n' > "$1/data/ipset_isp_legacy.name"
+	printf 'mywg\n' > "$1/data/mywg.name"
+	printf 'isp_keep\n' > "$1/data/rule_tel.ipset"
+	: > "$1/commit.log"
+}
+
+b4_run() { # $1=state dir $2=function
+	(
+		PATH="$B4/bin:$PATH"
+		FAKE_UCI_STATE="$1"
+		ISP_SPLIT_CONF="$B4/conf"
+		ISP_SPLIT_BASE="$B4/base"
+		ISP_SPLIT_MWAN3="$B4/mwan3"
+		export PATH FAKE_UCI_STATE ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_MWAN3
+		. "$TMP/isp-lib.sh"
+		"$2"
+	)
+}
+
+b4_state "$B4/s1"
+b4_run "$B4/s1" _prune_orphan_ipsets > "$B4/prune.log" 2>&1
+_b4_left=$(grep '=ipset$' "$B4/s1/show" | sed 's/^mwan3\.//; s/=ipset$//' | tr '\n' ' ')
+_b4_expect='ipset_isp_tel ipset_isp_uni ipset_isp_keep ipset_isp_legacy mywg '
+if [ "$_b4_left" = "$_b4_expect" ] &&
+   grep -q '已清理孤儿 ipset 段 ipset_isp_old' "$B4/prune.log" &&
+   grep -q '仍被 mwan3 规则引用，保留' "$B4/prune.log" &&
+   grep -q '没有 isp_split 标记，保留不动' "$B4/prune.log"; then
+	ok "B-4 wire 只删带标记且无引用的孤儿段（保留当前/被引用/无标记段）"
+else
+	ng "B-4 孤儿段收敛结果异常: [$_b4_left]（期望: [$_b4_expect]）"
+	sed 's/^/    /' "$B4/prune.log"
+fi
+
+b4_run "$B4/s1" _uninstall_ipsets > "$B4/uninstall.log" 2>&1
+_b4_left=$(grep '=ipset$' "$B4/s1/show" | sed 's/^mwan3\.//; s/=ipset$//' | tr '\n' ' ')
+if [ "$_b4_left" = "ipset_isp_legacy mywg " ]; then
+	ok "B-4 uninstall 按 isp_split 标记全删，无标记段保持不动"
+else
+	ng "B-4 uninstall 后残留异常: [$_b4_left]（期望: [ipset_isp_legacy mywg ]）"
+	sed 's/^/    /' "$B4/uninstall.log"
+fi
+
+# ---- B-7：版本串三处同源，PKG_RELEASE 全部为 1 ----
+_v_script=$(sed -n 's/^ISP_VERSION="\(.*\)"$/\1/p' "$ROOT/files/usr/sbin/isp-split" | head -1)
+_v_main=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1)
+_v_luci=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-isp-split/Makefile" | head -1)
+_v_feed1=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/isp-split/Makefile" | head -1)
+_v_feed2=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/luci-app-isp-split/Makefile" | head -1)
+_r_main=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile" | head -1)
+_r_luci=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-isp-split/Makefile" | head -1)
+_r_feed1=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/feed/op-packages/isp-split/Makefile" | head -1)
+_r_feed2=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/feed/op-packages/luci-app-isp-split/Makefile" | head -1)
+if [ -n "$_v_script" ] && [ "$_v_script" = "$_v_main" ] &&
+   [ "$_v_main" = "$_v_luci" ] && [ "$_v_main" = "$_v_feed1" ] &&
+   [ "$_v_main" = "$_v_feed2" ] &&
+   [ "$_r_main" = "1" ] && [ "$_r_luci" = "1" ] &&
+   [ "$_r_feed1" = "1" ] && [ "$_r_feed2" = "1" ]; then
+	ok "B-7 版本串同源（$_v_script），PKG_RELEASE 全部为 1"
+else
+	ng "B-7 版本串不一致: script=$_v_script main=$_v_main luci=$_v_luci feed=$_v_feed1/$_v_feed2 release=$_r_main/$_r_luci/$_r_feed1/$_r_feed2"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then

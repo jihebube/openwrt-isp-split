@@ -131,6 +131,10 @@ return view.extend({
 		out.split('\n').forEach(function(line) {
 			if (!line)
 				return;
+			/* 注释行不是数据行（B-1）。conf get 已在 shell 侧过滤，
+			   这里再挡一次，避免旧版脚本或手工拼接的输出被渲染成红行。 */
+			if (/^\s*#/.test(line))
+				return;
 			var f = line.split('\t');
 			if (f[0] === 'dns_mode')
 				model.mode = (f[1] || 'bind').trim();
