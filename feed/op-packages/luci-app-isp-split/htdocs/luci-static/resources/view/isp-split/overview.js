@@ -45,6 +45,30 @@ var GLYPH_FOR = {
 	cernet: 'cernet'
 };
 
+/* 品牌 logo（运营商官方标志，fill 型多色 SVG，静态文件按请求加载） */
+var BRAND_LOGO = {
+	chinatelecom: 'logo-chinatelecom.svg',
+	chinanet: 'logo-chinatelecom.svg',
+	telecom: 'logo-chinatelecom.svg',
+	unicom_cnc: 'logo-unicom.svg',
+	unicom: 'logo-unicom.svg',
+	cmcc: 'logo-mobile.svg',
+	mobile: 'logo-mobile.svg'
+};
+
+function brandLogo(src, size) {
+	var file = BRAND_LOGO[src];
+	if (!file)
+		return null;
+	var img = document.createElement('img');
+	img.src = L.resource('isp-split/logos/' + file);
+	img.alt = src;
+	img.width = size || 20;
+	img.height = size || 20;
+	img.className = 'isp-brand-logo';
+	return img;
+}
+
 function svgIcon(name, size) {
 	var span = document.createElement('span');
 	span.className = 'isp-ico';
@@ -372,7 +396,7 @@ return view.extend({
 			}, [
 				E('div', { 'class': 'isp-card-head' }, [
 					E('span', { 'class': 'isp-op-name' }, [ r.label || r.src ]),
-					E('span', { 'class': 'isp-op-ico' }, [ svgIcon(GLYPH_FOR[r.src] || 'other', 20) ])
+					E('span', { 'class': 'isp-op-ico' }, [ brandLogo(r.src, 20) || svgIcon(GLYPH_FOR[r.src] || 'other', 20) ])
 				]),
 				E('div', {}, [
 					E('span', { 'class': 'isp-big' }, [ r.exists ? fmtNum(packets) : '—' ]),

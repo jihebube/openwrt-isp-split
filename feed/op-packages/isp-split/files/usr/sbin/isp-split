@@ -15,7 +15,7 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.2.1"
+ISP_VERSION="0.2.1-logo"
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
