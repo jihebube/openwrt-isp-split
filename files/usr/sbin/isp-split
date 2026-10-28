@@ -1281,9 +1281,9 @@ _gen_batch() {
 # 命中集合的流量在前面的 jump 里已离开本链，能走到这条规则的
 # 必然是未命中任何启用集合的流量，从而可以量化"覆盖率"。
 #
-# 是否把 DNS（udp/tcp 53）排除在兜底统计之外。默认 1=排除：
-# DNS 查询本身不是业务流量（网关本地应答或运营商解析开销），计进兜底
-# 只会稀释"未命中运营商集合的真实业务流量"这个口径。写 0 保持旧行为。
+# 是否把 DNS（udp/tcp 任一侧 53）排除在兜底统计之外。默认 1=排除：
+# DNS 查询/响应本身不是业务流量（网关本地应答或运营商解析开销），计进
+# 兜底只会稀释"未命中运营商集合的真实业务流量"这个口径。写 0 保持旧行为。
 _fallback_skip_dns() {
 	[ "${COUNT_FALLBACK_SKIP_DNS:-1}" != "0" ]
 }
@@ -1301,15 +1301,21 @@ _fallback_rule_ok() {
 		# 为什么是两条：nft 不接受一条规则里同时出现 udp dport 和 tcp dport
 		# （conflicting transport layer protocols）。拆成
 		#   A) 非 tcp/udp：ICMP 等其他协议照常计数
-		#   B) tcp/udp 且 dport != 53
+		#   B) tcp/udp 且 dport != 53 且 sport != 53
+		# B 必须同时排除两侧 53：DNS 查询 dport=53，DNS 响应 sport=53
+		# （WAN→LAN）——只排除 dport 会漏掉响应包（BUG-21 残留半修）。
+		# nft 1.1.6 接受一条规则里写两个 th 不等式，故仍是两条规则。
 		# 两条规则共用同一个命名计数器，计数自动汇总。
 		[ "$_fbo_n" -eq 2 ] || return 1
 		printf '%s\n' "$_fbo_norm" |
 			grep -F 'meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"' |
 			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+' ||
 			return 1
+		# 不依赖 dport/sport 的渲染顺序：同一行里两个条件都出现即可。
 		_fbo_dns=$(printf '%s\n' "$_fbo_norm" |
-			grep -F 'th dport != 53 counter name "isp_fallback"' | head -1)
+			grep -F 'th dport != 53' |
+			grep -F 'th sport != 53' | head -1)
+		[ -n "$_fbo_dns" ] || return 1
 		# nft 通常按书写顺序渲染集合；两种顺序都认，避免老版本
 		# 归一化顺序后每次 apply 都误判成"形状不对"而重建。
 		case "$_fbo_dns" in
@@ -1355,7 +1361,8 @@ _fallback_counter() {
 	fi
 
 	# 幂等：规则已存在且形状正确（mark==0、IPv4、命名计数器、DNS 条件）
-	# 就不动它。旧版单条规则（无 mark 条件或未排除 DNS）需要重建。
+	# 就不动它。旧版单条规则（无 mark 条件或未排除 DNS）以及只排 dport=53
+	# 的半修形状（漏 DNS 响应）都需要重建。
 	_fb_lines=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
 		grep 'counter name "isp_fallback"')
 	if _fallback_rule_ok "$_fb_lines"; then
@@ -1374,7 +1381,7 @@ _fallback_counter() {
 	_FB_BASE='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000'
 	if _fallback_skip_dns; then
 		_COND_OTHER="$_FB_BASE meta l4proto != tcp meta l4proto != udp counter name \"isp_fallback\""
-		_COND_DNS="$_FB_BASE meta l4proto { tcp, udp } th dport != 53 counter name \"isp_fallback\""
+		_COND_DNS="$_FB_BASE meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name \"isp_fallback\""
 		if [ -n "$_h" ]; then
 			# 连续两次插到同一个锚点前：先 OTHER 后 DNS，两条保持相邻。
 			if nft insert rule inet mwan3 mwan3_rules position "$_h" \
@@ -2268,8 +2275,8 @@ DNS_STATE=$BASE/state
 DNS_MODE=${DNS_MODE:-bind}
 # 统计"未命中任何运营商集合"的兜底流量（isp_fallback 计数器，status 里显示）
 COUNT_FALLBACK=${COUNT_FALLBACK:-1}
-# 兜底计数是否排除 DNS（udp/tcp 53）。默认 1=排除：DNS 查询本身不是
-# 业务流量，计入兜底只会稀释真实业务流量的口径。0=旧行为。
+# 兜底计数是否排除 DNS（udp/tcp 任一侧 53）。默认 1=排除：DNS 查询和
+# 响应都不是业务流量，计入兜底只会稀释真实业务流量的口径。0=旧行为。
 COUNT_FALLBACK_SKIP_DNS=${COUNT_FALLBACK_SKIP_DNS:-1}
 DOMAINDIR=${DOMAIN_LIST_DIR:-${DOMAINDIR:-/etc/isp-split/domains}}
 

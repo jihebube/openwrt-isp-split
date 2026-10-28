@@ -1558,8 +1558,11 @@ fi
 
 echo "== 13. 兜底计数默认排除 DNS（BUG-21）"
 # 真 nft 不接受一条规则里同时出现 udp dport 和 tcp dport，所以排除 DNS
-# 必须拆两条：非 tcp/udp（保留 ICMP 等）+ tcp/udp 且 dport != 53。
-# 这里用假 nft 检查 _fallback_counter 实际下发的规则形状和幂等重建路径。
+# 必须拆两条：非 tcp/udp（保留 ICMP 等）+ tcp/udp 且 dport/sport 都不是 53。
+# DNS 查询 dport=53、DNS 响应 sport=53，两侧都要排除，否则响应包会漏进
+# 兜底计数（BUG-21 第一版只排 dport 的残留问题）。
+# 这里用假 nft 检查 _fallback_counter 实际下发的规则形状和幂等重建路径；
+# 13.8 在 root + 本机 DNS 可用时用真 nft 做一次查询/响应语义验证。
 FB=$TMP/fb
 mkdir -p "$FB/bin"
 cat > "$FB/bin/nft" <<'FAKE_FB_NFT'
@@ -1663,14 +1666,15 @@ tcp dport 443 jump mwan3_policy_wan_only # handle 2
 FB_RULES
 if fb_run "$FB/s1" "$TMP/fb.conf" >/dev/null 2>&1; then
 	_fb_other=$(grep -c 'meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"' "$FB/s1/log" 2>/dev/null || true)
-	_fb_dns=$(grep -c 'meta l4proto { tcp, udp } th dport != 53 counter name "isp_fallback"' "$FB/s1/log" 2>/dev/null || true)
+	_fb_dns=$(grep -c 'meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback"' "$FB/s1/log" 2>/dev/null || true)
 	_fb_pos=$(grep -c '^insert .*position 2 ' "$FB/s1/log" 2>/dev/null || true)
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s1/rules" 2>/dev/null || true)
 	if [ "${_fb_other:-0}" -eq 1 ] && [ "${_fb_dns:-0}" -eq 1 ] &&
 	   [ "${_fb_pos:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
 	   sed -n '2p' "$FB/s1/rules" | grep -q 'meta l4proto != tcp' &&
-	   sed -n '3p' "$FB/s1/rules" | grep -q 'th dport != 53'; then
-		ok "默认排除 DNS：插在锚点前，两条规则形状正确且相邻"
+	   sed -n '3p' "$FB/s1/rules" | grep -q 'th dport != 53' &&
+	   sed -n '3p' "$FB/s1/rules" | grep -q 'th sport != 53'; then
+		ok "默认排除 DNS：插在锚点前，两条规则形状正确且相邻（dport/sport 双侧 53）"
 	else
 		ng "默认排除 DNS 的规则形状异常（other=$_fb_other dns=$_fb_dns pos=$_fb_pos n=$_fb_n）"
 		sed 's/^/    /' "$FB/s1/log"
@@ -1685,7 +1689,7 @@ if fb_run "$FB/s2" "$TMP/fb0.conf" >/dev/null 2>&1; then
 	_fb_add=$(grep -c '^add rule' "$FB/s2/log" 2>/dev/null || true)
 	if [ "${_fb_add:-0}" -eq 1 ] &&
 	   grep -q 'meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"' "$FB/s2/rules" &&
-	   ! grep -q 'meta l4proto\|dport != 53' "$FB/s2/rules"; then
+	   ! grep -qE 'meta l4proto|dport != 53|sport != 53' "$FB/s2/rules"; then
 		ok "COUNT_FALLBACK_SKIP_DNS=0 保持旧单条形状（不加 DNS 条件）"
 	else
 		ng "COUNT_FALLBACK_SKIP_DNS=0 的规则形状不是旧形状"
@@ -1703,7 +1707,8 @@ if fb_run "$FB/s3" "$TMP/fb.conf" >/dev/null 2>&1; then
 	_fb_add=$(grep -c '^add rule' "$FB/s3/log" 2>/dev/null || true)
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s3/rules" 2>/dev/null || true)
 	if [ "${_fb_del:-0}" -eq 1 ] && [ "${_fb_add:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
-	   grep -q 'th dport != 53' "$FB/s3/rules"; then
+	   grep -q 'th dport != 53' "$FB/s3/rules" &&
+	   grep -q 'th sport != 53' "$FB/s3/rules"; then
 		ok "旧单条规则在默认配置下重建为两条新规则"
 	else
 		ng "旧规则重建异常（delete=$_fb_del add=$_fb_add n=$_fb_n）"
@@ -1716,7 +1721,7 @@ fi
 fb_state "$FB/s4"
 cat > "$FB/s4/rules" <<'FB_NEW_RULES'
 meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
-meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 counter name "isp_fallback" # handle 2
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback" # handle 2
 FB_NEW_RULES
 if fb_run "$FB/s4" "$TMP/fb.conf" >/dev/null 2>&1; then
 	if [ ! -s "$FB/s4/log" ] &&
@@ -1737,13 +1742,101 @@ if fb_run "$FB/s5" "$TMP/fb0.conf" >/dev/null 2>&1; then
 	_fb_del=$(grep -c '^delete ' "$FB/s5/log" 2>/dev/null || true)
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s5/rules" 2>/dev/null || true)
 	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 1 ] &&
-	   ! grep -q 'meta l4proto\|dport != 53' "$FB/s5/rules"; then
+	   ! grep -qE 'meta l4proto|dport != 53|sport != 53' "$FB/s5/rules"; then
 		ok "COUNT_FALLBACK_SKIP_DNS=0 时两条新规则切回旧单条形状"
 	else
 		ng "切回旧形状异常（delete=$_fb_del n=$_fb_n）"
 	fi
 else
 	ng "切回旧形状时 _fallback_counter 调用失败"
+fi
+
+# --- 13.6 BUG-21 半修形状（只排 dport 53）：必须重建为双侧排除 ---
+# 这是上一轮遗留问题的回归用例：旧规则只带 th dport != 53，
+# DNS 响应包（sport=53）仍会被计入。
+fb_state "$FB/s6"
+cat > "$FB/s6/rules" <<'FB_HALF_RULES'
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 counter name "isp_fallback" # handle 2
+FB_HALF_RULES
+if fb_run "$FB/s6" "$TMP/fb.conf" >/dev/null 2>&1; then
+	_fb_del=$(grep -c '^delete ' "$FB/s6/log" 2>/dev/null || true)
+	_fb_add=$(grep -c '^add rule' "$FB/s6/log" 2>/dev/null || true)
+	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s6/rules" 2>/dev/null || true)
+	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_add:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
+	   grep -q 'th dport != 53' "$FB/s6/rules" &&
+	   grep -q 'th sport != 53' "$FB/s6/rules"; then
+		ok "半修形状（只排 dport 53）在默认配置下重建为 dport/sport 双侧排除"
+	else
+		ng "半修形状未被重建（delete=$_fb_del add=$_fb_add n=$_fb_n）"
+	fi
+else
+	ng "半修形状重建时 _fallback_counter 调用失败"
+fi
+
+# --- 13.7 nft 渲染顺序颠倒（sport 在 dport 前）时仍幂等 ---
+# 不能因为 nft 归一化顺序不同就每次 apply 都重建规则。
+fb_state "$FB/s7"
+cat > "$FB/s7/rules" <<'FB_REV_RULES'
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th sport != 53 th dport != 53 counter name "isp_fallback" # handle 2
+FB_REV_RULES
+if fb_run "$FB/s7" "$TMP/fb.conf" >/dev/null 2>&1; then
+	if [ ! -s "$FB/s7/log" ] &&
+	   [ "$(grep -c 'counter name "isp_fallback"' "$FB/s7/rules")" -eq 2 ]; then
+		ok "dport/sport 条件顺序颠倒时形状检查仍通过（幂等，无重建）"
+	else
+		ng "条件顺序颠倒导致误判并重建"
+		sed 's/^/    /' "$FB/s7/log"
+	fi
+else
+	ng "条件顺序颠倒时 _fallback_counter 调用失败"
+fi
+
+# --- 13.8 真 nft 语义：DNS 查询与响应都不进兜底（root + 本机 DNS 时） ---
+# 在独立表里复刻计数条件，用 nslookup 触发一次真实 UDP 查询+响应：
+# 出向 udp dport 53 与入向 udp sport 53 各有一个直接计数器，
+# 另有一对 dport/sport 双侧排除计数器；期望直接计数 >0、排除计数 =0。
+# 非 root / 无 nft / 本机无 DNS 时跳过，不影响离线用例。
+_nft_bin=$(command -v nft 2>/dev/null || true)
+if [ "$(id -u)" -eq 0 ] && [ -n "$_nft_bin" ] && command -v nslookup >/dev/null 2>&1; then
+	FB_T=selftest_fb_dns
+	"$_nft_bin" delete table inet "$FB_T" >/dev/null 2>&1 || true
+	if "$_nft_bin" add table inet "$FB_T" >/dev/null 2>&1 &&
+	   "$_nft_bin" add chain inet "$FB_T" out '{ type filter hook output priority 0; }' >/dev/null 2>&1 &&
+	   "$_nft_bin" add chain inet "$FB_T" in '{ type filter hook input priority 0; }' >/dev/null 2>&1 &&
+	   "$_nft_bin" add counter inet "$FB_T" q >/dev/null 2>&1 &&
+	   "$_nft_bin" add counter inet "$FB_T" qe >/dev/null 2>&1 &&
+	   "$_nft_bin" add counter inet "$FB_T" r >/dev/null 2>&1 &&
+	   "$_nft_bin" add counter inet "$FB_T" re >/dev/null 2>&1 &&
+	   "$_nft_bin" add rule inet "$FB_T" out oif lo udp dport 53 counter name q >/dev/null 2>&1 &&
+	   "$_nft_bin" add rule inet "$FB_T" out oif lo meta l4proto '{ tcp, udp }' th dport != 53 th sport != 53 counter name qe >/dev/null 2>&1 &&
+	   "$_nft_bin" add rule inet "$FB_T" in iif lo udp sport 53 counter name r >/dev/null 2>&1 &&
+	   "$_nft_bin" add rule inet "$FB_T" in iif lo meta l4proto '{ tcp, udp }' th dport != 53 th sport != 53 counter name re >/dev/null 2>&1; then
+		nslookup www.example.com 127.0.0.1 >/dev/null 2>&1 || true
+		_fb_pkt() {
+			"$_nft_bin" list counter inet "$FB_T" "$1" 2>/dev/null |
+				sed -n 's/.*packets \([0-9][0-9]*\).*/\1/p' | head -1
+		}
+		_fb_q=$(_fb_pkt q)
+		_fb_qe=$(_fb_pkt qe)
+		_fb_r=$(_fb_pkt r)
+		_fb_re=$(_fb_pkt re)
+		"$_nft_bin" delete table inet "$FB_T" >/dev/null 2>&1 || true
+		if [ "${_fb_q:-0}" -eq 0 ] && [ "${_fb_r:-0}" -eq 0 ]; then
+			echo "  - 跳过真 nft 语义测试：127.0.0.1:53 无 DNS 响应"
+		elif [ "${_fb_q:-0}" -gt 0 ] && [ "${_fb_r:-0}" -gt 0 ] &&
+		     [ "${_fb_qe:-0}" -eq 0 ] && [ "${_fb_re:-0}" -eq 0 ]; then
+			ok "真 nft：DNS 查询(q=$_fb_q)与响应(r=$_fb_r)均被双侧排除计数(${_fb_qe}/${_fb_re})"
+		else
+			ng "真 nft：DNS 排除语义不符（q=$_fb_q qe=$_fb_qe r=$_fb_r re=$_fb_re）"
+		fi
+	else
+		"$_nft_bin" delete table inet "$FB_T" >/dev/null 2>&1 || true
+		echo "  - 跳过真 nft 语义测试：临时表/链创建失败（当前环境不支持）"
+	fi
+else
+	echo "  - 跳过真 nft 语义测试：需要 root + nft + nslookup（离线形状用例已覆盖）"
 fi
 
 echo
