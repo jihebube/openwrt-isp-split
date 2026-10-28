@@ -1556,6 +1556,196 @@ else
 	ok "非法源角色被拒绝"
 fi
 
+echo "== 13. 兜底计数默认排除 DNS（BUG-21）"
+# 真 nft 不接受一条规则里同时出现 udp dport 和 tcp dport，所以排除 DNS
+# 必须拆两条：非 tcp/udp（保留 ICMP 等）+ tcp/udp 且 dport != 53。
+# 这里用假 nft 检查 _fallback_counter 实际下发的规则形状和幂等重建路径。
+FB=$TMP/fb
+mkdir -p "$FB/bin"
+cat > "$FB/bin/nft" <<'FAKE_FB_NFT'
+#!/bin/sh
+S=${FAKE_FB_STATE:?}
+mkdir -p "$S"
+[ -f "$S/rules" ] || : > "$S/rules"
+log() { echo "$*" >> "$S/log"; }
+next_h() {
+	h=$(cat "$S/hnext" 2>/dev/null || echo 100)
+	h=$((h + 1))
+	echo "$h" > "$S/hnext"
+	echo "$h"
+}
+[ "$1" = "-a" ] && shift
+cmd=$1; shift
+case "$cmd" in
+list)
+	case "$*" in
+	*"counter inet mwan3 isp_fallback"*) exit 0 ;;
+	*"chain inet mwan3 mwan3_rules"*)
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_rules {"
+		sed 's/^/		/' "$S/rules"
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
+	*) exit 1 ;;
+	esac
+	;;
+add)
+	log "add $*"
+	case "$1" in
+	counter) exit 0 ;;
+	rule)
+		shift 4 # rule inet mwan3 mwan3_rules
+		h=$(next_h)
+		printf '%s # handle %s\n' "$*" "$h" >> "$S/rules"
+		exit 0
+		;;
+	esac
+	exit 1
+	;;
+insert)
+	log "insert $*"
+	shift 4
+	[ "${1:-}" = "position" ] || exit 1
+	pos=$2
+	shift 2
+	h=$(next_h)
+	awk -v pos="$pos" -v line="$* # handle $h" '
+		$0 ~ ("# handle " pos "$") { print line }
+		{ print }
+	' "$S/rules" > "$S/rules.new" && mv "$S/rules.new" "$S/rules"
+	exit 0
+	;;
+delete)
+	log "delete $*"
+	h=""
+	for a in "$@"; do h=$a; done
+	awk -v h="$h" '$0 !~ ("# handle " h "$")' "$S/rules" > "$S/rules.new" &&
+		mv "$S/rules.new" "$S/rules"
+	exit 0
+	;;
+esac
+exit 1
+FAKE_FB_NFT
+chmod +x "$FB/bin/nft"
+
+cat > "$TMP/fb.conf" <<'FB_CONF'
+COUNT_FALLBACK="1"
+FB_CONF
+cat > "$TMP/fb0.conf" <<'FB0_CONF'
+COUNT_FALLBACK="1"
+COUNT_FALLBACK_SKIP_DNS="0"
+FB0_CONF
+
+fb_state() {
+	rm -rf "$1"
+	mkdir -p "$1"
+	: > "$1/rules"
+	: > "$1/log"
+}
+fb_run() {
+	(
+		PATH="$FB/bin:$PATH"
+		FAKE_FB_STATE="$1"
+		ISP_SPLIT_CONF="$2"
+		export PATH FAKE_FB_STATE ISP_SPLIT_CONF
+		. "$TMP/isp-lib.sh"
+		_fallback_counter
+	)
+}
+
+# --- 13.1 默认（skip=1）：插到锚点前，两条规则形状正确 ---
+fb_state "$FB/s1"
+cat > "$FB/s1/rules" <<'FB_RULES'
+ip daddr @isp_tel meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only # handle 1
+tcp dport 443 jump mwan3_policy_wan_only # handle 2
+FB_RULES
+if fb_run "$FB/s1" "$TMP/fb.conf" >/dev/null 2>&1; then
+	_fb_other=$(grep -c 'meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"' "$FB/s1/log" 2>/dev/null || true)
+	_fb_dns=$(grep -c 'meta l4proto { tcp, udp } th dport != 53 counter name "isp_fallback"' "$FB/s1/log" 2>/dev/null || true)
+	_fb_pos=$(grep -c '^insert .*position 2 ' "$FB/s1/log" 2>/dev/null || true)
+	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s1/rules" 2>/dev/null || true)
+	if [ "${_fb_other:-0}" -eq 1 ] && [ "${_fb_dns:-0}" -eq 1 ] &&
+	   [ "${_fb_pos:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
+	   sed -n '2p' "$FB/s1/rules" | grep -q 'meta l4proto != tcp' &&
+	   sed -n '3p' "$FB/s1/rules" | grep -q 'th dport != 53'; then
+		ok "默认排除 DNS：插在锚点前，两条规则形状正确且相邻"
+	else
+		ng "默认排除 DNS 的规则形状异常（other=$_fb_other dns=$_fb_dns pos=$_fb_pos n=$_fb_n）"
+		sed 's/^/    /' "$FB/s1/log"
+	fi
+else
+	ng "默认配置下 _fallback_counter 调用失败"
+fi
+
+# --- 13.2 skip=0：保持单条旧形状（无 l4proto / 无 dport） ---
+fb_state "$FB/s2"
+if fb_run "$FB/s2" "$TMP/fb0.conf" >/dev/null 2>&1; then
+	_fb_add=$(grep -c '^add rule' "$FB/s2/log" 2>/dev/null || true)
+	if [ "${_fb_add:-0}" -eq 1 ] &&
+	   grep -q 'meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"' "$FB/s2/rules" &&
+	   ! grep -q 'meta l4proto\|dport != 53' "$FB/s2/rules"; then
+		ok "COUNT_FALLBACK_SKIP_DNS=0 保持旧单条形状（不加 DNS 条件）"
+	else
+		ng "COUNT_FALLBACK_SKIP_DNS=0 的规则形状不是旧形状"
+		sed 's/^/    /' "$FB/s2/log"
+	fi
+else
+	ng "COUNT_FALLBACK_SKIP_DNS=0 时 _fallback_counter 调用失败"
+fi
+
+# --- 13.3 旧规则 + 默认配置：必须重建为两条新规则 ---
+fb_state "$FB/s3"
+echo 'meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback" # handle 1' > "$FB/s3/rules"
+if fb_run "$FB/s3" "$TMP/fb.conf" >/dev/null 2>&1; then
+	_fb_del=$(grep -c '^delete ' "$FB/s3/log" 2>/dev/null || true)
+	_fb_add=$(grep -c '^add rule' "$FB/s3/log" 2>/dev/null || true)
+	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s3/rules" 2>/dev/null || true)
+	if [ "${_fb_del:-0}" -eq 1 ] && [ "${_fb_add:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
+	   grep -q 'th dport != 53' "$FB/s3/rules"; then
+		ok "旧单条规则在默认配置下重建为两条新规则"
+	else
+		ng "旧规则重建异常（delete=$_fb_del add=$_fb_add n=$_fb_n）"
+	fi
+else
+	ng "旧规则重建时 _fallback_counter 调用失败"
+fi
+
+# --- 13.4 新规则 + 默认配置：幂等，不重复插入 ---
+fb_state "$FB/s4"
+cat > "$FB/s4/rules" <<'FB_NEW_RULES'
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 counter name "isp_fallback" # handle 2
+FB_NEW_RULES
+if fb_run "$FB/s4" "$TMP/fb.conf" >/dev/null 2>&1; then
+	if [ ! -s "$FB/s4/log" ] &&
+	   [ "$(grep -c 'counter name "isp_fallback"' "$FB/s4/rules")" -eq 2 ]; then
+		ok "新规则形状已存在时幂等（无 delete/insert/add）"
+	else
+		ng "新规则幂等失败（日志非空或规则数不是 2）"
+		sed 's/^/    /' "$FB/s4/log"
+	fi
+else
+	ng "新规则幂等检查时 _fallback_counter 调用失败"
+fi
+
+# --- 13.5 新规则 + skip=0：切回旧形状 ---
+fb_state "$FB/s5"
+cp "$FB/s4/rules" "$FB/s5/rules"
+if fb_run "$FB/s5" "$TMP/fb0.conf" >/dev/null 2>&1; then
+	_fb_del=$(grep -c '^delete ' "$FB/s5/log" 2>/dev/null || true)
+	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s5/rules" 2>/dev/null || true)
+	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 1 ] &&
+	   ! grep -q 'meta l4proto\|dport != 53' "$FB/s5/rules"; then
+		ok "COUNT_FALLBACK_SKIP_DNS=0 时两条新规则切回旧单条形状"
+	else
+		ng "切回旧形状异常（delete=$_fb_del n=$_fb_n）"
+	fi
+else
+	ng "切回旧形状时 _fallback_counter 调用失败"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then

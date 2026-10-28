@@ -132,12 +132,35 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
 | `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |
+| `COUNT_FALLBACK_SKIP_DNS` | `1` | 兜底计数排除 DNS（udp/tcp dport 53）；`0` 保持旧行为 |
 | `ISP_SOURCES` | yfgao 主源 + clang 校验源 | 多数据源声明，见下节；留空则完全退回 0.1.x 的单源行为 |
 | `ISP_SOURCE_FILES` | yfgao/clang 四类映射 | 每源文件名映射（不同源的同一运营商文件名不同） |
 | `ISP_VERIFY_ENABLE` | `1`（0.2.1 起） | 是否启用校验源；配置里显式写 `0` 可关闭 |
 | `ISP_DIFF_MAX_JACCARD_DROP` | `90` | 与校验源的 Jaccard 低于此值就拒绝本次更新 |
 | `ISP_DIFF_MAX_DELTA_PCT` | `3` | 单个运营商地址数的日变化上限（%，仅校验源启用时生效） |
 | `ISP_SOURCE_MAX_FAIL_DAYS` | `3` | 校验源连续失败多少天后升级为"拒绝更新" |
+
+### 兜底计数为什么默认排除 DNS
+
+`COUNT_FALLBACK_SKIP_DNS` 默认 `1`：兜底计数器只统计**会出公网**的
+未命中流量，UDP/TCP 目标端口 53 的 DNS 查询不计入。
+
+理由：DNS 查询本身不是业务流量——LAN 设备到网关（例如
+`192.168.10.1:53`）的查询在本地就被应答，到运营商 DNS 的查询也只是
+解析开销。它们占兜底包数的比例又很高（生产实测 32 万包里约 90%），
+计进去只会稀释"未命中运营商集合的真实业务流量"这个口径，让覆盖率
+看起来比实际差。
+
+判断只看**目标端口 53**，不写死网关地址，因此查本地网关和查运营商
+DNS 都会被排除。需要兼容旧统计口径时在 `/etc/isp-split.conf` 写：
+
+```sh
+COUNT_FALLBACK_SKIP_DNS="0"
+```
+
+改完执行 `isp-split apply` 重建计数规则。规则形状会从单条变成两条
+（非 TCP/UDP 一条、TCP/UDP 且非 53 一条，共用一个命名计数器），
+所以升级后第一次 `apply` 会看到规则被重建，计数从旧值继续累加。
 
 ---
 

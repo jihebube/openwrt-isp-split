@@ -1280,12 +1280,70 @@ _gen_batch() {
 # 兜底流量计数器：插在本工具规则块之后、既有端口/兜底规则之前。
 # 命中集合的流量在前面的 jump 里已离开本链，能走到这条规则的
 # 必然是未命中任何启用集合的流量，从而可以量化"覆盖率"。
-# 判断某条链上规则是否已经是我们要的兜底计数规则。
-# nft list chain 会渲染 counter packets N bytes N，比较前先去掉，避免误判。
+#
+# 是否把 DNS（udp/tcp 53）排除在兜底统计之外。默认 1=排除：
+# DNS 查询本身不是业务流量（网关本地应答或运营商解析开销），计进兜底
+# 只会稀释"未命中运营商集合的真实业务流量"这个口径。写 0 保持旧行为。
+_fallback_skip_dns() {
+	[ "${COUNT_FALLBACK_SKIP_DNS:-1}" != "0" ]
+}
+
+# 判断链上的兜底计数规则是否已经是当前配置期望的形状。
+# 传入的必须是已经过滤过 counter name "isp_fallback" 的行。
+# nft list chain 会渲染 counter packets N bytes N / # handle N，比较前先去掉。
 _fallback_rule_ok() {
-	printf '%s\n' "$1" |
-		sed 's/ # handle [0-9][0-9]*$//; s/counter packets [0-9][0-9]* bytes [0-9][0-9]* //g' |
-		grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+ .*counter name "isp_fallback"'
+	_fbo_norm=$(printf '%s\n' "$1" |
+		sed 's/ # handle [0-9][0-9]*$//; s/ packets [0-9][0-9]* bytes [0-9][0-9]*//g')
+	_fbo_n=$(printf '%s\n' "$_fbo_norm" |
+		grep -c 'counter name "isp_fallback"' || true)
+	_fbo_n=${_fbo_n:-0}
+	if _fallback_skip_dns; then
+		# 为什么是两条：nft 不接受一条规则里同时出现 udp dport 和 tcp dport
+		# （conflicting transport layer protocols）。拆成
+		#   A) 非 tcp/udp：ICMP 等其他协议照常计数
+		#   B) tcp/udp 且 dport != 53
+		# 两条规则共用同一个命名计数器，计数自动汇总。
+		[ "$_fbo_n" -eq 2 ] || return 1
+		printf '%s\n' "$_fbo_norm" |
+			grep -F 'meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"' |
+			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+' ||
+			return 1
+		_fbo_dns=$(printf '%s\n' "$_fbo_norm" |
+			grep -F 'th dport != 53 counter name "isp_fallback"' | head -1)
+		# nft 通常按书写顺序渲染集合；两种顺序都认，避免老版本
+		# 归一化顺序后每次 apply 都误判成"形状不对"而重建。
+		case "$_fbo_dns" in
+		*'meta l4proto { tcp, udp }'* | *'meta l4proto { udp, tcp }'*) ;;
+		*) return 1 ;;
+		esac
+		printf '%s\n' "$_fbo_dns" |
+			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+' ||
+			return 1
+	else
+		# 旧形状：单条规则，所有未命中集合的 IPv4 包都计数（含 DNS）。
+		[ "$_fbo_n" -eq 1 ] || return 1
+		printf '%s\n' "$_fbo_norm" |
+			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+ .*counter name "isp_fallback"' ||
+			return 1
+		printf '%s\n' "$_fbo_norm" | grep -q 'meta l4proto' && return 1
+	fi
+	return 0
+}
+
+# 删除链上所有 isp_fallback 计数规则。删除循环加上限，避免 nft 删除
+# 返回成功但规则实际仍在时无限循环。
+_fallback_drop_rules() {
+	_fbd_i=0
+	while [ "$_fbd_i" -lt 10 ]; do
+		_fbd_h=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+			grep 'counter name "isp_fallback"' |
+			grep -oE '# handle [0-9]+' | grep -oE '[0-9]+' | head -1)
+		[ -n "$_fbd_h" ] || return 0
+		nft delete rule inet mwan3 mwan3_rules handle "$_fbd_h" 2>/dev/null || return 1
+		_fbd_i=$((_fbd_i + 1))
+	done
+	! nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
+		grep -q 'counter name "isp_fallback"'
 }
 
 _fallback_counter() {
@@ -1296,34 +1354,49 @@ _fallback_counter() {
 		nft add counter inet mwan3 isp_fallback 2>/dev/null || return 0
 	fi
 
-	# 幂等：规则已存在且形状正确（mark==0、IPv4、命名计数器）就不动它。
-	# 旧版规则（无 mark 条件）会误计命中集合的新连接首包，需要重建。
+	# 幂等：规则已存在且形状正确（mark==0、IPv4、命名计数器、DNS 条件）
+	# 就不动它。旧版单条规则（无 mark 条件或未排除 DNS）需要重建。
 	_fb_lines=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
 		grep 'counter name "isp_fallback"')
-	_fb_count=$(printf '%s\n' "$_fb_lines" | grep -c 'counter name "isp_fallback"' || true)
-	_fb_count=${_fb_count:-0}
-	if [ "$_fb_count" -eq 1 ] && _fallback_rule_ok "$_fb_lines"; then
+	if _fallback_rule_ok "$_fb_lines"; then
 		return 0
 	fi
 
-	# 只在缺失/重复/形状不对时重建；删除循环加上限，避免 nft 删除
-	# 返回成功但规则实际仍在时无限循环。
-	_i=0
-	while [ "$_i" -lt 5 ]; do
-		_rh=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
-			grep 'counter name "isp_fallback"' |
-			grep -oE '# handle [0-9]+' | grep -oE '[0-9]+' | head -1)
-		[ -n "$_rh" ] || break
-		nft delete rule inet mwan3 mwan3_rules handle "$_rh" 2>/dev/null || break
-		_i=$((_i + 1))
-	done
+	# 只在缺失/重复/形状不对时重建。
+	_fallback_drop_rules || return 1
 
 	# 插入点：最后一条 daddr @isp_* 规则的下一条
 	_h=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
 		sed -n '/chain mwan3_rules/,/^	}/p' |
 		awk '/daddr @isp_/ { seen = 1; next }
 		     seen && /# handle/    { print $NF; exit }')
-	_COND='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"'
+
+	_FB_BASE='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000'
+	if _fallback_skip_dns; then
+		_COND_OTHER="$_FB_BASE meta l4proto != tcp meta l4proto != udp counter name \"isp_fallback\""
+		_COND_DNS="$_FB_BASE meta l4proto { tcp, udp } th dport != 53 counter name \"isp_fallback\""
+		if [ -n "$_h" ]; then
+			# 连续两次插到同一个锚点前：先 OTHER 后 DNS，两条保持相邻。
+			if nft insert rule inet mwan3 mwan3_rules position "$_h" \
+				"$_COND_OTHER" 2>/dev/null &&
+				nft insert rule inet mwan3 mwan3_rules position "$_h" \
+					"$_COND_DNS" 2>/dev/null; then
+				return 0
+			fi
+			_fallback_drop_rules
+			return 1
+		fi
+		# 没找到位置（本工具规则在链尾或版本差异）就追加到链尾
+		if nft add rule inet mwan3 mwan3_rules "$_COND_OTHER" 2>/dev/null &&
+			nft add rule inet mwan3 mwan3_rules "$_COND_DNS" 2>/dev/null; then
+			return 0
+		fi
+		_fallback_drop_rules
+		return 1
+	fi
+
+	# COUNT_FALLBACK_SKIP_DNS=0：保持 0.1.x/0.2.x 的单条旧形状。
+	_COND="$_FB_BASE counter name \"isp_fallback\""
 	if [ -n "$_h" ]; then
 		nft insert rule inet mwan3 mwan3_rules position "$_h" \
 			"$_COND" 2>/dev/null && return 0
@@ -2060,9 +2133,11 @@ cmd_status() {
 	foreach_enabled _st_all
 	# status 是只读命令：绝不在这里删除/重插 nft 规则。
 	# LuCI 每 10 秒轮询一次，自愈式重插会造成统计缺口和规则抖动。
-	if [ "$COUNT_FALLBACK" = "1" ] &&
-	   ! _mwan3_rules_body | grep -q 'counter name "isp_fallback"'; then
-		echo "提示: 兜底计数规则缺失（status 只读，不自动修复；运行 isp-split apply 恢复）"
+	if [ "$COUNT_FALLBACK" = "1" ]; then
+		_st_fb=$(_mwan3_rules_body | grep 'counter name "isp_fallback"')
+		if ! _fallback_rule_ok "$_st_fb"; then
+			echo "提示: 兜底计数规则缺失或形状不符（status 只读，不自动修复；运行 isp-split apply 恢复）"
+		fi
 	fi
 	if nft list counter inet mwan3 isp_fallback >/dev/null 2>&1; then
 		_fb=$(nft list counter inet mwan3 isp_fallback 2>/dev/null |
@@ -2193,6 +2268,9 @@ DNS_STATE=$BASE/state
 DNS_MODE=${DNS_MODE:-bind}
 # 统计"未命中任何运营商集合"的兜底流量（isp_fallback 计数器，status 里显示）
 COUNT_FALLBACK=${COUNT_FALLBACK:-1}
+# 兜底计数是否排除 DNS（udp/tcp 53）。默认 1=排除：DNS 查询本身不是
+# 业务流量，计入兜底只会稀释真实业务流量的口径。0=旧行为。
+COUNT_FALLBACK_SKIP_DNS=${COUNT_FALLBACK_SKIP_DNS:-1}
 DOMAINDIR=${DOMAIN_LIST_DIR:-${DOMAINDIR:-/etc/isp-split/domains}}
 
 # ---- dnsmasq confdir：探测"实际加载目录"，绝不整体覆盖 ----
