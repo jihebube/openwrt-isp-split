@@ -29,7 +29,7 @@
 
 | 平台 | 状态 |
 |---|---|
-| OpenWrt/Kwrt 25.12（x86_64） | ✅ 完整验证（双 PPPoE 生产环境长期运行 + VM 回归） |
+| OpenWrt/Kwrt 25.12（x86_64） | ✅ 完整验证（双 PPPoE 长期运行 + 自动化回归） |
 | OpenWrt 24.10（x86_64） | ✅ CI 双 SDK 构建，未真机长测 |
 | ARM / MIPS 软路由（MT7981、IPQ 等） | ⚠️ 理论兼容（纯 shell/awk，无架构相关代码），欢迎实测反馈 |
 | 官方固件直装 | ⚠️ 需先替换 iptables 版 mwan3 为 nft 版（见上方自查命令） |
@@ -63,17 +63,17 @@ isp-split status    # 各集合命中计数与流量
 
 | 浅色 | 深色 |
 |---|---|
-| ![状态页-浅色](tools/screenshots/overview-desktop-light.png) | ![状态页-深色](tools/screenshots/overview-desktop-dark.png) |
+| ![状态页-浅色](docs/images/overview-desktop-light.png) | ![状态页-深色](docs/images/overview-desktop-dark.png) |
 
 配置页（策略映射 / 多线路 DNS / 域名分流，含"保存前预检"）：
 
 | 浅色 | 预检输出 |
 |---|---|
-| ![配置页-浅色](tools/screenshots/config-desktop-light.png) | ![预检](tools/screenshots/config-preflight-light.png) |
+| ![配置页-浅色](docs/images/config-desktop-light.png) | ![预检](docs/images/config-preflight-light.png) |
 
-移动端：`tools/screenshots/overview-mobile-light.png`、`tools/screenshots/config-mobile-light.png`
+移动端：移动端布局自适应（上图同源页面在窄屏下自动单列）
 
-截图来自测试 VM 上的 LuCI 真页面（OpenWrt 25.12.6 / luci-theme-bootstrap），不是设计稿。
+截图来自 OpenWrt 25.12.6 的 LuCI 真实页面。
 
 ## 工作原理
 
@@ -140,7 +140,7 @@ ISP_VERIFY_ENABLE=1   # 校验源只跑日 diff；分歧超阈值会拒绝更新
 
 `ISP_SOURCES` 留空 = 与 0.1.x 完全一致的单源行为，老配置无需改动。
 升级时已有 `/etc/isp-split.conf` 会被保留：显式声明过 `ISP_SOURCES` 的配置
-（例如生产上的 clang 主源 + `ISP_VERIFY_ENABLE=0`）不会被自动切换。
+（例如 clang 主源 + `ISP_VERIFY_ENABLE=0`）不会被自动切换。
 
 yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 `chinabtn/gwbn/othernet/hk/mo/tw` 默认关闭，原因见
@@ -192,7 +192,6 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 
 - [x] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），默认 `ISP_VERIFY_ENABLE=1`，
       校验源换 clang；`sources.tsv` 残留清理、LuCI 只读数据源区块
-      （代码已完成，等生产 3 天 diff 数据与验收后发版）
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）

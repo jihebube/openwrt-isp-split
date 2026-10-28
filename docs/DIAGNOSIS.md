@@ -57,8 +57,7 @@ DNAT/un-SNAT 在 **-100**。所以 mwan3 看到的是"还没做地址转换"的�
 
 ### VM 实测（OpenWrt 25.12.6 / nft 1.1.6 / mwan3 3.6）
 
-在测试 VM `192.168.12.1` 上搭了和生产同构的拓扑：客户端 netns
-`192.168.12.50` — br-lan — VM（mwan3 wan1/wan2，isp-split 四个集合）—
+在隔离测试 VM 上搭了同构拓扑：客户端 netns — br-lan — VM（mwan3 wan1/wan2，isp-split 四个集合）—
 上游 netns 里的 DNS 服务器 `223.5.5.5:53`。在 `mwan3_rules` 链首插探针
 计数器（`p_rules_all` / `p_rules_q53` / `p_rules_r53`），在
 `mwan3_prerouting` 的每个"提前离开"点插位置探针（`t1..t6`）。
@@ -147,8 +146,8 @@ ip netns add cli
 ip link add lancli type veth peer name cli0
 ip link set cli0 netns cli && ip link set lancli master br-lan && ip link set lancli up
 ip netns exec cli ip link set cli0 up
-ip netns exec cli ip addr add 192.168.12.50/24 dev cli0
-ip netns exec cli ip route add default via 192.168.12.1
+ip netns exec cli ip addr add 192.168.50.50/24 dev cli0
+ip netns exec cli ip route add default via 192.168.50.1
 
 # 2) 上游 netns 里起一个 223.5.5.5:53 的 DNS
 ip netns exec ispnet ip addr add 223.5.5.5/32 dev isp2
@@ -159,7 +158,7 @@ ip netns exec ispnet dnsmasq --no-daemon --port=53 --listen-address=223.5.5.5 \
 
 # 3) 探针（只读计数，不改 mwan3 语义）
 nft add counter inet probe c_q;  nft add counter inet probe c_r
-nft add rule inet probe pre ip saddr 192.168.12.50 ip daddr 223.5.5.5 udp dport 53 counter name c_q
+nft add rule inet probe pre ip saddr 192.168.50.50 ip daddr 223.5.5.5 udp dport 53 counter name c_q
 nft add rule inet probe pre ip saddr 223.5.5.5 udp sport 53 counter name c_r
 
 # 4) 跑一轮，读增量
