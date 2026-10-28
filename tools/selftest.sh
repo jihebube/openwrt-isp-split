@@ -1673,8 +1673,10 @@ if fb_run "$FB/s1" "$TMP/fb.conf" >/dev/null 2>&1; then
 	   [ "${_fb_pos:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
 	   sed -n '2p' "$FB/s1/rules" | grep -q 'meta l4proto != tcp' &&
 	   sed -n '3p' "$FB/s1/rules" | grep -q 'th dport != 53' &&
-	   sed -n '3p' "$FB/s1/rules" | grep -q 'th sport != 53'; then
-		ok "默认排除 DNS：插在锚点前，两条规则形状正确且相邻（dport/sport 双侧 53）"
+	   sed -n '3p' "$FB/s1/rules" | grep -q 'th sport != 53' &&
+	   sed -n '2p' "$FB/s1/rules" | grep -q 'ct state new' &&
+	   sed -n '3p' "$FB/s1/rules" | grep -q 'ct state new'; then
+		ok "默认排除 DNS：插在锚点前，两条规则形状正确且相邻（双侧 53 + ct state new）"
 	else
 		ng "默认排除 DNS 的规则形状异常（other=$_fb_other dns=$_fb_dns pos=$_fb_pos n=$_fb_n）"
 		sed 's/^/    /' "$FB/s1/log"
@@ -1688,9 +1690,9 @@ fb_state "$FB/s2"
 if fb_run "$FB/s2" "$TMP/fb0.conf" >/dev/null 2>&1; then
 	_fb_add=$(grep -c '^add rule' "$FB/s2/log" 2>/dev/null || true)
 	if [ "${_fb_add:-0}" -eq 1 ] &&
-	   grep -q 'meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 counter name "isp_fallback"' "$FB/s2/rules" &&
+	   grep -q 'meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new counter name "isp_fallback"' "$FB/s2/rules" &&
 	   ! grep -qE 'meta l4proto|dport != 53|sport != 53' "$FB/s2/rules"; then
-		ok "COUNT_FALLBACK_SKIP_DNS=0 保持旧单条形状（不加 DNS 条件）"
+		ok "COUNT_FALLBACK_SKIP_DNS=0 保持单条形状（不排除 DNS，但仍只计首包）"
 	else
 		ng "COUNT_FALLBACK_SKIP_DNS=0 的规则形状不是旧形状"
 		sed 's/^/    /' "$FB/s2/log"
@@ -1708,8 +1710,9 @@ if fb_run "$FB/s3" "$TMP/fb.conf" >/dev/null 2>&1; then
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s3/rules" 2>/dev/null || true)
 	if [ "${_fb_del:-0}" -eq 1 ] && [ "${_fb_add:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
 	   grep -q 'th dport != 53' "$FB/s3/rules" &&
-	   grep -q 'th sport != 53' "$FB/s3/rules"; then
-		ok "旧单条规则在默认配置下重建为两条新规则"
+	   grep -q 'th sport != 53' "$FB/s3/rules" &&
+	   [ "$(grep -c 'ct state new' "$FB/s3/rules")" -eq 2 ]; then
+		ok "旧单条规则在默认配置下重建为两条新规则（含 ct state new）"
 	else
 		ng "旧规则重建异常（delete=$_fb_del add=$_fb_add n=$_fb_n）"
 	fi
@@ -1720,8 +1723,8 @@ fi
 # --- 13.4 新规则 + 默认配置：幂等，不重复插入 ---
 fb_state "$FB/s4"
 cat > "$FB/s4/rules" <<'FB_NEW_RULES'
-meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
-meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback" # handle 2
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback" # handle 2
 FB_NEW_RULES
 if fb_run "$FB/s4" "$TMP/fb.conf" >/dev/null 2>&1; then
 	if [ ! -s "$FB/s4/log" ] &&
@@ -1742,8 +1745,9 @@ if fb_run "$FB/s5" "$TMP/fb0.conf" >/dev/null 2>&1; then
 	_fb_del=$(grep -c '^delete ' "$FB/s5/log" 2>/dev/null || true)
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s5/rules" 2>/dev/null || true)
 	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 1 ] &&
-	   ! grep -qE 'meta l4proto|dport != 53|sport != 53' "$FB/s5/rules"; then
-		ok "COUNT_FALLBACK_SKIP_DNS=0 时两条新规则切回旧单条形状"
+	   ! grep -qE 'meta l4proto|dport != 53|sport != 53' "$FB/s5/rules" &&
+	   grep -q 'ct state new' "$FB/s5/rules"; then
+		ok "COUNT_FALLBACK_SKIP_DNS=0 时两条新规则切回单条形状（仍保留 ct state new）"
 	else
 		ng "切回旧形状异常（delete=$_fb_del n=$_fb_n）"
 	fi
@@ -1765,8 +1769,9 @@ if fb_run "$FB/s6" "$TMP/fb.conf" >/dev/null 2>&1; then
 	_fb_n=$(grep -c 'counter name "isp_fallback"' "$FB/s6/rules" 2>/dev/null || true)
 	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_add:-0}" -eq 2 ] && [ "${_fb_n:-0}" -eq 2 ] &&
 	   grep -q 'th dport != 53' "$FB/s6/rules" &&
-	   grep -q 'th sport != 53' "$FB/s6/rules"; then
-		ok "半修形状（只排 dport 53）在默认配置下重建为 dport/sport 双侧排除"
+	   grep -q 'th sport != 53' "$FB/s6/rules" &&
+	   [ "$(grep -c 'ct state new' "$FB/s6/rules")" -eq 2 ]; then
+		ok "半修形状（只排 dport 53）在默认配置下重建为双侧排除 + ct state new"
 	else
 		ng "半修形状未被重建（delete=$_fb_del add=$_fb_add n=$_fb_n）"
 	fi
@@ -1778,8 +1783,8 @@ fi
 # 不能因为 nft 归一化顺序不同就每次 apply 都重建规则。
 fb_state "$FB/s7"
 cat > "$FB/s7/rules" <<'FB_REV_RULES'
-meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
-meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th sport != 53 th dport != 53 counter name "isp_fallback" # handle 2
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto { tcp, udp } th sport != 53 th dport != 53 counter name "isp_fallback" # handle 2
 FB_REV_RULES
 if fb_run "$FB/s7" "$TMP/fb.conf" >/dev/null 2>&1; then
 	if [ ! -s "$FB/s7/log" ] &&
@@ -1837,6 +1842,140 @@ if [ "$(id -u)" -eq 0 ] && [ -n "$_nft_bin" ] && command -v nslookup >/dev/null 
 	fi
 else
 	echo "  - 跳过真 nft 语义测试：需要 root + nft + nslookup（离线形状用例已覆盖）"
+fi
+
+
+# --- 13.9 上一版已发布的形状（双侧 53、没有 ct state new）必须重建 ---
+# 0.2.1 目前装在生产上的就是这一版：只排 DNS，但按包计数。
+fb_state "$FB/s9"
+cat > "$FB/s9/rules" <<'FB_S9'
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto != tcp meta l4proto != udp counter name "isp_fallback" # handle 1
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback" # handle 2
+FB_S9
+if fb_run "$FB/s9" "$TMP/fb.conf" >/dev/null 2>&1; then
+	_fb_del=$(grep -c '^delete ' "$FB/s9/log" 2>/dev/null || true)
+	_fb_add=$(grep -c '^add rule' "$FB/s9/log" 2>/dev/null || true)
+	if [ "${_fb_del:-0}" -eq 2 ] && [ "${_fb_add:-0}" -eq 2 ] &&
+	   [ "$(grep -c 'ct state new' "$FB/s9/rules")" -eq 2 ]; then
+		ok "上一版形状（无 ct state new）重建为按连接计数"
+	else
+		ng "上一版形状未被重建（delete=$_fb_del add=$_fb_add）"
+		sed 's/^/    /' "$FB/s9/log"
+	fi
+else
+	ng "上一版形状重建时 _fallback_counter 调用失败"
+fi
+
+echo "== 14. 兜底增量归因工具（tools/count-attrib.sh，只读）"
+CA=$ROOT/tools/count-attrib.sh
+if [ -f "$CA" ] && sh -n "$CA" 2>/dev/null; then
+	ok "count-attrib.sh 语法检查通过"
+else
+	ng "count-attrib.sh 缺失或语法错误"
+fi
+
+# 假 nft + 假 conntrack：让工具在离线环境跑完整流程。
+# 兜底计数器每次读取后自增 CA_STEP，模拟"窗口内涨了 CA_STEP 包"。
+mkdir -p "$TMP/ca/bin"
+cat > "$TMP/ca/bin/nft" <<'FAKE_CA_NFT'
+#!/bin/sh
+S=${CA_STATE:?}
+echo "$*" >> "$S/calls"
+case "$*" in
+"list table inet mwan3") cat "$S/table"; exit 0 ;;
+"list counter inet mwan3 isp_fallback")
+	v=$(cat "$S/fb")
+	step=$(cat "$S/step")
+	echo $((v + step)) > "$S/fb"
+	echo "counter isp_fallback { packets $v bytes $((v * 70)) }"
+	exit 0
+	;;
+"-a list chain inet mwan3 mwan3_rules") cat "$S/chain"; exit 0 ;;
+"list chain inet mwan3 mwan3_rules") cat "$S/chain"; exit 0 ;;
+esac
+exit 0
+FAKE_CA_NFT
+chmod +x "$TMP/ca/bin/nft"
+
+ca_state() { # $1=state dir $2=fb step $3=before ct file
+	rm -rf "$1"
+	mkdir -p "$1"
+	: > "$1/table"
+	echo "$2" > "$1/step"
+	echo 0 > "$1/fb"
+	cat > "$1/chain" <<'CA_CHAIN'
+table inet mwan3 {
+	chain mwan3_rules {
+		meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"
+		meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback"
+	}
+}
+CA_CHAIN
+	cp "$3" "$1/ct"
+}
+
+cat > "$TMP/ca/ct1" <<'CA_CT1'
+ipv4 2 udp 17 25 src=192.168.10.9 dst=223.5.5.5 sport=40001 dport=53 packets=2 bytes=140 src=223.5.5.5 dst=192.168.10.9 sport=53 dport=40001 packets=2 bytes=180 mark=0 use=1
+ipv4 2 tcp 6 300 src=192.168.10.9 dst=1.2.3.4 sport=50000 dport=443 packets=9 bytes=900 src=1.2.3.4 dst=192.168.10.9 sport=443 dport=50000 packets=9 bytes=900 mark=0 use=1
+CA_CT1
+cat > "$TMP/ca/ct2" <<'CA_CT2'
+ipv4 2 udp 17 25 src=192.168.10.9 dst=223.5.5.5 sport=40001 dport=53 packets=4 bytes=280 src=223.5.5.5 dst=192.168.10.9 sport=53 dport=40001 packets=4 bytes=360 mark=0 use=1
+ipv4 2 tcp 6 300 src=192.168.10.9 dst=1.2.3.4 sport=50000 dport=443 packets=9 bytes=900 src=1.2.3.4 dst=192.168.10.9 sport=443 dport=50000 packets=9 bytes=900 mark=0 use=1
+CA_CT2
+
+# 14.1 兜底没涨、DNS 涨了 → 判定"DNS 没被计入"
+ca_state "$TMP/ca/s1" 0 "$TMP/ca/ct1"
+_ca_out=$(
+	PATH="$TMP/ca/bin:$PATH" NFT=nft NF_CONNTRACK="$TMP/ca/s1/ct" CA_STATE="$TMP/ca/s1" \
+		export PATH NFT NF_CONNTRACK CA_STATE
+	( sleep 1; cp "$TMP/ca/ct2" "$TMP/ca/s1/ct" ) &
+	sh "$CA" 2 223.5.5.5
+	wait
+)
+if printf '%s\n' "$_ca_out" | grep -q '规则形状: current' &&
+   printf '%s\n' "$_ca_out" | grep -q '兜底计数没有增长'; then
+	ok "归因：兜底增量为 0 时判定 DNS 未被计入"
+else
+	ng "归因误判（兜底 0 + DNS 有流量）"
+	printf '%s\n' "$_ca_out" | sed 's/^/    /'
+fi
+
+# 14.2 兜底涨 8、DNS 实际只有 4 包 → 判定"至少 4 包不可能是 DNS"
+ca_state "$TMP/ca/s2" 8 "$TMP/ca/ct1"
+_ca_out=$(
+	PATH="$TMP/ca/bin:$PATH" NFT=nft NF_CONNTRACK="$TMP/ca/s2/ct" CA_STATE="$TMP/ca/s2" \
+		export PATH NFT NF_CONNTRACK CA_STATE
+	( sleep 1; cp "$TMP/ca/ct2" "$TMP/ca/s2/ct" ) &
+	sh "$CA" 2 223.5.5.5
+	wait
+)
+if printf '%s\n' "$_ca_out" | grep -q '兜底增量(8)' &&
+   printf '%s\n' "$_ca_out" | grep -q '至少 4 包不可能是 DNS'; then
+	ok "归因：兜底增量超过 DNS 实际包数时给出下界"
+else
+	ng "归因下界判定不符（期望 8 包 / DNS 4 包）"
+	printf '%s\n' "$_ca_out" | sed 's/^/    /'
+fi
+
+# 14.4 读不到 conntrack（非 root）时不做归因，只报增量
+_ca_out=$(
+	PATH="$TMP/ca/bin:$PATH" NFT=nft NF_CONNTRACK=/nonexistent-ca CA_STATE="$TMP/ca/s2" \
+		export PATH NFT NF_CONNTRACK CA_STATE
+	sh "$CA" 2 2>/dev/null
+)
+if printf '%s\n' "$_ca_out" | grep -q '读不到 /nonexistent-ca'; then
+	ok "归因：读不到 conntrack 时不做 DNS 归因（只报增量）"
+else
+	ng "读不到 conntrack 时仍给出了归因结论"
+	printf '%s\n' "$_ca_out" | sed 's/^/    /'
+fi
+
+# 14.3 工具必须只读：假 nft 记录了全部调用，只能出现 list
+if [ -s "$TMP/ca/s2/calls" ] &&
+   ! grep -qE '^(add|delete|insert|flush|replace)' "$TMP/ca/s2/calls"; then
+	ok "归因工具全程只读（$(wc -l < "$TMP/ca/s2/calls" | tr -d ' ') 次调用全是 list）"
+else
+	ng "归因工具出现了写操作：$(grep -E '^(add|delete|insert|flush|replace)' "$TMP/ca/s2/calls" 2>/dev/null | head -3)"
 fi
 
 echo

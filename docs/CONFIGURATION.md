@@ -131,8 +131,8 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 | `DNSDIR` | `/etc/isp-split/dnsmasq.d` | 旧版片段目录（仅用于迁移/清理，新版本不再写入） |
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
-| `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行） |
-| `COUNT_FALLBACK_SKIP_DNS` | `1` | 兜底计数排除 DNS（udp/tcp 任一侧端口 53，查询与响应都不计）；`0` 保持旧行为 |
+| `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行）；口径是 `ct state new`，即只计每条连接的首包 |
+| `COUNT_FALLBACK_SKIP_DNS` | `1` | 兜底计数排除 DNS（udp/tcp 任一侧端口 53，查询与响应都不计）；`0` 保持不排除 DNS 的旧行为 |
 | `ISP_SOURCES` | yfgao 主源 + clang 校验源 | 多数据源声明，见下节；留空则完全退回 0.1.x 的单源行为 |
 | `ISP_SOURCE_FILES` | yfgao/clang 四类映射 | 每源文件名映射（不同源的同一运营商文件名不同） |
 | `ISP_VERIFY_ENABLE` | `1`（0.2.1 起） | 是否启用校验源；配置里显式写 `0` 可关闭 |
@@ -161,7 +161,21 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 `th dport != 53 th sport != 53`，任一侧 53 都不计数；ICMP 等非 TCP/UDP
 流量仍由另一条规则照常计数。
 
-需要兼容旧统计口径时在 `/etc/isp-split.conf` 写：
+> 补充（BUG-21 收尾的实测结论）：在健康的 mwan3 里，DNS **响应**其实
+> 根本走不到这条计数规则——`mwan3_prerouting`（priority `mangle+1`，即
+> `-149`）在 conntrack 的 DNAT/un-SNAT（`-100`）之前，WAN 回来的响应包
+> 有三道各自独立、任一命中就提前离开的门：
+>
+> 1. `ct mark & 0x3f00 != 0` → 直接 vmap 到策略链（首包出向时已打标）；
+> 2. `mwan3_ifaces_in` 按 `iifname` 给 WAN 入向包打 `0x500/0x600`；
+> 3. `mwan3_connected`（响应此刻的目的地址还是路由器自己的 WAN 地址，
+>    属于 connected 网段）或 `fib daddr type local return`。
+>
+> 所以 `th sport != 53` 是**防御性**的：它保证即使 mwan3 规则被改坏、
+> 或某条 WAN 没被 mwan3 纳管，响应也不会污染兜底计数；它不是生产上
+> 那个"+8 包/次查询"的原因。定量核对方法见 `docs/DIAGNOSIS.md`。
+
+需要兼容旧统计口径（不排除 DNS）时在 `/etc/isp-split.conf` 写：
 
 ```sh
 COUNT_FALLBACK_SKIP_DNS="0"
@@ -170,6 +184,28 @@ COUNT_FALLBACK_SKIP_DNS="0"
 改完执行 `isp-split apply` 重建计数规则。规则形状会从单条变成两条
 （非 TCP/UDP 一条、TCP/UDP 且两侧都非 53 一条，共用一个命名计数器），
 所以升级后第一次 `apply` 会看到规则被重建，计数从旧值继续累加。
+
+### 兜底计数的单位是"连接"，不是"包"
+
+两条规则都带 `ct state new`：
+
+```nft
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new \
+     meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"
+meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new \
+     meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback"
+```
+
+原因：`meta mark & 0x3f00 == 0` 只说明"这个包进来时还没打标"，并不保证
+这条连接最终会被打标。如果 mwan3 的 `default_rule_v4` 被 `enabled=0`
+关闭（`status` 会提示这种情况），未命中集合的流就不会有 conntrack 标记，
+同一连接的每个包都会重新经过 `mwan3_rules`，兜底计数从"按连接"退化
+成"按包"——一条 5 个包的 ICMP 流会记 +5 而不是 +1。加上 `ct state new`
+之后，无论后续是否打标，每条连接只计首包，`status` 里的数字才能直接
+当"未命中集合的新连接数"读。
+
+升级后第一次 `apply` 会重建这两条规则（旧形状没有 `ct state new`），
+计数从旧值继续累加。
 
 ---
 

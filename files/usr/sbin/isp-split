@@ -1306,9 +1306,13 @@ _fallback_rule_ok() {
 		# （WAN→LAN）——只排除 dport 会漏掉响应包（BUG-21 残留半修）。
 		# nft 1.1.6 接受一条规则里写两个 th 不等式，故仍是两条规则。
 		# 两条规则共用同一个命名计数器，计数自动汇总。
+		# 两条都必须带 ct state new：否则未打标的连接会按包重复计数。
 		[ "$_fbo_n" -eq 2 ] || return 1
-		printf '%s\n' "$_fbo_norm" |
+		_fbo_other=$(printf '%s\n' "$_fbo_norm" |
 			grep -F 'meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"' |
+			grep -F 'ct state new' | head -1)
+		[ -n "$_fbo_other" ] || return 1
+		printf '%s\n' "$_fbo_other" |
 			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+' ||
 			return 1
 		# 不依赖 dport/sport 的渲染顺序：同一行里两个条件都出现即可。
@@ -1316,6 +1320,10 @@ _fallback_rule_ok() {
 			grep -F 'th dport != 53' |
 			grep -F 'th sport != 53' | head -1)
 		[ -n "$_fbo_dns" ] || return 1
+		case "$_fbo_dns" in
+		*'ct state new'*) ;;
+		*) return 1 ;;
+		esac
 		# nft 通常按书写顺序渲染集合；两种顺序都认，避免老版本
 		# 归一化顺序后每次 apply 都误判成"形状不对"而重建。
 		case "$_fbo_dns" in
@@ -1326,10 +1334,10 @@ _fallback_rule_ok() {
 			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+' ||
 			return 1
 	else
-		# 旧形状：单条规则，所有未命中集合的 IPv4 包都计数（含 DNS）。
+		# COUNT_FALLBACK_SKIP_DNS=0：单条规则，不排除 DNS，但同样只计首包。
 		[ "$_fbo_n" -eq 1 ] || return 1
 		printf '%s\n' "$_fbo_norm" |
-			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+ .*counter name "isp_fallback"' ||
+			grep -qE 'meta nfproto ipv4 .*meta mark (&|and) 0x0*3f00 == 0x0+ .*ct state new .*counter name "isp_fallback"' ||
 			return 1
 		printf '%s\n' "$_fbo_norm" | grep -q 'meta l4proto' && return 1
 	fi
@@ -1360,9 +1368,10 @@ _fallback_counter() {
 		nft add counter inet mwan3 isp_fallback 2>/dev/null || return 0
 	fi
 
-	# 幂等：规则已存在且形状正确（mark==0、IPv4、命名计数器、DNS 条件）
-	# 就不动它。旧版单条规则（无 mark 条件或未排除 DNS）以及只排 dport=53
-	# 的半修形状（漏 DNS 响应）都需要重建。
+	# 幂等：规则已存在且形状正确（mark==0、ct state new、IPv4、命名计数器、
+	# DNS 条件）就不动它。旧版单条规则（无 mark 条件或未排除 DNS）、只排
+	# dport=53 的半修形状（漏 DNS 响应）、以及缺少 ct state new 的按包计数
+	# 形状，都需要重建。
 	_fb_lines=$(nft -a list chain inet mwan3 mwan3_rules 2>/dev/null |
 		grep 'counter name "isp_fallback"')
 	if _fallback_rule_ok "$_fb_lines"; then
@@ -1378,7 +1387,16 @@ _fallback_counter() {
 		awk '/daddr @isp_/ { seen = 1; next }
 		     seen && /# handle/    { print $NF; exit }')
 
-	_FB_BASE='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000'
+	# ct state new 是兜底计数的口径锚点（BUG-21 收尾，FIX23）：
+	# 这个计数器的语义是"未命中任何集合的新连接数"，status 也是这么写的。
+	# 但 `meta mark & 0x3f00 == 0` 只说明"这个包进来时还没打标"，不保证它
+	# 接下来一定会被打标：如果整条连接最终没拿到 conntrack 标记（例如
+	# mwan3 的 default_rule_v4 被 enabled=0 关闭，或策略链什么都没命中），
+	# 同一连接的每个包都会重新走一遍本链，兜底计数就从"按连接"退化成
+	# "按包"，数字被放大任意倍（VM 实测：一条未打标的 ICMP 流 ping 5 次，
+	# 旧形状计 +5，加 ct state new 后计 +1）。
+	# 加 ct state new 后，不论后续是否打标，同一连接只计首包一次。
+	_FB_BASE='meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new'
 	if _fallback_skip_dns; then
 		_COND_OTHER="$_FB_BASE meta l4proto != tcp meta l4proto != udp counter name \"isp_fallback\""
 		_COND_DNS="$_FB_BASE meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name \"isp_fallback\""
@@ -1457,7 +1475,10 @@ cmd_apply() {
 
 	# nft -f 对整份文件是一个事务：要么全成功，要么全不变。
 	nft -f "$WORK/batch.nft" || die "nft 批量加载失败，线上规则未改动"
-	_fallback_counter
+	# 兜底计数规则失败以前是静默的：status 里"兜底"行直接消失，用户只会
+	# 看到数字不再增长，很容易误判成"没有兜底流量"。至少留一条可查的日志。
+	_fallback_counter ||
+		log "警告：兜底计数规则未安装成功（status 的兜底行会缺失或为旧值），可稍后重跑 isp-split apply"
 	# 任何一次 mwan3 reload 都会 flush mwan3_output，DNS 旁路规则会丢；
 	# apply/refresh 是日常最常跑的入口，这里也重放一次。
 	# 失败不能再只打警告：apply 必须让调用方看到非 0，否则 cron/LuCI
@@ -1631,7 +1652,8 @@ cmd_wire() {
 	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	log "规则已注入（备份: $WORK/mwan3.bak）"
 	/etc/init.d/mwan3 reload
-	_fallback_counter
+	_fallback_counter ||
+		log "警告：兜底计数规则未安装成功（status 的兜底行会缺失或为旧值），可稍后重跑 isp-split apply"
 	# reload 刚返回时 mwan3_output 往往还没重建完，这里必须等/重试；
 	# 恢复失败要让 wire 以非 0 退出，否则 sync/install 会误报成功。
 	_dns_bypass 1 1 ||
@@ -2155,7 +2177,8 @@ cmd_status() {
 			"兜底" "-" "-" "${_fp:-0}" "${_fb_b:-0}" "未命中集合"
 	fi
 	echo
-	echo "注: 命中包/流量为连接首包统计（后续包由 conntrack 恢复标记，不再经过规则链）。"
+	echo "注: 命中包/流量为连接首包统计（ct state new；后续包由 conntrack 恢复标记，不再经过规则链）。"
+	echo "    DNS（udp/tcp 任一侧 53）不计入兜底，见 COUNT_FALLBACK_SKIP_DNS。"
 	echo "    业务吞吐请看接口计数: cat /sys/class/net/pppoe-wan*/statistics/rx_bytes"
 	echo
 	_sources_report
