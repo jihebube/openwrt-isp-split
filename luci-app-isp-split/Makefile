@@ -31,6 +31,9 @@ define Package/luci-app-isp-split/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/isp-split
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/isp-split/isp-split.css \
 		$(1)/www/luci-static/resources/isp-split/isp-split.css
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/isp-split/logos
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/isp-split/logos/*.svg \
+		$(1)/www/luci-static/resources/isp-split/logos/
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/isp-split/overview.js \
 		$(1)/www/luci-static/resources/view/isp-split/overview.js
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/isp-split/config.js \

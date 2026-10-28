@@ -30,6 +30,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 	# 同时移除 LuCI 页面
 	rm -f /www/luci-static/resources/view/isp-split/*.js
 	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
+	rm -rf /www/luci-static/resources/isp-split/logos
 	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
 	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
 	rm -f /tmp/luci-indexcache* 2>/dev/null
@@ -93,9 +94,11 @@ install_luci() {
 	L=$ROOT/luci-app-isp-split
 	[ -d "$L" ] || { say "找不到 $L，跳过 LuCI"; return 0; }
 	mkdir -p /www/luci-static/resources/view/isp-split /usr/share/luci/menu.d /usr/share/rpcd/acl.d
-	mkdir -p /www/luci-static/resources/isp-split
+	mkdir -p /www/luci-static/resources/isp-split/logos
 	cp -f "$L/htdocs/luci-static/resources/isp-split/"*.css \
 		/www/luci-static/resources/isp-split/ 2>/dev/null || true
+	cp -f "$L/htdocs/luci-static/resources/isp-split/logos/"*.svg \
+		/www/luci-static/resources/isp-split/logos/ 2>/dev/null || true
 	cp -f "$L/htdocs/luci-static/resources/view/isp-split/"*.js \
 		/www/luci-static/resources/view/isp-split/
 	cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split.json" /usr/share/luci/menu.d/
