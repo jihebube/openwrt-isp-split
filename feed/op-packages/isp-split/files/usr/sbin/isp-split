@@ -26,6 +26,12 @@ _strip_comments() {
 
 CONF=${ISP_SPLIT_CONF:-/etc/isp-split.conf}
 BASE=${ISP_SPLIT_BASE:-/etc/isp-split}
+# 归一化尾部斜杠（含多个）：`/etc//` 与 `/etc` 必须落到同一条拒绝分支；
+# 根路径保持 `/`，否则会变成空串绕过下面的空值检查。
+if [ "$BASE" != "/" ]; then
+	BASE=$(printf '%s' "$BASE" | sed 's#/*$##')
+	[ -n "$BASE" ] || BASE=/
+fi
 # BASE 会被 cp/写文件，也会在 uninstall 里被 `rm -rf`。它可以从环境变量
 # 覆盖（离线自检用），所以先挡住危险值：空、根、相对路径、含 ".."。
 case "$BASE" in
@@ -36,6 +42,16 @@ case "$BASE" in
 /*) ;;
 *)
 	echo "ISP_SPLIT_BASE 必须是绝对路径: '$BASE'" >&2
+	exit 1
+	;;
+esac
+# A-10：BASE 的下一站是 `rm -rf "$BASE"`（uninstall）。只挡空/根/相对/..
+# 还不够——/etc、/usr、/var 都是合法绝对路径，却能直接抹掉系统目录。
+# 这里与 teardown.sh 的 validate_base 同一口径，先在最外层拒绝；uninstall
+# 不会再有机会往 /etc/work 里写临时文件。
+case "$BASE" in
+/ | /etc | /usr | /var | /bin | /sbin | /lib | /lib64 | /boot | /dev | /proc | /sys | /www | /root | /home | /tmp | /mnt | /opt)
+	echo "ISP_SPLIT_BASE 指向系统目录，拒绝执行: '$BASE'" >&2
 	exit 1
 	;;
 esac
@@ -589,6 +605,10 @@ _state_put() {
 			{ rm -f "$_sp_tmp"; return 1; }
 	fi
 	mv -f "$_sp_tmp" "$SOURCE_STATE" 2>/dev/null || { rm -f "$_sp_tmp"; return 1; }
+	# A-14：state 里是数据源健康度/下载时间，不含口令但也没必要让本机低权
+	# 用户读；统一 700/600（升级前已存在的旧权限也在这里被纠正）。
+	chmod 700 "$STATE_DIR" 2>/dev/null || true
+	chmod 600 "$SOURCE_STATE" 2>/dev/null || true
 	return 0
 }
 
@@ -5160,12 +5180,34 @@ cmd_export() {
 	/etc/init.d | /etc/init.d/* | /etc/uci-defaults | /etc/uci-defaults/* | \
 		/etc/crontabs | /etc/crontabs/* | /etc/rc.d | /etc/rc.d/* | \
 		/etc/config | /etc/config/* | /etc/hotplug.d | /etc/hotplug.d/* | \
+		/etc/profile.d | /etc/profile.d/* | /etc/rc.local.d | /etc/rc.local.d/* | \
 		/usr/sbin | /usr/sbin/* | /usr/bin | /usr/bin/* | \
 		/bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | \
-		/usr/lib | /usr/lib/* | /usr/share/rpcd | /usr/share/rpcd/*)
+		/usr/lib | /usr/lib/* | /usr/share/rpcd | /usr/share/rpcd/* | \
+		/usr/share/luci | /usr/share/luci/* | /www | /www/*)
 		die "拒绝导出到系统目录: $_dir" ;;
 	esac
 	mkdir -p "$_dir" || die "无法创建 $_dir"
+	# A-09：上面的黑名单按字面匹配，/tmp/link-to-etc 这类目录可以绕过。
+	# 建目录后再解析一次真实路径（pwd -P 是 busybox 也有的最小原语），
+	# 对真实路径重复同一张黑名单；不解析到真实路径就不写任何文件。
+	_dir_real=$(cd "$_dir" 2>/dev/null && pwd -P) || _dir_real=""
+	[ -n "$_dir_real" ] || die "无法解析输出目录的真实路径: $_dir"
+	for _dchk in "$_dir" "$_dir_real"; do
+		case "$_dchk" in
+		/ | /etc | /usr | /var | /bin | /sbin | /lib | /boot | /dev | /proc | /sys | /www | /root)
+			die "拒绝导出到系统目录: $_dchk（$_dir）" ;;
+		/etc/init.d | /etc/init.d/* | /etc/uci-defaults | /etc/uci-defaults/* | \
+			/etc/crontabs | /etc/crontabs/* | /etc/rc.d | /etc/rc.d/* | \
+			/etc/config | /etc/config/* | /etc/hotplug.d | /etc/hotplug.d/* | \
+			/etc/profile.d | /etc/profile.d/* | /etc/rc.local.d | /etc/rc.local.d/* | \
+			/usr/sbin | /usr/sbin/* | /usr/bin | /usr/bin/* | \
+			/bin | /bin/* | /sbin | /sbin/* | /lib | /lib/* | \
+			/usr/lib | /usr/lib/* | /usr/share/rpcd | /usr/share/rpcd/* | \
+			/usr/share/luci | /usr/share/luci/* | /www | /www/*)
+			die "拒绝导出到系统目录: $_dchk（$_dir 的真实路径）" ;;
+		esac
+	done
 
 	_n=0
 	_old_ifs=$IFS
@@ -5190,14 +5232,18 @@ cmd_export() {
 		*) _ext=txt ;;
 		esac
 		_out="$_dir/isp-$_src.$_ext"
-		rm -f "$_out"
+		# A-09：不再 rm -f 后直接重定向（rm 与重定向之间有 TOCTOU，
+		# 且 README 以前根本没删链接）。统一用 _tmp_next_to 建同目录
+		# 随机临时文件，写完 rename 落位；rename 不跟随符号链接。
+		_out_tmp=$(_tmp_next_to "$_dir")
+		[ -n "$_out_tmp" ] || die "无法在 $_dir 创建临时文件（权限/空间？）"
 
 		case "$_fmt" in
 		mihomo)
 			{
 				echo "payload:"
 				sed 's/^/  - /' "$_f"
-			} > "$_out"
+			} > "$_out_tmp" || { rm -f "$_out_tmp"; die "写入 $_out 失败"; }
 			;;
 		singbox)
 			# sing-box 的 source 格式是对象，不是裸数组：
@@ -5208,15 +5254,18 @@ cmd_export() {
 				printf '{\n  "version": 1,\n  "rules": [\n    { "ip_cidr": [\n'
 				awk 'NR > 1 { printf ",\n" } { printf "      \"%s\"", $0 }' "$_f"
 				printf '\n    ] }\n  ]\n}\n'
-			} > "$_out"
+			} > "$_out_tmp" || { rm -f "$_out_tmp"; die "写入 $_out 失败"; }
 			;;
 		text)
-			cp "$_f" "$_out"
+			cp -f "$_f" "$_out_tmp" || { rm -f "$_out_tmp"; die "写入 $_out 失败"; }
 			;;
 		*)
+			rm -f "$_out_tmp"
 			die "未知格式 '$_fmt'，可选 mihomo / singbox / text"
 			;;
 		esac
+		chmod 644 "$_out_tmp" 2>/dev/null || true
+		mv -f "$_out_tmp" "$_out" || { rm -f "$_out_tmp"; die "落位 $_out 失败"; }
 		printf '  %-34s %6s 条\n' "$_out" "$(wc -l < "$_f" | tr -d ' ')"
 		_n=$((_n + 1))
 	done
@@ -5224,9 +5273,14 @@ cmd_export() {
 	[ "$_n" -gt 0 ] || die "没有可导出的数据，先执行 isp-split fetch"
 
 	# 附一份可直接抄的示例配置
+	# A-09：README 也必须走“同目录临时文件 + rename”。旧实现直接
+	# `cat > "$_dir/README-*.txt"`，若目标已存在且是指向 /etc/shadow 之类
+	# 的符号链接，root 的重定向会写穿链接（数据文件已先 rm，README 漏了）。
 	case "$_fmt" in
 	mihomo)
-		cat > "$_dir/README-mihomo.txt" <<'EOF'
+		_readme_tmp=$(_tmp_next_to "$_dir")
+		[ -n "$_readme_tmp" ] || die "无法在 $_dir 创建 README 临时文件"
+		cat > "$_readme_tmp" <<'EOF'
 mihomo / OpenClash 用法：
 
 # 1) 放进 rule-provider（OpenClash 可在「规则集」里添加本地文件）
@@ -5256,9 +5310,15 @@ rules:
 
 # 3) 定时更新：cron 里跑 isp-split fetch 后再 export 到 OpenClash 目录
 EOF
+		[ -s "$_readme_tmp" ] || { rm -f "$_readme_tmp"; die "写入 README-mihomo.txt 失败"; }
+		chmod 644 "$_readme_tmp" 2>/dev/null || true
+		mv -f "$_readme_tmp" "$_dir/README-mihomo.txt" ||
+			{ rm -f "$_readme_tmp"; die "落位 README-mihomo.txt 失败"; }
 		;;
 	singbox)
-		cat > "$_dir/README-singbox.txt" <<'EOF'
+		_readme_tmp=$(_tmp_next_to "$_dir")
+		[ -n "$_readme_tmp" ] || die "无法在 $_dir 创建 README 临时文件"
+		cat > "$_readme_tmp" <<'EOF'
 sing-box 用法：
 
 {
@@ -5283,6 +5343,10 @@ sing-box 用法：
       {"version":1,"rules":[{"ip_cidr":[...]}]}，本工具导出的正是该格式。
       裸 JSON 数组（mihomo 的 payload 格式）sing-box 不接受。
 EOF
+		[ -s "$_readme_tmp" ] || { rm -f "$_readme_tmp"; die "写入 README-singbox.txt 失败"; }
+		chmod 644 "$_readme_tmp" 2>/dev/null || true
+		mv -f "$_readme_tmp" "$_dir/README-singbox.txt" ||
+			{ rm -f "$_readme_tmp"; die "落位 README-singbox.txt 失败"; }
 		;;
 	esac
 
@@ -5511,7 +5575,11 @@ stun.douyucdn.cn:18000
 stun.freeswitch.org:3478
 stun.cloudflare.com:3478
 '
-LC_DEFAULT_ECHO='https://api.ipify.org,https://ipv4.icanhazip.com'
+# F-23：默认回显源必须国内可达。api.ipify.org / icanhazip.com 在境内运营商
+# 网络经常被 RST/超时，造成“HTTP 200 但 exit_ip 空”。下面三个是 2026-10 实测
+# 可达的 HTTPS 端点（ip.3322.net 返回裸 IP；myip.ipip.net 返回
+# “当前 IP：x.x.x.x”；ddns.oray.com 返回 “Current IP Address: x.x.x.x”）。
+LC_DEFAULT_ECHO='https://ip.3322.net,https://myip.ipip.net,https://ddns.oray.com/checkip'
 # 部分站点对默认 curl UA 直接 412/418（实测 www.chinatelecom.com.cn），
 # 必须带浏览器 UA；Range 只取 1 字节，避免 CDN 把体检当成下载。
 LC_DEFAULT_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -5541,6 +5609,17 @@ _lc_int() {
 _lc_ip_valid() {
 	case "${1:-}" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
 	printf '%s' "$1" | awk -F. 'NF == 4 && $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255 { ok = 1 } END { exit(ok ? 0 : 1) }'
+}
+
+# F-23：回显源不保证只返回裸 IP。ipip.net 返回“当前 IP：x.x.x.x 来自于：…”，
+# oray 返回“Current IP Address: x.x.x.x”。从响应里抓第一个**通过严格 IPv4
+# 校验**的候选；纯文本/JSON/HTML 都走同一条路径，不额外信任任何格式。
+_lc_extract_ip() {
+	printf '%s' "${1:-}" |
+		grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' 2>/dev/null |
+		while IFS= read -r _eip; do
+			_lc_ip_valid "$_eip" && { printf '%s' "$_eip"; break; }
+		done
 }
 
 
@@ -5598,7 +5677,12 @@ _lc_jitter() { # max-min
 }
 
 _lc_fmt_ms() {
-	case "${1:-}" in '' | *[!0-9]*) printf '—' ;; *) printf '%sms' "$1" ;; esac
+	case "${1:-}" in
+	'') printf '—' ;;
+	'<1') printf '<1ms' ;;
+	*[!0-9]*) printf '—' ;;
+	*) printf '%sms' "$1" ;;
+	esac
 }
 
 # ---- 配置/表 ----
@@ -5827,24 +5911,65 @@ _lc_wan_one() {
 
 # ---- 出口 IP ----
 
-_lc_exit_ip() { # <device> -> ip 或空
+# F-23：逐 URL 探测出口 IP，并把每个 URL 的 http_code/err/耗时写进
+# LC_EXIT_PROBE（JSON 数组），供页面区分“源不可达”与“真的没出网”。
+# 注意：本函数直接设置全局 LC_EXIT_IP / LC_EXIT_PROBE，不能用 $(...) 调用——
+# 命令替换会丢掉探测明细。
+_lc_exit_ip() { # <device>，设置 LC_EXIT_IP 与 LC_EXIT_PROBE
 	_dev=$1
+	LC_EXIT_IP=""
+	LC_EXIT_PROBE_ITEMS=""
 	# 夹具模式：ISP_SPLIT_LC_EXIT_IPS="1.2.3.4,5.6.7.8"，none 表示失败
 	if [ -n "${ISP_SPLIT_LC_EXIT_IPS:-}" ]; then
-		printf '%s' "$ISP_SPLIT_LC_EXIT_IPS" | awk -v idx="${LC_IDX:-1}" -F, '
-			$idx != "none" && $idx ~ /^[0-9.]+$/ { print $idx }'
+		LC_EXIT_IP=$(printf '%s' "$ISP_SPLIT_LC_EXIT_IPS" | awk -v idx="${LC_IDX:-1}" -F, '
+			$idx != "none" && $idx ~ /^[0-9.]+$/ { print $idx }')
+		LC_EXIT_PROBE=${ISP_SPLIT_LC_EXIT_PROBE:-[]}
 		return 0
 	fi
-	command -v curl >/dev/null 2>&1 || return 0
+	command -v curl >/dev/null 2>&1 || { LC_EXIT_PROBE="[]"; return 0; }
 	_old_ifs=$IFS
 	IFS=,
 	for _u in $(_lc_echo_raw); do
 		IFS=$_old_ifs
-		_r=$(curl -sS --interface "$_dev" --connect-timeout 3 -m 5 \
-			-A "$(_lc_ua)" --url "$_u" 2>/dev/null | tr -d '[:space:]' | head -c 64)
-		_lc_ip_valid "$_r" && { printf '%s' "$_r"; return 0; }
+		# TMPDIR 可能指向不可写的沙箱目录；/tmp 作为兜底（mktemp 仍是
+		# O_EXCL 随机名，不会被预占）。
+		_eb=$(mktemp "${TMPDIR:-/tmp}/.isp-split-echo.XXXXXX" 2>/dev/null) ||
+			_eb=$(mktemp "/tmp/.isp-split-echo.XXXXXX" 2>/dev/null) || _eb=""
+		_ee=$(mktemp "${TMPDIR:-/tmp}/.isp-split-echo2.XXXXXX" 2>/dev/null) ||
+			_ee=$(mktemp "/tmp/.isp-split-echo2.XXXXXX" 2>/dev/null) || _ee=""
+		if [ -z "$_eb" ] || [ -z "$_ee" ]; then
+			rm -f "$_eb" "$_ee"
+			continue
+		fi
+		_meta=$(curl -sS --interface "$_dev" --connect-timeout 3 -m 5 \
+			--max-filesize 65536 -A "$(_lc_ua)" -o "$_eb" \
+			-w '%{http_code} %{time_total}' --url "$_u" 2>"$_ee")
+		_rc=$?
+		_code=$(printf '%s' "$_meta" | awk '{ print $1; exit }')
+		_tt=$(printf '%s' "$_meta" | awk '{ print $2; exit }')
+		case "$_code" in '' | *[!0-9]*) _code=0 ;; *) _code=$((_code + 0)) ;; esac
+		_err=$(head -1 "$_ee" 2>/dev/null | tr '\t\r\n' '   ' | tr -s ' ' | cut -c1-160)
+		_body=$(head -c 512 "$_eb" 2>/dev/null)
+		_ip=""
+		case "$_code" in
+		2* | 3*) _ip=$(_lc_extract_ip "$_body") ;;
+		esac
+		_ok=false
+		[ -n "$_ip" ] && _ok=true
+		if [ "$_ok" = "true" ]; then
+			LC_EXIT_IP=$_ip
+			_err=""
+		else
+			[ -n "$_err" ] || _err="no-ip"
+		fi
+		_ms=$(_lc_ms "${_tt:-0}")
+		LC_EXIT_PROBE_ITEMS="${LC_EXIT_PROBE_ITEMS}${LC_EXIT_PROBE_ITEMS:+,}"
+		LC_EXIT_PROBE_ITEMS="${LC_EXIT_PROBE_ITEMS}{\"url\":$(_lc_json_str "$_u"),\"http_code\":$(_lc_int "$_code"),\"err\":$(_lc_json_str "$_err"),\"ms\":$(_lc_int "$_ms"),\"ok\":$_ok}"
+		rm -f "$_eb" "$_ee"
+		[ "$_ok" = "true" ] && break
 	done
 	IFS=$_old_ifs
+	LC_EXIT_PROBE="[${LC_EXIT_PROBE_ITEMS}]"
 	return 0
 }
 
@@ -6299,20 +6424,176 @@ _lc_stun_probe() { # <device> <wan_ip> <wan_class>
 
 # ---- 延迟 / 可用性 ----
 
-# DNS 段：curl 的 time_namelookup 只有在不钉 IP 时才有意义。
-# 这里单独发一个 http:// 请求（只取 DNS 计时，最多 2s），真正的四段测量
-# 用 --resolve 钉到已校验 IP，避免 GSLB 二次解析换 IP。
-_lc_dns_ms() { # <device> <domain>
-	_dv=$1
-	_dm=$2
-	if [ -n "${ISP_SPLIT_LC_LAT:-}" ]; then
-		printf '%s' "$(_lc_lat_get dns 0)"
+# F-24b：DNS 段必须测“这条 WAN 的 DNS”，不能测系统 resolver（127.0.0.1
+# 的 dnsmasq 热缓存）。从 DNS_TABLE 的 <策略>:<DNS> 里找策略出接口等于本
+# WAN 设备的条目；取不到时回退系统 resolver，并在 JSON 标 dns_scope=local。
+# 设置 LC_DNS_SERVER / LC_DNS_SCOPE。
+_lc_dns_for_dev() { # <device>
+	_lcdd_dev=$1
+	LC_DNS_SERVER=""
+	LC_DNS_SCOPE="local"
+	# 夹具：ISP_SPLIT_LC_DNS_IPS="223.5.5.5,none"（按 LC_IDX 取），或单个
+	# ISP_SPLIT_LC_DNS_IP。夹具也走“按线”语义，scope=wan。
+	if [ -n "${ISP_SPLIT_LC_DNS_IPS:-}" ]; then
+		_lcdd_ip=$(printf '%s' "$ISP_SPLIT_LC_DNS_IPS" | awk -v idx="${LC_IDX:-1}" -F, '
+			$idx != "none" { print $idx }')
+		case "$_lcdd_ip" in
+		'' | none) ;;
+		*)
+			if _valid_ipv4 "$_lcdd_ip"; then
+				LC_DNS_SERVER=$_lcdd_ip
+				LC_DNS_SCOPE=wan
+			fi
+			;;
+		esac
 		return 0
 	fi
-	command -v curl >/dev/null 2>&1 || { printf '0'; return 0; }
-	_v=$(curl -sS --interface "$_dv" --connect-timeout 1 -m 2 -o /dev/null \
-		-w '%{time_namelookup}' "http://$_dm/" 2>/dev/null)
-	_lc_ms "${_v:-0}"
+	if [ -n "${ISP_SPLIT_LC_DNS_IP:-}" ]; then
+		if _valid_ipv4 "$ISP_SPLIT_LC_DNS_IP"; then
+			LC_DNS_SERVER=$ISP_SPLIT_LC_DNS_IP
+			LC_DNS_SCOPE=wan
+		fi
+		return 0
+	fi
+	for _lcdd_row in ${DNS_TABLE:-}; do
+		_lcdd_pol=${_lcdd_row%%:*}
+		_lcdd_ip=${_lcdd_row#*:}
+		[ -n "$_lcdd_ip" ] || continue
+		_valid_policy "$_lcdd_pol" || continue
+		_valid_ipv4 "$_lcdd_ip" || continue
+		_lcdd_pdev=$(policy_device "$_lcdd_pol")
+		if [ -n "$_lcdd_pdev" ] && [ "$_lcdd_pdev" = "$_lcdd_dev" ]; then
+			LC_DNS_SERVER=$_lcdd_ip
+			LC_DNS_SCOPE=wan
+			break
+		fi
+	done
+	return 0
+}
+
+# curl 是否带 c-ares（--dns-servers 只在 c-ares 构建里可用）。探测一次缓存。
+LC_CURL_CARES=""
+_lc_curl_cares() {
+	if [ -z "$LC_CURL_CARES" ]; then
+		case "$(curl --version 2>/dev/null | head -1)" in
+		*c-ares*) LC_CURL_CARES=1 ;;
+		*) LC_CURL_CARES=0 ;;
+		esac
+	fi
+	[ "$LC_CURL_CARES" = "1" ]
+}
+
+# curl 秒 -> 整数毫秒 / "<1" / 空（失败）。0 不再作为“未测”哨兵。
+_lc_sec_to_dns_ms() {
+	case "${1:-}" in '' | *[!0-9.]*) return 1 ;; esac
+	awk -v v="$1" 'BEGIN {
+		if (v <= 0) exit 1
+		ms = v * 1000
+		if (ms < 1) { print "<1"; exit 0 }
+		printf "%d\n", int(ms + 0.5)
+	}'
+}
+
+# 纳秒时钟：busybox date 可能不支持 %N（会原样输出秒），用长度判定，
+# 不可用就退回 /proc/uptime 的 10ms 精度。返回值写在 stdout。
+_lc_clock_ns() {
+	_cn=$(date +%s%N 2>/dev/null) || return 1
+	case "$_cn" in '' | *[!0-9]*) return 1 ;; esac
+	[ "${#_cn}" -ge 16 ] || return 1
+	printf '%s' "$_cn"
+}
+
+# nslookup 按指定 server 测一次；成功输出毫秒（或 "<1"），失败输出空。
+# busybox nslookup 支持 `nslookup <name> <server>`；没有 timeout 命令时
+# 仍受 resolver 自身超时约束，但不会无限阻塞（OpenWrt 默认 5s × 2）。
+_lc_dns_nslookup() { # <domain> [server]
+	_ldn_dom=$1
+	_ldn_srv=${2:-}
+	_ldn_t0ns=$(_lc_clock_ns 2>/dev/null) || _ldn_t0ns=""
+	_ldn_u0=$(_lc_uptime_ms)
+	if [ -n "$_ldn_srv" ]; then
+		if command -v timeout >/dev/null 2>&1; then
+			_ldn_out=$(timeout 3 nslookup "$_ldn_dom" "$_ldn_srv" 2>&1)
+		else
+			_ldn_out=$(nslookup "$_ldn_dom" "$_ldn_srv" 2>&1)
+		fi
+	else
+		if command -v timeout >/dev/null 2>&1; then
+			_ldn_out=$(timeout 3 nslookup "$_ldn_dom" 2>&1)
+		else
+			_ldn_out=$(nslookup "$_ldn_dom" 2>&1)
+		fi
+	fi
+	_ldn_rc=$?
+	_ldn_u1=$(_lc_uptime_ms)
+	_ldn_t1ns=$(_lc_clock_ns 2>/dev/null) || _ldn_t1ns=""
+	# 失败特征先排除；再要求至少有一行 Name:（NXDOMAIN/SERVFAIL 没有）
+	case "$_ldn_out" in
+	*"can't resolve"* | *"timed out"* | *"no servers could be reached"* | *"Connection refused"*)
+		return 1 ;;
+	esac
+	[ "$_ldn_rc" -eq 0 ] || return 1
+	printf '%s' "$_ldn_out" | grep -q 'Name:' || return 1
+
+	if [ -n "$_ldn_t0ns" ] && [ -n "$_ldn_t1ns" ]; then
+		_ldn_diff=$((_ldn_t1ns - _ldn_t0ns))
+		[ "$_ldn_diff" -ge 0 ] 2>/dev/null || return 1
+		case "$_ldn_diff" in
+		0) printf '<1' ;;
+		*)
+			_ldn_ms=$((_ldn_diff / 1000000))
+			[ "$_ldn_ms" -gt 0 ] 2>/dev/null || _ldn_ms="<1"
+			printf '%s' "$_ldn_ms"
+			;;
+		esac
+		return 0
+	fi
+	# 没有纳秒时钟（busybox date 常见）时，用执行前后 /proc/uptime 的
+	# 10ms 精度差。0 表示低于分辨率，输出 "<1"，绝不再回 0。
+	_ldn_ms=$((_ldn_u1 - _ldn_u0))
+	[ "$_ldn_ms" -gt 0 ] 2>/dev/null || _ldn_ms="<1"
+	printf '%s' "$_ldn_ms"
+}
+
+# DNS 段：优先 c-ares 的 curl --dns-servers（直接问该 WAN 的 DNS）；
+# 没有 c-ares 时用 busybox nslookup <domain> <server>。两者都取不到时，
+# 回退系统 resolver 并标 dns_scope=local。设置 LC_DNS_MS / LC_DNS_SCOPE。
+_lc_dns_ms() { # <device> <domain>，设置 LC_DNS_MS / LC_DNS_SCOPE
+	_dv=$1
+	_dm=$2
+	LC_DNS_MS=""
+	LC_DNS_SCOPE="local"
+	LC_DNS_SERVER=""
+	if [ -n "${ISP_SPLIT_LC_LAT:-}" ]; then
+		# 夹具值按“秒”解释，与 curl -w 的 time_namelookup 同口径：
+		# dns=0.4 -> 400ms，dns=0.0004 -> "<1"，缺失 -> null。
+		_raw=$(_lc_lat_get dns "")
+		LC_DNS_MS=$(_lc_sec_to_dns_ms "$_raw" 2>/dev/null) || LC_DNS_MS=""
+		return 0
+	fi
+	_lc_dns_for_dev "$_dv"
+
+	# c-ares 路径：--dns-servers 只影响 DNS，--interface 仍负责选路。
+	if [ -n "$LC_DNS_SERVER" ] && command -v curl >/dev/null 2>&1 && _lc_curl_cares; then
+		_meta=$(curl -sS --interface "$_dv" --dns-servers "$LC_DNS_SERVER" \
+			--connect-timeout 2 -m 3 -o /dev/null \
+			-w '%{time_namelookup} %{http_code}' "https://$_dm/" 2>/dev/null)
+		_sec=$(printf '%s' "$_meta" | awk '{ print $1; exit }')
+		LC_DNS_MS=$(_lc_sec_to_dns_ms "$_sec" 2>/dev/null) || LC_DNS_MS=""
+		[ -n "$LC_DNS_MS" ] && return 0
+	fi
+
+	command -v nslookup >/dev/null 2>&1 || return 0
+	if [ -n "$LC_DNS_SERVER" ]; then
+		LC_DNS_MS=$(_lc_dns_nslookup "$_dm" "$LC_DNS_SERVER") || LC_DNS_MS=""
+		[ -n "$LC_DNS_MS" ] && return 0
+		# 指定 server 失败时仍回退系统 resolver，但 scope 保持 wan 会误导；
+		# 标 local 且不再把失败的 server 写进 JSON。
+		LC_DNS_SCOPE=local
+		LC_DNS_SERVER=""
+	fi
+	LC_DNS_MS=$(_lc_dns_nslookup "$_dm") || LC_DNS_MS=""
+	return 0
 }
 
 _lc_lat_get() { # <key> <default> 从 ISP_SPLIT_LC_LAT="dns=2,tcp=30,..." 取
@@ -6337,7 +6618,10 @@ _lc_measure() { # <device> <domain> <ip> <timeout> [fast]
 	# 而且失败目标的早停能把整次体检压进 rpcd 预算。
 	_ct=$_mto
 	[ "$_ct" -gt 2 ] && _ct=2
-	LC_DNS_MS=$(_lc_dns_ms "$_mdev" "$_mdom")
+	LC_DNS_MS=""
+	LC_DNS_SCOPE="local"
+	LC_DNS_SERVER=""
+	_lc_dns_ms "$_mdev" "$_mdom"
 	LC_TCP_MS=""
 	LC_TLS_MS=""
 	LC_TTFB_MS=""
@@ -6443,7 +6727,8 @@ _lc_measure() { # <device> <domain> <ip> <timeout> [fast]
 			LC_AVAIL=full
 		fi
 	else
-		if [ "$LC_DNS_MS" -gt 0 ] 2>/dev/null; then
+		# F-24b：空 = 未测/失败；"<1" 也是已测到。
+		if [ -n "$LC_DNS_MS" ]; then
 			LC_AVAIL=tcpfail
 		else
 			LC_AVAIL=dnsfail
@@ -6470,8 +6755,17 @@ _lc_avail_from() { # <http_code> <tls_ok> <tcp_ok>
 
 _lc_geo_cache_get() { # <ip> <provider>
 	[ -f "$LC_GEO" ] || return 1
+	# A-13：只接受四列完整的行。旧缓存若被外部文本写进 TAB/换行，行列会错位；
+	# 这里让坏行进不了展示链路，下一次写入会用清洗后的文本覆盖。
 	awk -F'\t' -v ip="$1" -v p="$2" -v now="$(_lc_now)" -v ttl="$(_lc_geo_ttl)" '
-		$1 == ip && $2 == p && (now - $4) < ttl { print $3; exit }' "$LC_GEO" 2>/dev/null
+		NF >= 4 && $1 == ip && $2 == p && (now - $4) < ttl { print $3; exit }' "$LC_GEO" 2>/dev/null
+}
+
+# A-13：缓存是 TAB 分隔的 4 列文本，外部返回的 TAB/CR/LF 会破坏行列结构。
+# 写前统一清洗（不是 JSON 转义：TSV 里要的是“没有分隔符”，不是反斜杠），
+# 并截断到 200 字符，避免单条归属地把 state 撑大。
+_lc_geo_cache_clean() {
+	printf '%s' "${1:-}" | tr '\t\r\n' '   ' | tr -s ' ' | sed 's/[[:cntrl:]]//g' | cut -c1-200
 }
 
 _lc_geo_ttl() {
@@ -6485,7 +6779,12 @@ _lc_geo_cache_put() { # <ip> <provider> <text>
 	# 写在缓存目录之外：缓存目录整体替换时不能把归属地缓存一起带走（旧实现
 	# 既丢缓存，又会在探测中途凭空造出一个没有 meta 的半截缓存目录）。
 	mkdir -p "$STATE_DIR" 2>/dev/null || return 0
-	printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(_lc_now)" >>"$LC_GEO" 2>/dev/null || true
+	_lg_ip=$(_lc_geo_cache_clean "$1")
+	_lg_prov=$(_lc_geo_cache_clean "$2")
+	_lg_text=$(_lc_geo_cache_clean "$3")
+	[ -n "$_lg_ip" ] && [ -n "$_lg_prov" ] || return 0
+	printf '%s\t%s\t%s\t%s\n' "$_lg_ip" "$_lg_prov" "$_lg_text" "$(_lc_now)" >>"$LC_GEO" 2>/dev/null || true
+	chmod 600 "$LC_GEO" 2>/dev/null || true
 	# 只保留最近 200 条，防止长期运行把 state 撑大
 	if [ -f "$LC_GEO" ]; then
 		tail -n 200 "$LC_GEO" >"$LC_GEO.$$" 2>/dev/null &&
@@ -6496,7 +6795,9 @@ _lc_geo_cache_put() { # <ip> <provider> <text>
 _lc_geo_query() { # <ip> <provider>
 	case "$2" in
 	baidu)
-		_r=$(curl -sS -m 2 --connect-timeout 2 \
+		# A-13：主源只走 HTTPS；--max-filesize 防止被控/异常端点用超大 body
+		# 在 2s 内灌满 shell 变量（curl -m 只限时不限体积）。
+		_r=$(curl -sS -m 2 --connect-timeout 2 --max-filesize 131072 --proto '=https' \
 			"https://opendata.baidu.com/api.php?query=$1&resource_id=6006&oe=utf8" 2>/dev/null)
 		[ -n "$_r" ] || return 1
 		_loc=$(printf '%s' "$_r" | jsonfilter -e '@.data[0].location' 2>/dev/null)
@@ -6504,7 +6805,9 @@ _lc_geo_query() { # <ip> <provider>
 		printf '%s' "$_loc"
 		;;
 	ip-api)
-		_r=$(curl -sS -m 2 --connect-timeout 2 \
+		# 显式选择才走这里：ip-api 免费版只有 HTTP，明文。默认 auto 不再
+		# 自动降级到它（见 docs/SECURITY.md）；仍保留给内网/可信链路用户。
+		_r=$(curl -sS -m 2 --connect-timeout 2 --max-filesize 131072 \
 			"http://ip-api.com/json/$1?lang=zh-CN&fields=status,country,regionName,city,isp" 2>/dev/null)
 		[ -n "$_r" ] || return 1
 		_st=$(printf '%s' "$_r" | jsonfilter -e '@.status' 2>/dev/null)
@@ -6543,7 +6846,9 @@ _lc_geo() { # <exit_ip> <wan_ip> <wan_class>
 		return 0
 	fi
 
-	_provs="baidu ip-api"
+	# A-13：auto 只走 HTTPS 的百度。ip-api 是明文 HTTP，降级为“显式选择”
+	# 才启用；不再自动兜底，避免用户在不知情时把出口 IP 暴露给明文链路。
+	_provs="baidu"
 	[ "$_geo_prov" = "auto" ] || _provs=$_geo_prov
 	for _p in $_provs; do
 		_c=$(_lc_geo_cache_get "$_ip" "$_p")
@@ -6798,7 +7103,16 @@ _lc_wan_json() {
 	_httpj=false; [ "${LC_HTTP_CODE:-0}" -ge 200 ] 2>/dev/null && [ "${LC_HTTP_CODE:-0}" -lt 500 ] 2>/dev/null && _httpj=true
 
 	_tcpj=null; [ -n "${LC_TCP_MS:-}" ] && _tcpj=$LC_TCP_MS
-	_dnsj=null; [ -n "${LC_DNS_MS:-}" ] && _dnsj=$LC_DNS_MS
+	# F-24b：dns_ms 只允许 null / 整数 / "<1"；绝不再输出 0。
+	_dnsj=null
+	case "${LC_DNS_MS:-}" in
+	'') ;;
+	'<1') _dnsj='"<1"' ;;
+	*[!0-9]*) ;;
+	*) _dnsj=$LC_DNS_MS ;;
+	esac
+	_dnssj=null; [ -n "${LC_DNS_SCOPE:-}" ] && _dnssj=$(_lc_json_str "$LC_DNS_SCOPE")
+	_dnssrvj=null; [ -n "${LC_DNS_SERVER:-}" ] && _dnssrvj=$(_lc_json_str "$LC_DNS_SERVER")
 	_tlsj=null; [ -n "${LC_TLS_MS:-}" ] && _tlsj=$LC_TLS_MS
 	_ttfbj=null; [ -n "${LC_TTFB_MS:-}" ] && _ttfbj=$LC_TTFB_MS
 	_totalj=null; [ -n "${LC_TOTAL_MS:-}" ] && _totalj=$LC_TOTAL_MS
@@ -6810,12 +7124,12 @@ _lc_wan_json() {
 	printf '"iface":%s,"device":%s,"up":%s,"state":%s,"wan_ip":%s,"ip_class":%s,' \
 		"$(_lc_json_str "$LC_IFACE")" "$(_lc_json_str "$LC_DEV")" "$_upj" \
 		"$(_lc_json_str "$LC_STATE")" "$_wanipj" "$(_lc_json_str "$LC_IP_CLASS")"
-	printf '"exit_ip":%s,"exit_ok":%s,"multi_nat":%s,"isp":%s,"isp_label":%s,' \
-		"$_exipj" "$_exj" "$_mj" "$(_lc_json_str "${LC_ISP:-}")" \
+	printf '"exit_ip":%s,"exit_ok":%s,"exit_probe":%s,"multi_nat":%s,"isp":%s,"isp_label":%s,' \
+		"$_exipj" "$_exj" "${LC_EXIT_PROBE:-[]}" "$_mj" "$(_lc_json_str "${LC_ISP:-}")" \
 		"$(_lc_json_str "$(_lc_isp_label "${LC_ISP:-}")")"
 	printf '"target":%s,' "$(_lc_target_json)"
-	printf '"latency":{"dns_ms":%s,"tcp_ms":%s,"tls_ms":%s,"ttfb_ms":%s,"total_ms":%s,"jitter_ms":%s,"loss_pct":%s,"attempts":%s,"ok_count":%s,"samples":[%s]},' \
-		"$_dnsj" "$_tcpj" "$_tlsj" "$_ttfbj" "$_totalj" \
+	printf '"latency":{"dns_ms":%s,"dns_scope":%s,"dns_server":%s,"tcp_ms":%s,"tls_ms":%s,"ttfb_ms":%s,"total_ms":%s,"jitter_ms":%s,"loss_pct":%s,"attempts":%s,"ok_count":%s,"samples":[%s]},' \
+		"$_dnsj" "$_dnssj" "$_dnssrvj" "$_tcpj" "$_tlsj" "$_ttfbj" "$_totalj" \
 		"$(_lc_int "${LC_JITTER:-0}")" "$(_lc_int "${LC_LOSS:-100}")" \
 		"$(_lc_int "${LC_ATTEMPTS:-0}")" "$(_lc_int "${LC_OK_COUNT:-0}")" \
 		"$(printf '%s' "${LC_SAMPLES:-}" | tr ' ' ',' | sed 's/^,//; s/,$//')"
@@ -6979,6 +7293,7 @@ _lc_run_wan() { # <iface> <dev> <up> <state> <wan_ip>
 	LC_WAN_IP=$5
 	LC_IP_CLASS=$(_lc_ip_class "$LC_WAN_IP")
 	LC_EXIT_IP=""
+	LC_EXIT_PROBE="[]"
 	LC_EXIT_OK=0
 	LC_MULTI=0
 	LC_ISP=""
@@ -6988,7 +7303,9 @@ _lc_run_wan() { # <iface> <dev> <up> <state> <wan_ip>
 	LC_T_MODE=none
 	LC_T_VALID=0
 	LC_T_SAME=0
-	LC_DNS_MS=0
+	LC_DNS_MS=""
+	LC_DNS_SCOPE="local"
+	LC_DNS_SERVER=""
 	LC_TCP_MS=""
 	LC_TLS_MS=""
 	LC_TTFB_MS=""
@@ -7012,7 +7329,9 @@ _lc_run_wan() { # <iface> <dev> <up> <state> <wan_ip>
 	LC_STUN_LPORT=0
 
 	# 出口 IP：WAN down 时也试一次（可能只是 mwan3 track 失败，链路还在）
-	LC_EXIT_IP=$(_lc_exit_ip "$LC_DEV")
+	LC_EXIT_IP=""
+	LC_EXIT_PROBE="[]"
+	_lc_exit_ip "$LC_DEV"
 	if _lc_ip_valid "$LC_EXIT_IP"; then
 		LC_EXIT_OK=1
 	else
@@ -7322,6 +7641,13 @@ _lc_publish() { # <tmpdir>
 	[ -d "$LC_CACHE" ] && mv "$LC_CACHE" "$LC_CACHE_PREV" 2>/dev/null
 	if mv "$1" "$LC_CACHE" 2>/dev/null; then
 		rm -rf "$LC_CACHE_PREV" 2>/dev/null
+		# A-14：缓存目录 700、其中每个文件 600。mv 保留临时目录的权限，
+		# 但升级前留下的旧 cache 可能还是 755/644，这里统一纠正。
+		chmod 700 "$LC_CACHE" 2>/dev/null || true
+		for _pf in "$LC_CACHE"/*; do
+			[ -f "$_pf" ] || continue
+			chmod 600 "$_pf" 2>/dev/null || true
+		done
 		return 0
 	fi
 	[ -d "$LC_CACHE_PREV" ] && [ ! -d "$LC_CACHE" ] && mv "$LC_CACHE_PREV" "$LC_CACHE" 2>/dev/null
@@ -7335,7 +7661,7 @@ _lc_dt() {
 _lc_privacy_line() {
 	if [ "$(_lc_opt LINE_CHECK_GEO 1)" = "1" ]; then
 		_lc_gp=$(_lc_opt LINE_CHECK_GEO_PROVIDER auto)
-		[ "$_lc_gp" = "auto" ] && _lc_gp="百度优先，失败转 ip-api"
+		[ "$_lc_gp" = "auto" ] && _lc_gp="仅百度 HTTPS（ip-api 需显式选择）"
 		[ "$_lc_gp" = "off" ] && _lc_gp="关闭"
 		printf '隐私：归属地查询已开启，仅把每条线的出口公网 IP 发给 %s；不发送内网地址/设备名/MAC/流量内容。\n' "$_lc_gp"
 	else
@@ -7392,6 +7718,7 @@ _lc_background() { # <force> <only>
 	[ -n "$_b_only" ] && set -- "$@" --wan "$_b_only"
 
 	: >"$LC_LOG" 2>/dev/null || true
+	chmod 600 "$LC_LOG" 2>/dev/null || true
 	# setsid：脱离 rpcd 的会话/进程组，exec 返回后不会被一起收走。
 	# 三个 fd 全部重定向：父进程退出时 rpcd 的管道不能被子进程挂着，否则
 	# exec 仍然要等到探测结束（那正是 BUG-23 的另一半）。
@@ -7465,6 +7792,10 @@ cmd_linecheck() {
 
 	[ "$(_lc_opt LINE_CHECK_ENABLE 1)" = "1" ] || die "线路体检已关闭（LINE_CHECK_ENABLE=0）"
 	[ "$_lc_worker" = "1" ] && _lc_json=1
+	# A-14：体检缓存含公网 IP/归属地/STUN 映射。整个 linecheck 进程内
+	# 统一 umask 077，新建目录 700、文件 600；已存在的旧目录/文件在下面
+	# 再显式 chmod 一次（umask 只影响新建）。
+	umask 077
 	# A-03/A-04：读取侧校验必须在任何 curl 之前硬失败（含后台/worker）。
 	_lc_read_validate
 
@@ -7478,6 +7809,7 @@ cmd_linecheck() {
 	[ "${ISP_SPLIT_LC_NO_SOCAT:-0}" = "1" ] && LC_SOCAT=0
 
 	mkdir -p "$STATE_DIR" 2>/dev/null || true
+	chmod 700 "$STATE_DIR" 2>/dev/null || true
 	# 每次调用都先扫掉 pid 已死的探测目录（SIGKILL 走不到 trap）。命中缓存时
 	# 也扫，否则一个被 rpcd 超时杀掉的前台探测要等到缓存过期才有人收尸。
 	_lc_sweep_tmp
@@ -7519,6 +7851,7 @@ cmd_linecheck() {
 			[ "$_lc_force" = "1" ] && set -- "$@" --force
 			[ -n "$_lc_only" ] && set -- "$@" --wan "$_lc_only"
 			: >"$LC_LOG" 2>/dev/null || true
+	chmod 600 "$LC_LOG" 2>/dev/null || true
 			if command -v setsid >/dev/null 2>&1; then
 				ISP_SPLIT_LC_SELF=$_lc_self setsid sh "$LC_RUN" "$@" </dev/null >>"$LC_LOG" 2>&1 &
 			else

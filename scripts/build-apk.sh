@@ -61,7 +61,31 @@ else
 	FILE=$(curl -fsSL "$BASE/" | grep -oE 'openwrt-sdk-[^"<]*Linux-x86_64\.tar\.(zst|xz)' | head -1)
 	[ -n "$FILE" ] || { echo "在 $BASE 找不到 SDK，确认版本号与架构" >&2; exit 1; }
 	echo "下载 $FILE"
+
+	# A-12：SDK 是随后会被执行的构建工具链，不能只靠 TLS。OpenWrt 的
+	# target 目录同时发布 sha256sums（与 SDK 同源）；先取清单、再下载、
+	# 最后逐字节核对。清单缺失或哈希不匹配都硬失败，绝不“校验不了就跳过”。
+	SUMS=$(curl -fsSL "$BASE/sha256sums") || {
+		echo "无法下载 SDK 校验清单: $BASE/sha256sums" >&2
+		exit 1
+	}
+	WANT=$(printf '%s\n' "$SUMS" | awk -v f="$FILE" '$2 == f || $2 == "*" f { print $1; exit }')
+	[ -n "$WANT" ] || {
+		echo "校验清单里没有 $FILE（上游未发布或文件名变了），拒绝无校验构建" >&2
+		exit 1
+	}
 	curl -fsSL -o "$WORK/sdk.tar" "$BASE/$FILE"
+	command -v sha256sum >/dev/null 2>&1 || {
+		echo "缺少 sha256sum，无法校验 SDK" >&2
+		exit 1
+	}
+	GOT=$(sha256sum "$WORK/sdk.tar" | awk '{ print $1 }')
+	if [ "$GOT" != "$WANT" ]; then
+		echo "SDK sha256 校验失败: 期望 $WANT，实际 $GOT（$FILE）" >&2
+		rm -f "$WORK/sdk.tar"
+		exit 1
+	fi
+	echo "SDK sha256 校验通过: $WANT"
 	mkdir -p "$WORK/sdk"
 	# 这里是**构建主机**（CI / Linux x86_64，GNU tar）解 SDK 包，--strip-components
 	# 合法也必须用；路由器侧用户装源码包的姿势（busybox tar 不支持该参数）在

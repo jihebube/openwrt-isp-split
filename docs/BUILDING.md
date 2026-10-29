@@ -84,7 +84,7 @@ sh scripts/build-apk.sh 24.10.4 x86/64   # 指定版本与架构
 OWRT_WORK=/tmp/sdkbuild sh scripts/build-apk.sh
 ```
 
-脚本流程：动态解析并下载 SDK → 解压到 `.sdk-build/<SDK 版本>/sdk/`（F-19：按版本分桶，25.12 与 24.10 各自一份，复用前校验目录里的版本标记 `.isp-split-sdk-version`）→ 拷入软件包 → `feeds update/install` → `make defconfig` → `make package/*/compile` → 收集产物到 `dist/sdk-<版本>/`。
+脚本流程：动态解析并下载 SDK → **用上游同目录 `sha256sums` 校验 SDK 的 sha256（A-12；清单缺失或哈希不符直接失败）** → 解压到 `.sdk-build/<SDK 版本>/sdk/`（F-19：按版本分桶，25.12 与 24.10 各自一份，复用前校验目录里的版本标记 `.isp-split-sdk-version`）→ 拷入软件包 → `feeds update/install` → `make defconfig` → `make package/*/compile` → 收集产物到 `dist/sdk-<版本>/`。
 
 宿主要求：Linux x86_64，`build-essential`、`zstd`、`curl`、`git`、`file`、`perl`、`python3-distutils`（Debian 系）。
 

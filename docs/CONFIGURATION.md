@@ -275,11 +275,16 @@ meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new \
 
 1. **本机口 IP 分类**：公网 / CGNAT（`100.64.0.0/10`）/ 私网；
 2. **出口 IP**：`curl --interface <l3_device>` 请求 `LINE_CHECK_ECHO_URLS`；
-   WAN IP 本身是公网、出口却是另一个公网 IP 时标“多层 NAT/代理”；
+   WAN IP 本身是公网、出口却是另一个公网 IP 时标“多层 NAT/代理”。每个 URL 的
+   `http_code` / `err` / 耗时写入 JSON 的 `wans[].exit_probe`；页面据此把
+   “回显源不可达”和“未真正出网”分成两句文案；
 3. **同运营商目标四段延迟**：域名清单 → DNS 解析 → 用 `@isp_*` 集合校验归属
    → `curl --resolve` 钉住已验证 IP，5 次尝试；显示 DNS / TCP / TLS / 首字节，
-   评分用 TCP 建连中位数；
-4. **归属地**：只发送出口公网 IP，百度优先、ip-api 兜底，24h 缓存；
+   评分用 TCP 建连中位数。DNS 段优先用 `DNS_TABLE` 中该 WAN 策略对应的 DNS
+   服务器；取不到时回退系统 resolver，并在 JSON 的 `latency.dns_scope` 标注
+   `local`。`dns_ms` 只输出 `null`（未测/失败）或实测毫秒，亚毫秒输出 `"<1"`，
+   不再用 0 当“未测”哨兵；
+4. **归属地**：只发送出口公网 IP，默认只走百度 HTTPS（`auto` 不再自动转 ip-api），24h 缓存；
 5. **双 STUN**：`socat ...,so-bindtodevice=<l3_device>`，同一本地端口打两个
    不同 IP 的服务器，判五态 NAT；
 6. **评分**：公开规则表 + 硬上限 + 完整明细 + 一句话建议。
@@ -297,7 +302,7 @@ isp-split linecheck --force         # 绕过 60s 结果缓存，强制重测
 |---|---|---|
 | `LINE_CHECK_ENABLE` | `1` | 总开关；`0` 时命令直接拒绝执行，LuCI 显示已关闭 |
 | `LINE_CHECK_GEO` | `1` | 归属地隐私开关；`1` 允许把每条 WAN 的**出口公网 IP**发给第三方，`0` 只关闭归属地查询（出口 IP 回显、STUN、延迟探测照常外发） |
-| `LINE_CHECK_GEO_PROVIDER` | `auto` | `auto`（百度优先，失败转 ip-api）/ `baidu` / `ip-api` / `off` |
+| `LINE_CHECK_GEO_PROVIDER` | `auto` | `auto`（仅百度 HTTPS）/ `baidu` / `ip-api`（显式选择，HTTP 明文）/ `off` |
 | `LINE_CHECK_GEO_TTL` | `86400` | 同一出口 IP 的归属地缓存秒数（最小 60） |
 | `LINE_CHECK_MIN_INTERVAL` | `60` | 结果缓存与手动触发最小间隔（15-3600 秒）；`--force` 可绕过 |
 | `LINE_CHECK_TIMEOUT` | `3` | 单次探测超时（1-10 秒），curl 与 socat 共用 |
@@ -305,16 +310,16 @@ isp-split linecheck --force         # 绕过 60s 结果缓存，强制重测
 | `LINE_CHECK_TARGETS` | 电信/联通/移动/教育网各 2 个域名 | 格式 `<运营商源名>:<域名1>,<域名2>`；源名必须与 `ISP_TABLE` 第一列一致。线路运营商由 WAN IP / 出口 IP 匹配 `@isp_*` 得出；两者都不在集合里时直接走跨网基线，不猜运营商 |
 | `LINE_CHECK_BASELINE` | `www.baidu.com,www.qq.com` | 同网目标全部失败时的跨网基线；只判连通性，延迟项最高 15 分 |
 | `LINE_CHECK_STUN_SERVERS` | miwifi / douyu / freeswitch / cloudflare（bilibili 可选） | `<域名或 IP>:<端口>`；运行时按厂商优先解析，同一本地端口探测，失败自动换下一个；公网 STUN 可达性会波动。清单为空或全部非法时该 WAN 的 NAT 判 `unknown`，不影响其它项 |
-| `LINE_CHECK_ECHO_URLS` | `api.ipify.org,ipv4.icanhazip.com` | 出口 IP 回显服务，按顺序尝试；只接受 `http(s)://` + 常规 URL 字符（不接受查询串、curl 选项或 shell 元字符） |
+| `LINE_CHECK_ECHO_URLS` | `ip.3322.net,myip.ipip.net,ddns.oray.com/checkip`（均 HTTPS） | 出口 IP 回显服务，按顺序尝试；接受裸 IP 或含 IP 的文本，取第一个合法 IPv4。只接受 `http(s)://` + 常规 URL 字符（不接受查询串、curl 选项或 shell 元字符） |
 | `LINE_CHECK_UA` | 浏览器 UA | 部分运营商站点对默认 curl UA 返回 412/418，必须带浏览器 UA；`conf set/check` 限制 512 字符并拒绝 CR/LF |
 
 ### 隐私声明
 
 开启 `LINE_CHECK_GEO=1` 后，体检会把**每条 WAN 的出口公网 IP**发送给第三方
-（默认百度，失败时 `ip-api.com`）查询归属地。
+（默认只走百度 HTTPS；只有显式选择 `ip-api` 才会请求明文 HTTP 的 `ip-api.com`）查询归属地。
 
 - 只发送出口 IP，**不发送**内网地址、设备名、MAC、流量内容；
-- `ip-api` 使用 **HTTP**，传输不加密；介意时把 `LINE_CHECK_GEO_PROVIDER` 固定为 `baidu`；
+- `auto`/`baidu` 只走 HTTPS；`ip-api` 是显式选项且使用 **HTTP**，传输不加密，不建议在不可信链路上启用；
 - `LINE_CHECK_GEO=0` 时不发起任何归属地请求，卡片显示“归属地：未查询（隐私开关关闭）”；
 - 关闭后仍可用本地 `@isp_*` 集合判断运营商大类（电信/联通/移动/教育网），不需要外发。
 

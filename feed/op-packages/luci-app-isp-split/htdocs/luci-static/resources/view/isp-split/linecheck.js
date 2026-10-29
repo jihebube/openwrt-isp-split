@@ -110,8 +110,12 @@ function fmtAge(sec) {
 }
 
 function fmtMs(v) {
-	if (v === null || v === undefined || v === '' || v === 0)
+	/* F-24b：null = 未测/失败，显示“—”；"<1" 与历史 0 都显示 "<1ms"。
+	   0 不再作为“没测到”的哨兵（亚毫秒 DNS 曾经被四舍五入成 0）。 */
+	if (v === null || v === undefined || v === '')
 		return '—';
+	if (v === 0 || v === '<1')
+		return '<1ms';
 	return v + 'ms';
 }
 
@@ -469,6 +473,14 @@ return view.extend({
 		var lat = w.latency || {};
 		var geo = w.geo || {};
 		var http = w.http || {};
+		/* F-23：exit_probe 是 shell 侧逐 URL 记录的探测明细。有明细但
+		   exit_ip 为空 => 回显源不可达/返回格式不符；连明细都没有 =>
+		   没有发起探测（curl 缺失/未配置），文案保持“可能未真正出网”。
+		   所有 JSON 字段只作为 E() 的文本子项，绝不拼进 HTML 解析路径。 */
+		var ep = Array.isArray(w.exit_probe) ? w.exit_probe : [];
+		var exitText = w.exit_ip || (ep.length
+			? _('回显源不可达（建议更换 LINE_CHECK_ECHO_URLS）')
+			: _('未取到（可能未真正出网）'));
 		var detail = E('div', { 'class': 'lc-detail', 'hidden': '' });
 
 		var toggle = E('button', {
@@ -525,7 +537,7 @@ return view.extend({
 					E('span', { 'class': 'lc-tag is-muted' }, [ classText(w.ip_class) ])
 				]),
 				row(_('出口 IP'), [
-					E('span', {}, [ w.exit_ip || _('未取到（可能未真正出网）') ]),
+					E('span', {}, [ exitText ]),
 					multi
 				]),
 				row(_('运营商'), [ w.isp_label || _('未知') ]),

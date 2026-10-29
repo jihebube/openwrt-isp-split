@@ -16,8 +16,11 @@ on:
 env:
   FEATURE_LINECHECK: "1"
 
+# A-12：默认最小权限。只有 release job 需要 contents: write。
+# action 全部钉 40 位 commit SHA（注释保留人类可读版本），避免上游 tag
+# 被移动/仓库被接管时 CI 执行被替换的代码。
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # F-21：tag 与版本号必须在编译前对上。打 tag 忘了改 Makefile（或改了版本号
@@ -27,7 +30,7 @@ jobs:
     name: tag ↔ 版本一致性
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: 断言 tag 的 vX.Y.Z 与 PKG_VERSION / ISP_VERSION 一致
         env:
           TAG_REF: ${{ github.ref }}
@@ -52,7 +55,7 @@ jobs:
           - branch: 24.10.4
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: 编译（复用 scripts/build-apk.sh，与本地构建同一路径）
         run: sh scripts/build-apk.sh ${{ matrix.branch }} x86/64
@@ -179,7 +182,7 @@ jobs:
           echo "parity luci: $sdk_luci <-> $local_luci"
           sh scripts/verify-package-payload.sh parity "$sdk_luci" "$local_luci"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: packages-${{ matrix.branch }}
           path: out/*
@@ -189,10 +192,10 @@ jobs:
     name: source tarball
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: 构建分发包
         run: sh scripts/build-release.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: source
           path: dist/*
@@ -200,8 +203,11 @@ jobs:
   release:
     needs: [ build, source ]
     runs-on: ubuntu-latest
+    # A-12：写权限只给真正写 Release 的 job；build/source 仍是只读。
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
       - name: 汇总
@@ -226,7 +232,7 @@ jobs:
             echo "::error::SHA256SUMS 把自己也列进了清单"
             exit 1
           fi
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: rel/*
           # 不自动生成 release notes：0.3.1 的对外口径要人工定稿（换装清单、体检彩蛋、

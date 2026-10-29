@@ -206,6 +206,14 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 
 **唯一差距**：DPI 应用识别。开源侧（netifyd/nDPI、eBPF 方案等）目前无法把识别结果接入多 WAN 路由——DPI 要看多个包才敢下结论，而路由必须在连接首包打标，时序上矛盾。替代方案：把大流量应用的 CDN 域名加入 `DOMAIN_SPLIT` 钉线（域名即应用本体，比 DPI 更精准），配合 mwan3 按设备分线，可覆盖按应用调度的大部分收益。完整分析见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+## 安全模型与已知边界
+
+完整的授权面、信任边界与回归防线见 [docs/SECURITY.md](docs/SECURITY.md)。三条最常被误解的先写在前面：
+
+1. **LuCI ACL 的 `write` = 以 root 执行任意 `isp-split` 子命令**。rpcd 只按可执行文件路径授权，不按子命令细分；默认安装只有 root 拥有该 ACL，不要把它授给“受限运维”账号。`read` 能读 `/etc/isp-split.conf` 与整个 `state/` 树（含公网 IP、归属地、STUN 映射）。
+2. **外网文本不会变成 HTML**。归属地、回显 IP、STUN 详情等全部经 `_lc_json_esc` 落盘，LuCI 侧只用 `E()` 文本节点渲染；全文唯一的 `innerHTML` 是静态图标 SVG，不接受 JSON 字段。`AUDIT-SECURITY-v2` §A-15 的结论是当前链路不可利用，selftest 已加“伪造全字段 payload”回归断言。
+3. **`uninstall` 的 BASE 有硬守卫**。`ISP_SPLIT_BASE=/etc isp-split uninstall` 会被拒绝；真实根只接受默认 `/etc/isp-split`，其它目录必须显式 `--i-know-what-im-doing`。`export` 的 README/数据文件统一走同目录临时文件 + 原子 `rename`，不写穿符号链接。
+
 ## 已知限制
 
 1. **与 OpenClash fake-ip 模式不兼容**：fake-ip 给域名返回假 IP（198.18.0.0/15），本工具按真实目标 IP 匹配运营商集合，fake-ip 下分流与多线路 DNS 均不生效（启动检测会告警）。请使用 redir-host 模式（新版 OpenClash 默认）。
@@ -226,9 +234,10 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
     **不是 NAT1-4 认证**：公网 STUN 服务器基本不支持 `CHANGE-REQUEST`，无法可靠区分
     Full Cone / Restricted / Port-Restricted。UDP 3478 被运营商阻断时只降级为“未知”，
     不影响其他检查项与评分
-13. 归属地查询会把每条 WAN 的出口公网 IP 发给第三方（默认百度，失败转 ip-api.com）；
-    只发送出口 IP，不发送内网地址、设备名、MAC 或流量内容。ip-api 使用 HTTP 明文，
-    介意时把 `LINE_CHECK_GEO` 设为 `0` 或把 `LINE_CHECK_GEO_PROVIDER` 固定为 `baidu`
+13. 归属地查询会把每条 WAN 的出口公网 IP 发给第三方（默认只走百度 HTTPS）；
+    只发送出口 IP，不发送内网地址、设备名、MAC 或流量内容。`ip-api` 仍是可选的
+    显式配置项，但它使用 HTTP 明文；介意时把 `LINE_CHECK_GEO` 设为 `0`，或不要
+    把 `LINE_CHECK_GEO_PROVIDER` 设为 `ip-api`
 <!-- lc:end -->
 
 ## 路线图

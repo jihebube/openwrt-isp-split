@@ -518,7 +518,9 @@ done
 rm -f "$TMP/bug6/uci.log"
 (
 	PATH="$TMP/bug6/fakebin:$TMP/fakebin:$PATH"
-	ISP_SPLIT_DESTDIR="$TMP/bug6/dest"
+	# A-10：teardown 的沙箱守卫要求 BASE 在 DESTDIR 子树内。这里只测
+	# 片段清理，DESTDIR 取 $TMP/bug6 即可让 BASE=$TMP/bug6/base 合法。
+	ISP_SPLIT_DESTDIR="$TMP/bug6"
 	ISP_SPLIT_CONF="$TMP/bug6/conf"
 	ISP_SPLIT_BASE="$TMP/bug6/base"
 	DNSMASQ_CONF_GLOB="$TMP/bug6/var/etc/dnsmasq.conf.*"
@@ -4692,7 +4694,7 @@ else
 fi
 # 反向：postrm 里的删除目标不许出现清单外的路径
 printf '%s\n' "$_f14_list" |
-	awk '$1 == "path" || $1 == "dir" || $1 == "glob" { print $2 }
+	awk '$1 == "path" || $1 == "dir" || $1 == "glob" || $1 == "base" { print $2 }
 	     $1 == "anchor" { $1 = ""; sub(/^ /, ""); print }' |
 	awk '{ print; print "/" $0 }' > "$F14/allow.txt"
 _extra=""
@@ -5416,7 +5418,7 @@ DNSDIR=/etc ISP_SPLIT_CONF="$A25/a05/conf" ISP_SPLIT_BASE="$A25/a05/base" \
 	DNSMASQ_CONF_GLOB="$A25/a05/no-such-conf.*"
 	DNSMASQ_DEFAULT_DIR="$A25/a05/root/tmp/dnsmasq.d"
 	export ISP_SPLIT_DESTDIR ISP_SPLIT_BASE DNSDIR DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
-	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" runtime
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" runtime --i-know-what-im-doing
 ) > "$A25/a05/teardown.log" 2>&1
 if [ "$_a25_a05_rc" -ne 0 ] && grep -q 'DNSDIR 非法' "$A25/a05/dns.log" &&
    [ -f "$A25/a05/root/etc/isp-split.conf" ]; then
@@ -5563,6 +5565,470 @@ if [ "$_a25_a08_ok" = "1" ]; then
 else
 	ng "A-08 health JSON 仍非法或含注入字段: $_a25_a08_json"
 fi
+
+echo "== 26. audit v2 安全修复第二批（A-09..A-14）"
+A26=$TMP/a26
+mkdir -p "$A26"
+
+# ---- A-09：export 的 README/数据文件预置 symlink，不得写穿 ----
+mkdir -p "$A26/a09/base/data" "$A26/a09/out"
+printf '1.0.1.0/24\n' > "$A26/a09/base/data/chinatelecom.txt"
+cat > "$A26/a09/conf" <<'A26_CONF'
+ISP_TABLE="chinatelecom:isp_tel:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A26_CONF
+printf 'VICTIM-README\n' > "$A26/a09/victim-readme"
+printf 'VICTIM-YAML\n' > "$A26/a09/victim-yaml"
+ln -s "$A26/a09/victim-readme" "$A26/a09/out/README-mihomo.txt"
+ln -s "$A26/a09/victim-yaml" "$A26/a09/out/isp-chinatelecom.yaml"
+ISP_SPLIT_CONF="$A26/a09/conf" ISP_SPLIT_BASE="$A26/a09/base" \
+	sh "$ROOT/files/usr/sbin/isp-split" export mihomo "$A26/a09/out" \
+	> "$A26/a09/export.log" 2>&1
+_a26_a09_rc=$?
+_a26_a09_ok=0
+if [ "$_a26_a09_rc" -eq 0 ] &&
+   [ "$(cat "$A26/a09/victim-readme")" = "VICTIM-README" ] &&
+   [ "$(cat "$A26/a09/victim-yaml")" = "VICTIM-YAML" ] &&
+   grep -q '^mihomo / OpenClash 用法' "$A26/a09/out/README-mihomo.txt" &&
+   grep -q 'payload:' "$A26/a09/out/isp-chinatelecom.yaml"; then
+	_a26_a09_ok=1
+fi
+if [ "$_a26_a09_ok" = "1" ]; then
+	ok "A-09 export 的 README/数据文件走原子落位，预置 symlink 未被写穿"
+else
+	ng "A-09 symlink 写穿或导出失败（rc=$_a26_a09_rc）: $(tail -2 "$A26/a09/export.log" | tr '\n' ' ')"
+fi
+# 目录 symlink -> /etc 必须在真实路径检查处被拒
+ln -s /etc "$A26/a09/link-to-etc"
+ISP_SPLIT_CONF="$A26/a09/conf" ISP_SPLIT_BASE="$A26/a09/base" \
+	sh "$ROOT/files/usr/sbin/isp-split" export mihomo "$A26/a09/link-to-etc" \
+	> "$A26/a09/link.log" 2>&1
+if [ $? -ne 0 ] && grep -q '拒绝导出到系统目录' "$A26/a09/link.log"; then
+	ok "A-09 输出目录真实路径为 /etc 时被拒（symlink 组件不能绕过黑名单）"
+else
+	ng "A-09 realpath 黑名单未生效: $(tail -2 "$A26/a09/link.log" | tr '\n' ' ')"
+fi
+
+# ---- A-10：BASE 守卫 + 清单随 BASE ----
+mkdir -p "$A26/a10"
+# 安全版事故重演：conf 故意不存在。守卫命中时会在读 conf 之前退出；
+# 即使守卫将来回归，缺少 conf 也会在 uninstall 动手之前退出，不会碰宿主 /etc。
+_a26_a10_main_bad=""
+for _a26_mb in /etc // /etc//; do
+	ISP_SPLIT_CONF="$A26/a10/no-such.conf" ISP_SPLIT_BASE=$_a26_mb \
+		sh "$ROOT/files/usr/sbin/isp-split" uninstall > "$A26/a10/etc-main.log" 2>&1
+	[ $? -ne 0 ] && grep -qE '系统目录|非法' "$A26/a10/etc-main.log" ||
+		_a26_a10_main_bad="$_a26_a10_main_bad $_a26_mb"
+done
+if [ -z "$_a26_a10_main_bad" ]; then
+	ok "A-10 ISP_SPLIT_BASE=/etc（含 //、/etc//）isp-split uninstall 被入口守卫拒绝"
+else
+	ng "A-10 主脚本未拒绝系统 BASE:$_a26_a10_main_bad"
+fi
+sed '/^# ---------------------------------------------------------------- main$/,$d' \
+	"$ROOT/files/usr/lib/isp-split/teardown.sh" > "$A26/a10/teardown-lib.sh"
+_a26_a10_bad=""
+for _a26_b in /etc /usr /var / /tmp // /etc//; do
+	if ( ISP_SPLIT_BASE=$_a26_b ISP_SPLIT_DESTDIR=; . "$A26/a10/teardown-lib.sh"; validate_base ) >/dev/null 2>&1; then
+		_a26_a10_bad="$_a26_a10_bad $_a26_b"
+	fi
+done
+if [ -z "$_a26_a10_bad" ]; then
+	ok "A-10 teardown validate_base 拒绝 /etc /usr /var / /tmp（含 //、/etc//）"
+else
+	ng "A-10 validate_base 漏放系统目录:$_a26_a10_bad"
+fi
+# 默认路径放行；自定义路径必须显式确认；沙箱必须在 DESTDIR 子树
+_a26_a10_ok=0
+( ISP_SPLIT_BASE=/etc/isp-split ISP_SPLIT_DESTDIR=; . "$A26/a10/teardown-lib.sh"; validate_base ) || _a26_a10_ok=1
+( ISP_SPLIT_BASE="$A26/a10/custom" ISP_SPLIT_DESTDIR=; . "$A26/a10/teardown-lib.sh"; validate_base ) && _a26_a10_ok=1
+( ISP_SPLIT_BASE="$A26/a10/custom" ISP_SPLIT_DESTDIR=; . "$A26/a10/teardown-lib.sh"; IWKD=1; validate_base ) || _a26_a10_ok=1
+if [ "$_a26_a10_ok" = "0" ]; then
+	ok "A-10 validate_base：默认放行 / 自定义需 --i-know-what-im-doing"
+else
+	ng "A-10 validate_base 放行策略异常"
+fi
+# 真实根上验证“无 flag 拒绝 / 有 flag 才动手”时，用假 rm 记录调用，
+# 绝不真的删宿主或 VM 上的 /usr/sbin/isp-split（A-10 事故就是这么发生的）。
+mkdir -p "$A26/a10/fakebin" "$A26/a10/custom/state"
+cat > "$A26/a10/fakebin/rm" <<'A26_RM'
+#!/bin/sh
+printf '%s\n' "$*" >> "${A26_RM_LOG:-/dev/null}"
+exit 0
+A26_RM
+chmod +x "$A26/a10/fakebin/rm"
+printf 'KEEP\n' > "$A26/a10/custom/state/x"
+: > "$A26/a10/rm-nof.log"
+PATH="$A26/a10/fakebin:$PATH" A26_RM_LOG="$A26/a10/rm-nof.log" \
+	ISP_SPLIT_BASE="$A26/a10/custom" \
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" files \
+	> "$A26/a10/custom-nof.log" 2>&1
+_a26_a10_rc1=$?
+: > "$A26/a10/rm-yes.log"
+PATH="$A26/a10/fakebin:$PATH" A26_RM_LOG="$A26/a10/rm-yes.log" \
+	ISP_SPLIT_BASE="$A26/a10/custom" \
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" files \
+	--i-know-what-im-doing > "$A26/a10/custom-yes.log" 2>&1
+_a26_a10_rc2=$?
+if [ "$_a26_a10_rc1" -ne 0 ] && [ ! -s "$A26/a10/rm-nof.log" ] &&
+   [ -d "$A26/a10/custom" ] && [ "$_a26_a10_rc2" -eq 0 ] &&
+   grep -Fq "$A26/a10/custom" "$A26/a10/rm-yes.log"; then
+	ok "A-10 自定义 BASE：无 flag 被拒且零删除；带 flag 才按 BASE 删除（假 rm 记录）"
+else
+	ng "A-10 自定义 BASE 行为异常（nof=$_a26_a10_rc1 yes=$_a26_a10_rc2 rm=$(tr '\n' ';' < "$A26/a10/rm-yes.log")）"
+fi
+# 沙箱里做一次真实删除：DESTDIR + 默认 BASE，验证清单与数据目录一起消失
+mkdir -p "$A26/a10/root/etc/isp-split/state" "$A26/a10/root/usr/sbin"
+printf 'KEEP\n' > "$A26/a10/root/etc/isp-split/state/x"
+: > "$A26/a10/root/usr/sbin/isp-split"
+ISP_SPLIT_DESTDIR="$A26/a10/root" \
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" files > "$A26/a10/sandbox.log" 2>&1
+_a26_a10_rc3=$?
+if [ "$_a26_a10_rc3" -eq 0 ] && [ ! -e "$A26/a10/root/etc/isp-split" ] &&
+   [ ! -e "$A26/a10/root/usr/sbin/isp-split" ]; then
+	ok "A-10 沙箱真实删除：DESTDIR 内数据目录与固定清单同时清空"
+else
+	ng "A-10 沙箱删除异常（rc=$_a26_a10_rc3）: $(tail -2 "$A26/a10/sandbox.log" | tr '\n' ' ')"
+fi
+if sh "$ROOT/files/usr/lib/isp-split/teardown.sh" --list 2>/dev/null | grep -q '^base /etc/isp-split$'; then
+	ok "A-10 --list 的数据目录随 BASE 推导（base /etc/isp-split）"
+else
+	ng "A-10 --list 未输出随 BASE 推导的数据目录"
+fi
+
+# ---- A-11：文档明示 ACL 授权面 + A-15 E() 语义 ----
+_a26_a11_bad=""
+[ -f "$ROOT/docs/SECURITY.md" ] || _a26_a11_bad="$_a26_a11_bad SECURITY.md"
+for _a26_p in '任意子命令' 'file exec' 'createTextNode' 'innerHTML' 'A-15' 'ISP_SPLIT_BASE=/etc'; do
+	grep -Fq -- "$_a26_p" "$ROOT/docs/SECURITY.md" 2>/dev/null ||
+		_a26_a11_bad="$_a26_a11_bad [$_a26_p]"
+done
+grep -Fq 'docs/SECURITY.md' "$ROOT/README.md" || _a26_a11_bad="$_a26_a11_bad README-link"
+grep -Fq 'ANY isp-split subcommand' "$ROOT/luci-app-isp-split/root/usr/share/rpcd/acl.d/luci-app-isp-split.json" ||
+	_a26_a11_bad="$_a26_a11_bad ACL-warning"
+if [ -z "$_a26_a11_bad" ]; then
+	ok "A-11 SECURITY.md/README/ACL 说明覆盖 write=任意子命令与 E() 文本节点"
+else
+	ng "A-11 安全文档缺项:$_a26_a11_bad"
+fi
+
+# ---- A-12：action 钉 SHA / job 级权限 / SDK sha256 ----
+_a26_a12_bad=""
+if awk '/uses:/ && $0 !~ /@[0-9a-f]{40}/ { bad=1 } END { exit(bad ? 1 : 0) }' \
+	"$ROOT/.github/workflows/release.yml"; then :; else
+	_a26_a12_bad="$_a26_a12_bad action-SHA"
+fi
+[ "$(grep -v '^[[:space:]]*#' "$ROOT/.github/workflows/release.yml" | grep -c 'contents: write')" = "1" ] ||
+	_a26_a12_bad="$_a26_a12_bad write-count"
+[ "$(grep -v '^[[:space:]]*#' "$ROOT/.github/workflows/release.yml" | grep -c 'contents: read')" = "1" ] ||
+	_a26_a12_bad="$_a26_a12_bad read-count"
+awk '/^  release:/{f=1} f && /contents: write/{found=1} END { exit(found ? 0 : 1) }' \
+	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad release-write"
+awk '/^  release:/{exit} /^[[:space:]]*#/{next} /contents: write/{early=1} END { exit(early ? 1 : 0) }' \
+	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad early-write"
+grep -q 'sha256sums' "$ROOT/scripts/build-apk.sh" &&
+	grep -q 'SDK sha256 校验失败' "$ROOT/scripts/build-apk.sh" ||
+	_a26_a12_bad="$_a26_a12_bad sdk-sha256"
+if [ -z "$_a26_a12_bad" ]; then
+	ok "A-12 action 全部 40 位 SHA、contents:write 只在 release job、SDK 有 sha256 校验"
+else
+	ng "A-12 CI/供应链加固缺项:$_a26_a12_bad"
+fi
+# 校验和清单解析：模拟上游 sha256sums 的 "*文件名" 写法
+_a26_sum=$(printf '%s\n' 'deadbeef *openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' |
+	awk -v f='openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' '$2 == f || $2 == "*" f { print $1; exit }')
+if [ "$_a26_sum" = "deadbeef" ]; then
+	ok "A-12 sha256sums 的 *文件名 解析路径命中"
+else
+	ng "A-12 sha256sums 解析失败: [$_a26_sum]"
+fi
+
+# ---- A-13：auto 仅 HTTPS 百度 / 体积上限 / 缓存 TSV 清洗 ----
+_a26_a13_bad=""
+grep -Fq '_provs="baidu"' "$ROOT/files/usr/sbin/isp-split" || _a26_a13_bad="$_a26_a13_bad auto-provider"
+grep -Fq 'baidu ip-api' "$ROOT/files/usr/sbin/isp-split" && _a26_a13_bad="$_a26_a13_bad auto-still-ip-api"
+grep -Fq -- "--proto '=https'" "$ROOT/files/usr/sbin/isp-split" || _a26_a13_bad="$_a26_a13_bad proto-https"
+grep -Fq -- '--max-filesize 131072' "$ROOT/files/usr/sbin/isp-split" || _a26_a13_bad="$_a26_a13_bad max-filesize"
+mkdir -p "$A26/a13/base/state"
+( ISP_SPLIT_CONF="$A26/a09/conf" ISP_SPLIT_BASE="$A26/a13/base"; export ISP_SPLIT_CONF ISP_SPLIT_BASE
+  . "$TMP/isp-lib.sh"
+  _c=$(_lc_geo_cache_clean "$(printf 'A\tB\nC')")
+  [ "$_c" = "A B C" ] || exit 1
+  _c=$(_lc_geo_cache_clean "$(printf '%0300d' 0)")
+  [ "${#_c}" -eq 200 ] || exit 1
+  LC_GEO=$STATE_DIR/linecheck.geo.tsv
+  _lc_geo_cache_put 1.2.3.4 baidu "$(printf 'X\tY\nZ')"
+  awk -F'\t' 'NF != 4 || $3 != "X Y Z" { bad=1 } END { exit(bad ? 1 : 0) }' "$LC_GEO" || exit 1
+  [ "$(wc -l < "$LC_GEO" | tr -d ' ')" = "1" ] || exit 1
+) >/dev/null 2>&1 || _a26_a13_bad="$_a26_a13_bad cache-clean"
+if [ -z "$_a26_a13_bad" ]; then
+	ok "A-13 auto 只走百度 HTTPS、响应限体积、缓存 TAB/换行被清洗且截断 200"
+else
+	ng "A-13 归属地链路加固缺项:$_a26_a13_bad"
+fi
+
+# ---- A-14：state/cache 700/600 ----
+mkdir -p "$A26/a14/base"
+cat > "$A26/a14/conf" <<'A26_CONF'
+ISP_TABLE=""
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+LINE_CHECK_GEO=0
+A26_CONF
+ISP_SPLIT_CONF="$A26/a14/conf" ISP_SPLIT_BASE="$A26/a14/base" \
+	ISP_SPLIT_LC_WANS="wan1|wan1|1|online|203.0.113.5" \
+	ISP_SPLIT_LC_EXIT_IPS="198.51.100.7" \
+	ISP_SPLIT_LC_LAT="dns=0.4,tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5" \
+	ISP_SPLIT_LC_FORCE_SAME=1 ISP_SPLIT_LC_NO_SOCAT=1 \
+	ISP_SPLIT_LC_RESOLVE_IPS="124.236.19.250" \
+	sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --force \
+	> "$A26/a14/lc.json" 2> "$A26/a14/lc.err"
+_a26_mode() { stat -c %a "$1" 2>/dev/null || ls -ld "$1" 2>/dev/null | awk '{ print $1 }'; }
+_a26_m_state=$(_a26_mode "$A26/a14/base/state")
+_a26_m_cache=$(_a26_mode "$A26/a14/base/state/linecheck")
+_a26_m_json=$(_a26_mode "$A26/a14/base/state/linecheck/last.json")
+case "$_a26_m_state" in 700 | drwx------) _a26_state_ok=1 ;; *) _a26_state_ok=0 ;; esac
+case "$_a26_m_cache" in 700 | drwx------) _a26_cache_ok=1 ;; *) _a26_cache_ok=0 ;; esac
+case "$_a26_m_json" in 600 | -rw-------) _a26_json_ok=1 ;; *) _a26_json_ok=0 ;; esac
+if [ "$_a26_state_ok" = "1" ] && [ "$_a26_cache_ok" = "1" ] && [ "$_a26_json_ok" = "1" ]; then
+	ok "A-14 state=700 / linecheck=700 / last.json=600（umask 077 + 落位 chmod）"
+else
+	ng "A-14 权限未收紧: state=$_a26_m_state cache=$_a26_m_cache json=$_a26_m_json"
+fi
+if grep -q 'chmod 700 /etc/isp-split/state' "$ROOT/scripts/install.sh" &&
+   grep -q 'chmod 700 /etc/isp-split/state' "$ROOT/files/etc/init.d/isp-split" &&
+   grep -q 'umask 077' "$ROOT/files/etc/init.d/isp-split" &&
+   grep -q 'chmod 600' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "A-14 install/init 安装时 chmod + 运行时 umask 077 双向落地"
+else
+	ng "A-14 安装/运行时权限修正缺失"
+fi
+
+echo "== 27. F-23 回显源国内化 / F-24b 按线测 DNS / A-15 XSS 回归"
+A27=$TMP/a27
+mkdir -p "$A27"
+
+# ---- F-23：默认源全 HTTPS、国内可达；文本提取；exit_probe ----
+_a27_bad=""
+grep -q '^LC_DEFAULT_ECHO=.*https://ip.3322.net' "$ROOT/files/usr/sbin/isp-split" || _a27_bad="$_a27_bad default-echo"
+grep -q '^LINE_CHECK_ECHO_URLS="https://ip.3322.net,https://myip.ipip.net,https://ddns.oray.com/checkip"' "$ROOT/files/etc/isp-split.conf" || _a27_bad="$_a27_bad conf-echo"
+for _a27_s in '当前 IP：198.51.100.9 来自于：中国 测试' 'Current IP Address: 203.0.113.7' '198.51.100.9'; do
+	_a27_ip=$( ISP_SPLIT_CONF="$A26/a09/conf" ISP_SPLIT_BASE="$A27/base"; export ISP_SPLIT_CONF ISP_SPLIT_BASE
+		. "$TMP/isp-lib.sh"; _lc_extract_ip "$_a27_s" )
+	case "$_a27_ip" in 198.51.100.9 | 203.0.113.7) ;; *) _a27_bad="$_a27_bad extract[$_a27_s=$_a27_ip]" ;; esac
+done
+mkdir -p "$A27/bin"
+cat > "$A27/bin/curl" <<'A27_CURL'
+#!/bin/sh
+url=""; out=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--url) url=$2; shift ;;
+	-o) out=$2; shift ;;
+	esac
+	shift
+done
+case "$url" in
+*bad*) echo "curl: (6) Could not resolve host: bad.example" >&2; echo "000 0.010"; exit 6 ;;
+*) printf '当前 IP：198.51.100.9 来自于：中国 测试' > "$out"; echo "200 0.120"; exit 0 ;;
+esac
+A27_CURL
+chmod +x "$A27/bin/curl"
+cat > "$A27/f23.conf" <<'A27_CONF'
+ISP_TABLE=""
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+LINE_CHECK_GEO=0
+LINE_CHECK_ECHO_URLS="https://bad.example/ip,https://good.example/ip"
+LINE_CHECK_UA="Mozilla/5.0"
+A27_CONF
+( PATH="$A27/bin:$PATH" ISP_SPLIT_CONF="$A27/f23.conf" ISP_SPLIT_BASE="$A27/f23-base"
+  export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE
+  . "$TMP/isp-lib.sh"
+  _lc_exit_ip wan1
+  printf '%s\n' "$LC_EXIT_IP" > "$A27/f23.ip"
+  printf '%s\n' "$LC_EXIT_PROBE" > "$A27/f23.probe"
+) >/dev/null 2>&1
+_a27_probe=$(cat "$A27/f23.probe" 2>/dev/null)
+if [ -z "$_a27_bad" ] && [ "$(cat "$A27/f23.ip" 2>/dev/null)" = "198.51.100.9" ] &&
+   printf '%s' "$_a27_probe" | grep -q '"http_code":0' &&
+   printf '%s' "$_a27_probe" | grep -q '"http_code":200' &&
+   printf '%s' "$_a27_probe" | grep -q 'Could not resolve host'; then
+	if command -v python3 >/dev/null 2>&1; then
+		printf '%s' "$_a27_probe" | python3 -c 'import json,sys; o=json.load(sys.stdin); assert len(o)==2; assert o[0]["ok"] is False; assert o[1]["ok"] is True' \
+			>/dev/null 2>&1 || _a27_bad="$_a27_bad probe-json"
+	else
+		printf '%s' "$_a27_probe" | grep -q '^\[{.*}\]$' || _a27_bad="$_a27_bad probe-json"
+	fi
+else
+	_a27_bad="$_a27_bad exit-probe"
+fi
+# 全失败时 exit_ok=false 且 exit_probe 非空（页面文案拆分的判据）
+sed 's#https://good.example/ip#https://also-bad.example/ip#' "$A27/f23.conf" > "$A27/f23bad.conf"
+( PATH="$A27/bin:$PATH" ISP_SPLIT_CONF="$A27/f23bad.conf" ISP_SPLIT_BASE="$A27/f23-base2"
+  export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE
+  . "$TMP/isp-lib.sh"
+  _lc_exit_ip wan1
+  printf '%s\n' "$LC_EXIT_IP" > "$A27/f23bad.ip"
+  printf '%s\n' "$LC_EXIT_PROBE" > "$A27/f23bad.probe"
+) >/dev/null 2>&1
+if [ -z "$(cat "$A27/f23bad.ip" 2>/dev/null)" ] &&
+   [ "$(cat "$A27/f23bad.probe" 2>/dev/null)" != "[]" ] &&
+   grep -q '回显源不可达（建议更换 LINE_CHECK_ECHO_URLS）' "$LUCI_R/view/isp-split/linecheck.js" &&
+   grep -q '未取到（可能未真正出网）' "$LUCI_R/view/isp-split/linecheck.js"; then
+	ok "F-23 默认源国内 HTTPS；逐 URL 记录 http_code/err/耗时；失败文案与“未出网”已拆分"
+else
+	ng "F-23 回显源/exit_probe/文案异常:$_a27_bad"
+fi
+# 端到端 JSON：exit_probe 必须出现在 last.json / --json 输出里
+mkdir -p "$A27/f23-lc/base"
+cat > "$A27/f23-lc/conf" <<'A27_CONF'
+ISP_TABLE=""
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+LINE_CHECK_GEO=0
+LINE_CHECK_ECHO_URLS="https://bad.example/ip,https://good.example/ip"
+LINE_CHECK_UA="Mozilla/5.0"
+A27_CONF
+( PATH="$A27/bin:$PATH"
+  ISP_SPLIT_CONF="$A27/f23-lc/conf" ISP_SPLIT_BASE="$A27/f23-lc/base"
+  ISP_SPLIT_LC_WANS="wan1|wan1|1|online|203.0.113.5"
+  ISP_SPLIT_LC_LAT="dns=0.4,tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5"
+  ISP_SPLIT_LC_FORCE_SAME=1 ISP_SPLIT_LC_NO_SOCAT=1
+  ISP_SPLIT_LC_STUN="ok:1.2.3.4:40000|ok:1.2.3.4:40000"
+  ISP_SPLIT_LC_RESOLVE_IPS="124.236.19.250"
+  export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LC_WANS ISP_SPLIT_LC_LAT 	ISP_SPLIT_LC_FORCE_SAME ISP_SPLIT_LC_NO_SOCAT ISP_SPLIT_LC_STUN ISP_SPLIT_LC_RESOLVE_IPS
+  sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --force
+) > "$A27/f23.json" 2>/dev/null
+if grep -q '"exit_ip":"198.51.100.9"' "$A27/f23.json" &&
+   grep -q '"exit_ok":true' "$A27/f23.json" &&
+   grep -q '"exit_probe":\[{"url":"https://bad.example/ip"' "$A27/f23.json"; then
+	ok "F-23 端到端 JSON 含 exit_probe（失败+成功两条），exit_ip/exit_ok 正常"
+else
+	ng "F-23 端到端 JSON 缺 exit_probe 或 exit_ip 异常"
+fi
+
+# 兼容旧 conf：安装脚本保留已存在的 conf（默认值变更不覆盖用户显式配置）
+if grep -q '保留现有 /etc/isp-split.conf 不覆盖' "$ROOT/scripts/install.sh"; then
+	ok "F-23 旧 conf 兼容：install.sh 保留用户已有配置，默认 ECHO 变更不覆盖"
+else
+	ng "F-23 install.sh 的旧 conf 保留约定丢失"
+fi
+
+# ---- F-24b：夹具 0.4 -> 400；缺失 -> null；"<1"；按线 DNS ----
+mkdir -p "$A27/f24/base"
+cat > "$A27/f24/conf" <<'A27_CONF'
+ISP_TABLE=""
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+LINE_CHECK_GEO=0
+A27_CONF
+_a27_lc() { # <lat> <out>
+	ISP_SPLIT_CONF="$A27/f24/conf" ISP_SPLIT_BASE="$A27/f24/base" \
+	ISP_SPLIT_LC_WANS="wan1|wan1|1|online|203.0.113.5" \
+	ISP_SPLIT_LC_EXIT_IPS="198.51.100.7" \
+	ISP_SPLIT_LC_LAT="$1" \
+	ISP_SPLIT_LC_FORCE_SAME=1 ISP_SPLIT_LC_NO_SOCAT=1 \
+	ISP_SPLIT_LC_STUN="ok:1.2.3.4:40000|ok:1.2.3.4:40000" \
+	ISP_SPLIT_LC_RESOLVE_IPS="124.236.19.250" \
+	sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --force > "$2" 2>/dev/null
+}
+_a27_lc "dns=0.4,tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5" "$A27/f24/dns04.json"
+_a27_lc "tcp=30,tls=40,ttfb=50,total=60,jitter=3,loss=0,http=200,attempts=5" "$A27/f24/dnsnull.json"
+if grep -q '"dns_ms":400' "$A27/f24/dns04.json" &&
+   ! grep -q '"dns_ms":0[,}]' "$A27/f24/dns04.json" &&
+   grep -q '"dns_scope":"local"' "$A27/f24/dns04.json" &&
+   grep -q '"dns_ms":null' "$A27/f24/dnsnull.json"; then
+	ok "F-24b 夹具 dns=0.4 -> 400ms；dns 缺失 -> null；0 不再作为哨兵"
+else
+	ng "F-24b dns_ms 夹具输出异常: dns04=$(grep -o '"dns_ms":[^,]*' "$A27/f24/dns04.json" 2>/dev/null) null=$(grep -o '"dns_ms":[^,]*' "$A27/f24/dnsnull.json" 2>/dev/null)"
+fi
+( ISP_SPLIT_CONF="$A27/f24/conf" ISP_SPLIT_BASE="$A27/f24/base"; export ISP_SPLIT_CONF ISP_SPLIT_BASE
+  . "$TMP/isp-lib.sh"
+  _v=$(_lc_sec_to_dns_ms 0.0004); [ "$_v" = "<1" ] || exit 1
+  _v=$(_lc_sec_to_dns_ms 0.4); [ "$_v" = "400" ] || exit 1
+  _v=$(_lc_sec_to_dns_ms ""); [ -z "$_v" ] || exit 1
+) >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+	ok "F-24b 秒->毫秒转换：0.0004 -> \"<1\"，0.4 -> 400，空 -> null"
+else
+	ng "F-24b 秒->毫秒转换异常"
+fi
+# 按线 DNS：夹具 DNS IP + 假 nslookup，确认 server 参数与 scope
+cat > "$A27/bin/nslookup" <<'A27_NS'
+#!/bin/sh
+printf '%s\n' "$*" >> "$A27_NS_LOG"
+echo "Server: 223.5.5.5"
+echo "Address: 223.5.5.5:53"
+echo "Name: $1"
+echo "Address: 1.2.3.4"
+exit 0
+A27_NS
+chmod +x "$A27/bin/nslookup"
+: > "$A27/nslookup.log"
+( PATH="$A27/bin:$PATH" A27_NS_LOG="$A27/nslookup.log"
+  ISP_SPLIT_CONF="$A27/f24/conf" ISP_SPLIT_BASE="$A27/f24/base"
+  ISP_SPLIT_LC_DNS_IP=223.5.5.5
+  export PATH A27_NS_LOG ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LC_DNS_IP
+  . "$TMP/isp-lib.sh"
+  LC_DNS_MS=""; LC_DNS_SCOPE=""; LC_DNS_SERVER=""
+  _lc_dns_ms wan1 baidu.com
+  printf '%s|%s|%s\n' "$LC_DNS_MS" "$LC_DNS_SCOPE" "$LC_DNS_SERVER" > "$A27/f24/perline.txt"
+) >/dev/null 2>&1
+_a27_pl=$(cat "$A27/f24/perline.txt" 2>/dev/null)
+case "$_a27_pl" in
+'<1|wan|223.5.5.5' | [0-9]*'|wan|223.5.5.5')
+	if grep -q 'baidu.com 223.5.5.5' "$A27/nslookup.log" &&
+	   grep -q 'v === .<1.' "$LUCI_R/view/isp-split/linecheck.js" &&
+	   grep -q "'<1ms'" "$LUCI_R/view/isp-split/linecheck.js"; then
+		ok "F-24b 按线 DNS：nslookup 使用该 WAN 的 DNS IP（scope=wan），fmtMs 支持 \"<1ms\""
+	else
+		ng "F-24b 按线 DNS 命中但 nslookup 参数/前端 fmtMs 异常"
+	fi
+	;;
+*)
+	ng "F-24b 按线 DNS 未命中夹具 server: $_a27_pl"
+	;;
+esac
+
+# ---- A-15 XSS 回归：node 渲染断言优先，否则静态 grep ----
+_a27_node=${NODE:-}
+[ -n "$_a27_node" ] || _a27_node=$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)
+if [ -n "$_a27_node" ]; then
+	if "$_a27_node" "$ROOT/tools/xss-render-check.js" > "$A27/xss-node.log" 2>&1; then
+		ok "A-15 node 渲染断言：伪造全字段 payload 只以文本节点出现，innerHTML 仅静态 SVG"
+	else
+		ng "A-15 node 渲染断言失败: $(tail -2 "$A27/xss-node.log" | tr '\n' ' ')"
+	fi
+else
+	_a27_xss_bad=""
+	for _a27_js in linecheck.js overview.js config.js; do
+		_a27_n=$(grep -c 'innerHTML' "$LUCI_R/view/isp-split/$_a27_js" 2>/dev/null)
+		case "$_a27_n" in '' | *[!0-9]*) _a27_n=0 ;; esac
+		[ "$_a27_n" -eq 1 ] || _a27_xss_bad="$_a27_xss_bad $_a27_js:innerHTML=$_a27_n"
+		grep 'innerHTML' "$LUCI_R/view/isp-split/$_a27_js" 2>/dev/null |
+			grep -q "'<svg" || _a27_xss_bad="$_a27_xss_bad $_a27_js:not-static"
+		grep 'innerHTML' "$LUCI_R/view/isp-split/$_a27_js" 2>/dev/null |
+			grep -Eq '(w|d|data|geo|nat|target|exit)[A-Za-z_]*\.' &&
+			_a27_xss_bad="$_a27_xss_bad $_a27_js:field-concat"
+	done
+	grep -q "E('span', {}, \[ exitText \])" "$LUCI_R/view/isp-split/linecheck.js" ||
+		_a27_xss_bad="$_a27_xss_bad exitText-E"
+	grep -q 'Array.isArray(w.exit_probe)' "$LUCI_R/view/isp-split/linecheck.js" ||
+		_a27_xss_bad="$_a27_xss_bad exit_probe"
+	if [ -z "$_a27_xss_bad" ]; then
+		ok "A-15 静态断言：三个 view 的 innerHTML 各仅 1 处且为静态 SVG，外网字段只经 E() 文本节点"
+	else
+		ng "A-15 XSS 静态断言失败:$_a27_xss_bad"
+	fi
+fi
+
 
 echo
 echo "通过 $pass 项，失败 $fail 项，跳过 $skipn 项"

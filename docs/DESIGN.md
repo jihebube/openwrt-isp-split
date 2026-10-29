@@ -192,11 +192,11 @@ UDP 3478 被阻断时只把 NAT 标“未知”，不影响延迟/归属地/评�
 ### 隐私边界
 
 归属地查询是唯一会发送**出口公网 IP** 的第三方请求，不发内网地址、设备名、
-MAC 或流量内容。默认百度（HTTPS）优先、ip-api（HTTP）兜底，按
-“IP + provider”缓存 24h。`LINE_CHECK_GEO=0` 只停止归属地查询；出口 IP 回显、
+MAC 或流量内容。默认只走百度（HTTPS），`auto` 不再自动转 ip-api；
+`ip-api` 仅作为显式选项（HTTP 明文）。按“IP + provider”缓存 24h。`LINE_CHECK_GEO=0` 只停止归属地查询；出口 IP 回显、
 STUN 与同网/基线延迟探测仍会连接各自服务器。要完全停止体检，用
 `LINE_CHECK_ENABLE=0`。关闭归属地后仍可用本地集合判断运营商大类。
-UI 与文档都显式写出“ip-api 使用 HTTP 不加密”。
+UI 与文档都显式写出“ip-api 使用 HTTP 不加密，且不是默认兜底”。
 
 ### 缓存与预算
 

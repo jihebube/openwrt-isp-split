@@ -6,6 +6,8 @@ cd "$(dirname "$0")/.."
 cp -f files/usr/sbin/isp-split          feed/op-packages/isp-split/files/usr/sbin/isp-split
 cp -f files/etc/isp-split.conf          feed/op-packages/isp-split/files/etc/isp-split.conf 2>/dev/null || true
 cp -f files/etc/init.d/isp-split        feed/op-packages/isp-split/files/etc/init.d/isp-split 2>/dev/null || true
+mkdir -p feed/op-packages/isp-split/files/etc/uci-defaults
+cp -f files/etc/uci-defaults/99-isp-split feed/op-packages/isp-split/files/etc/uci-defaults/99-isp-split 2>/dev/null || true
 mkdir -p feed/op-packages/isp-split/files/usr/lib/isp-split
 # 数据管线与体检运行时的全部文件：下方逐字节校验覆盖 build.sh/*.awk，
 # 只拷 lc-run 会让 build.sh 在改版后悄悄漂移（cmp 失败才暴露）。
@@ -33,6 +35,7 @@ sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" feed/op-packages/isp-split/Makefile
 # 逐字节校验：feed 里的运行时代码必须与主源码完全相同（版本号在 Makefile 里单独对齐）。
 _bad=0
 for f in usr/sbin/isp-split etc/isp-split.conf etc/init.d/isp-split \
+         etc/uci-defaults/99-isp-split \
          usr/lib/isp-split/teardown.sh \
          usr/lib/isp-split/lc-run usr/lib/isp-split/build.sh \
          usr/lib/isp-split/cidr2range.awk usr/lib/isp-split/merge.awk \

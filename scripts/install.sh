@@ -122,7 +122,12 @@ if [ "$FEATURE_LINECHECK" != "1" ]; then
 		LUCI_SRC=$STAGE/luci
 	fi
 fi
-mkdir -p /usr/sbin /usr/lib/isp-split /etc/init.d /etc/isp-split/data
+mkdir -p /usr/sbin /usr/lib/isp-split /etc/init.d /etc/isp-split/data /etc/isp-split/state
+# A-14：state 里含公网 IP/归属地/STUN 映射，安装时就收紧；升级前已存在的
+# 旧目录/旧缓存也在这一步纠正，不能只依赖运行时 umask。
+chmod 700 /etc/isp-split/state 2>/dev/null || true
+find /etc/isp-split/state -type f -exec chmod 600 {} + 2>/dev/null || \
+	chmod 600 /etc/isp-split/state/* 2>/dev/null || true
 cp -f "$SRC/usr/sbin/isp-split" /usr/sbin/isp-split
 cp -f "$SRC/usr/lib/isp-split/"*.awk "$SRC/usr/lib/isp-split/build.sh" /usr/lib/isp-split/
 # F-14：卸载清理的唯一实现必须跟着装进设备——`isp-split uninstall` 靠它，
