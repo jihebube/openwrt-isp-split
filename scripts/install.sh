@@ -159,7 +159,11 @@ install_luci() {
 	mkdir -p /www/luci-static/resources/isp-split/logos
 	cp -f "$L/htdocs/luci-static/resources/isp-split/"*.css \
 		/www/luci-static/resources/isp-split/ 2>/dev/null || true
-	cp -f "$L/htdocs/luci-static/resources/isp-split/logos/"*.svg \
+	# 0.3.1 起 logo 换成官方风格 PNG（文件名不变，只改扩展名）。
+	# 先清旧 SVG：cp 只覆盖同名文件，0.3.0 装过的机器会同时留着三张 SVG，
+	# logos 目录两套素材并存，排查时很容易看错用的是哪一份。
+	rm -f /www/luci-static/resources/isp-split/logos/*.svg
+	cp -f "$L/htdocs/luci-static/resources/isp-split/logos/"*.png \
 		/www/luci-static/resources/isp-split/logos/ 2>/dev/null || true
 	cp -f "$L/htdocs/luci-static/resources/view/isp-split/overview.js" \
 		"$L/htdocs/luci-static/resources/view/isp-split/config.js" \
@@ -179,7 +183,7 @@ install_luci() {
 	# 权限归一化：cp -f 会继承源文件权限位。工作区里若被改成 0600，
 	# 装到设备上 uhttpd 读不了 → 静态资源 403、页面裸奔（0.3.0 实测踩到）。
 	chmod 644 /www/luci-static/resources/isp-split/*.css 2>/dev/null || true
-	chmod 644 /www/luci-static/resources/isp-split/logos/*.svg 2>/dev/null || true
+	chmod 644 /www/luci-static/resources/isp-split/logos/*.png 2>/dev/null || true
 	chmod 644 /www/luci-static/resources/view/isp-split/*.js 2>/dev/null || true
 	chmod 644 /usr/share/luci/menu.d/luci-app-isp-split*.json 2>/dev/null || true
 	chmod 644 /usr/share/rpcd/acl.d/luci-app-isp-split.json 2>/dev/null || true

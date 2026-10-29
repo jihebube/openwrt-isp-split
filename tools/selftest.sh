@@ -5027,6 +5027,148 @@ else
 	ng "23.8 集合缺失被当成普通未命中（rc=$_v23_ns）"
 fi
 
+echo "== 24. 状态页方案 B（0.3.1：PNG logo / 44px 左置 / cernet 退场 / 兜底进格子）"
+# 本节的定位：这些都不是"能跑就行"的行为，而是**发货素材与前端引用的一致性**。
+# 最容易出的错是"换了图但忘改引用"或"引用改了但包没装图"——两者在浏览器里
+# 都只表现为一个裂图标，服务端 404 而页面不报错，靠人眼在截图里发现。
+LUCI_R=$ROOT/luci-app-isp-split/htdocs/luci-static/resources
+LOGO=$LUCI_R/isp-split/logos
+OV=$LUCI_R/view/isp-split/overview.js
+LC=$LUCI_R/view/isp-split/linecheck.js
+FEED_LUCI=$ROOT/feed/op-packages/luci-app-isp-split/htdocs/luci-static/resources
+
+# 24.1 三张 PNG 到位：存在 + 单文件 ≤20KB + magic 是 PNG
+#      magic 直接读前 8 字节（89 50 4E 47 0D 0A 1A 0A），不靠扩展名——
+#      "把 SVG 改名成 .png"这种事故，只看文件名是查不出来的。
+_lg_bad=""
+# PNG 的 8 字节签名：89 50 4E 47 0D 0A 1A 0A。
+# 不用 od/hexdump 拼十六进制：busybox 与 GNU 的 -t 写法/分隔不同（VM 上
+# `od -An -tx1` 直接空输出，断言会误报"非PNG"）。head -c + cmp 两端行为一致。
+printf '\211PNG\r\n\032\n' > "$TMP/png.magic"
+for _f in logo-chinatelecom.png logo-unicom.png logo-mobile.png; do
+	_p=$LOGO/$_f
+	if [ ! -f "$_p" ]; then
+		_lg_bad="$_lg_bad 缺$_f"
+		continue
+	fi
+	_sz=$(wc -c < "$_p" | tr -d ' ')
+	[ "$_sz" -le 20480 ] || _lg_bad="$_lg_bad ${_f}=${_sz}B>20480"
+	head -c 8 "$_p" | cmp -s - "$TMP/png.magic" ||
+		_lg_bad="$_lg_bad ${_f}=magic非PNG"
+done
+if [ -z "$_lg_bad" ]; then
+	ok "24.1 logos/ 三张 PNG 存在、单文件 ≤20KB、magic=PNG"
+else
+	ng "24.1 logo 素材不合格:$_lg_bad"
+fi
+
+# 24.2 logos/ 只剩这一套素材：0 个 SVG，且不多不少正好 3 个文件
+if [ ! -e "$LOGO/logo-chinatelecom.svg" ] && [ ! -e "$LOGO/logo-unicom.svg" ] &&
+   [ ! -e "$LOGO/logo-mobile.svg" ] &&
+   [ "$(ls "$LOGO" | grep -c '\.svg$')" -eq 0 ] && [ "$(ls "$LOGO" | wc -l | tr -d ' ')" -eq 3 ]; then
+	ok "24.2 logos/ 旧 SVG 已删除，只剩 3 个 PNG"
+else
+	ng "24.2 logos/ 仍有残留（svg=$(ls "$LOGO" | grep -c '\.svg$') 个，共 $(ls "$LOGO" | wc -l | tr -d ' ') 个文件）"
+fi
+
+# 24.3 BRAND_LOGO 引用与文件一致：两个页面里的 logo-*.png 全部落盘、
+#      引用集合与 logos/ 实际清单完全相同、且没有任何 .svg 引用
+_bl_bad=""
+for _js in "$OV" "$LC"; do
+	_refs=$(grep -o 'logo-[a-z]*\.\(png\|svg\)' "$_js" | sort -u)
+	if [ -z "$_refs" ]; then
+		_bl_bad="$_bl_bad $(basename "$_js")=无logo引用"
+		continue
+	fi
+	for _r in $_refs; do
+		case "$_r" in
+		*.svg) _bl_bad="$_bl_bad $(basename "$_js"):$_r(仍是SVG)" ;;
+		*) [ -f "$LOGO/$_r" ] || _bl_bad="$_bl_bad $(basename "$_js"):$_r(文件不存在)" ;;
+		esac
+	done
+	[ "$_refs" = "$(ls "$LOGO" | sort -u)" ] ||
+		_bl_bad="$_bl_bad $(basename "$_js"):引用集合≠logos/清单"
+done
+if [ -z "$_bl_bad" ]; then
+	ok "24.3 BRAND_LOGO 引用与 logos/ 文件一一对应（overview.js + linecheck.js，无 SVG）"
+else
+	ng "24.3 logo 引用与文件不一致:$_bl_bad"
+fi
+
+# 24.4 cernet 退场（纯 UI）+ 兜底卡进网格：静态断言
+#      · cernet 过滤条件按 src 判（ISP_TABLE 里集合名可改，src 不可改）
+#      · #isp-fallback 只应出现 1 次：它现在由 paintOps 建在运营商网格里，
+#        若又回到独立大卡，两处会同时存在（第一处渲染成功、第二处空转）
+_ov_fb=$(grep -c "id': 'isp-fallback'" "$OV")
+if grep -q "r.src === 'cernet'" "$OV" &&
+   grep -q "isp-card-fb" "$OV" &&
+   grep -q "net:" "$OV" &&
+   [ "$_ov_fb" -eq 1 ]; then
+	ok "24.4 cernet 在状态页被过滤（后端数据行保留），兜底卡并入运营商网格（#isp-fallback ×1）"
+else
+	ng "24.4 cernet 过滤或兜底卡合并缺失（#isp-fallback 出现 $_ov_fb 次）"
+fi
+
+# 24.5 卡头 44px 左置：两个页面同一个 HEAD_ICO，CSS 里图标位是 44×44 的固定盒
+#      （左置 = .isp-card-head 不再 space-between；图标盒 flex: 0 0 44px）
+_css=$LUCI_R/isp-split/isp-split.css
+if grep -q 'HEAD_ICO = 44' "$OV" && grep -q 'HEAD_ICO = 44' "$LC" &&
+   grep -q 'flex: 0 0 44px' "$_css" &&
+   grep -q '^\.lc-head-ico' "$_css" &&
+   awk '/^\.isp-card-head /,/^}/' "$_css" | grep -q 'justify-content: flex-start' &&
+   ! awk '/^\.isp-card-head /,/^}/' "$_css" | grep -q 'space-between'; then
+	ok "24.5 卡头 44px 左置（isp-card-head / lc-head-ico，logo 与 glyph 同尺寸）"
+else
+	ng "24.5 卡头左置 44px 未落实"
+fi
+
+# 24.6 打包面跟着改：4 个 Makefile 的 install 规则装 *.png（留 *.svg 会装出空目录），
+#      install.sh 同步 PNG 并清掉旧 SVG（升级路径）
+_mk_bad=""
+for _f in luci-app-isp-split/Makefile feed/op-packages/luci-app-isp-split/Makefile; do
+	grep -q 'logos/\*\.png' "$ROOT/$_f" || _mk_bad="$_mk_bad $_f"
+	grep -q 'logos/\*\.svg' "$ROOT/$_f" && _mk_bad="$_mk_bad $_f(仍svg)"
+done
+grep -q 'logos/"\*\.png' "$ROOT/scripts/install.sh" || _mk_bad="$_mk_bad install.sh"
+grep -q 'logos/\*\.svg' "$ROOT/scripts/install.sh" ||
+	_mk_bad="$_mk_bad install.sh(无旧SVG清理)"
+if [ -z "$_mk_bad" ]; then
+	ok "24.6 打包/安装面装 PNG 并清理旧 SVG（Makefile×2 + install.sh）"
+else
+	ng "24.6 打包面未跟上换图:$_mk_bad"
+fi
+
+# 24.7 feed 侧 PNG 与主源码逐字节一致（发布物走 feed 构建，二进制漂移最难发现）
+_fd_bad=""
+for _f in logo-chinatelecom.png logo-unicom.png logo-mobile.png; do
+	cmp -s "$LOGO/$_f" "$FEED_LUCI/isp-split/logos/$_f" || _fd_bad="$_fd_bad $_f"
+done
+[ -e "$FEED_LUCI/isp-split/logos/logo-chinatelecom.svg" ] && _fd_bad="$_fd_bad feed残留SVG"
+if [ -z "$_fd_bad" ]; then
+	ok "24.7 feed/op-packages 的 logo PNG 与主源码逐字节一致（无 SVG 残留）"
+else
+	ng "24.7 feed 侧 logo 不一致:$_fd_bad"
+fi
+
+# 24.8 三个 LuCI 页仍能被 JS 引擎解析（换卡头动了 DOM 构造，语法错会白屏）
+#      有 node 才跑；VM 上没有 node，按 skip 记，不伪装成通过。
+_node=${NODE:-}
+[ -n "$_node" ] || _node=$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)
+if [ -n "$_node" ]; then
+	_js_bad=""
+	for _f in overview.js config.js linecheck.js; do
+		"$_node" --check "$LUCI_R/view/isp-split/$_f" >/dev/null 2>&1 ||
+			_js_bad="$_js_bad $_f"
+	done
+	if [ -z "$_js_bad" ]; then
+		ok "24.8 overview.js / config.js / linecheck.js 全部通过 node --check"
+	else
+		ng "24.8 node --check 失败:$_js_bad"
+	fi
+else
+	skip "24.8 node --check（环境里没有 node/nodejs）"
+fi
+
 echo
 echo "通过 $pass 项，失败 $fail 项，跳过 $skipn 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then

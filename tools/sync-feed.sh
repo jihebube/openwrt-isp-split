@@ -20,6 +20,10 @@ cp -f strip-linecheck.sh                feed/op-packages/isp-split/strip-lineche
 cp -f luci-app-isp-split/strip-linecheck.sh feed/op-packages/luci-app-isp-split/strip-linecheck.sh
 # LuCI：整树对齐（排除 feed 侧不需要的内容）
 cp -rf luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/. feed/op-packages/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/ 2>/dev/null || true
+# logo 由 SVG 换 PNG：cp -rf 只增不删，feed 侧会留着 0.3.0 的三张 SVG。
+# 显式清掉，保证 feed 里 logos/ 只有当前这一套素材（包 Makefile 只装 *.png，
+# 残留虽不影响产物，但会让 feed 目录看起来"两套并存"而误导排查）。
+rm -f feed/op-packages/luci-app-isp-split/htdocs/luci-static/resources/isp-split/logos/*.svg
 cp -rf luci-app-isp-split/htdocs/luci-static/resources/isp-split/. feed/op-packages/luci-app-isp-split/htdocs/luci-static/resources/isp-split/ 2>/dev/null || true
 cp -rf luci-app-isp-split/root/. feed/op-packages/luci-app-isp-split/root/ 2>/dev/null || true
 # feed Makefile 的版本跟主 Makefile 走（PKG_RELEASE 由 kiddin9 sync 自动改写，这里不管）
@@ -46,6 +50,14 @@ for f in htdocs/luci-static/resources/view/isp-split/overview.js \
          root/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json \
          root/usr/share/rpcd/acl.d/luci-app-isp-split.json; do
 	cmp -s "luci-app-isp-split/$f" "feed/op-packages/luci-app-isp-split/$f" || { echo "不一致: $f" >&2; _bad=1; }
+done
+# 0.3.1：运营商 logo 从 SVG 换成 PNG，二进制也必须逐字节一致（cmp 对二进制同样适用）。
+# 用显式清单而不是通配：漏拷一张只会在路由器上表现为"某家运营商图标 404"，
+# 前端没有任何兜底提示，最容易漏进发布。
+for f in logo-chinatelecom.png logo-unicom.png logo-mobile.png; do
+	cmp -s "luci-app-isp-split/htdocs/luci-static/resources/isp-split/logos/$f" \
+		"feed/op-packages/luci-app-isp-split/htdocs/luci-static/resources/isp-split/logos/$f" ||
+		{ echo "不一致: logos/$f" >&2; _bad=1; }
 done
 # 剥离脚本：仓库两份副本 + feed 两份，全部与 scripts/strip-linecheck.sh 逐字节一致
 for f in ./strip-linecheck.sh \

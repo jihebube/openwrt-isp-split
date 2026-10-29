@@ -49,7 +49,7 @@ define Package/luci-app-isp-split/install
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/isp-split/isp-split.css \
 		$(1)/www/luci-static/resources/isp-split/isp-split.css
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/isp-split/logos
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/isp-split/logos/*.svg \
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/isp-split/logos/*.png \
 		$(1)/www/luci-static/resources/isp-split/logos/
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/isp-split/overview.js \
 		$(1)/www/luci-static/resources/view/isp-split/overview.js
