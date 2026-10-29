@@ -43,8 +43,11 @@ fi
 cd "$WORK/sdk"
 
 # 2) 放入软件包（仓库根目录即包目录）
+# Build/Prepare 调 $(CURDIR)/strip-linecheck.sh：包目录必须自带这份脚本，
+# 所以主包这里显式复制（LuCI 包目录本来就整目录带过去）。
+rm -rf package/isp-split package/luci-app-isp-split
 mkdir -p package/isp-split
-cp -r "$ROOT"/Makefile "$ROOT"/files package/isp-split/
+cp -r "$ROOT"/Makefile "$ROOT"/files "$ROOT"/strip-linecheck.sh package/isp-split/
 mkdir -p package/luci-app-isp-split
 cp -r "$ROOT"/luci-app-isp-split/. package/luci-app-isp-split/
 

@@ -43,45 +43,53 @@ jobs:
           find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
           ls -lh out
 
-      - name: 零残留断言（产物里不得有 linecheck 痕迹）
+      - name: 零残留断言（ipk + apk 容器；未知格式显式失败）
         run: |
           set -eu
-          for ipk in out/*.ipk; do
-            [ -f "$ipk" ] || continue
-            d=$(mktemp -d)
-            # 容器嗅探：23.05/24.10 官方 ipk 是 gzip 包裹的 tar（1f 8b），
-            # 成员为 ./debian-binary ./control.tar.gz ./data.tar.gz；
-            # 历史格式才是明文 ar（!<arch>）。只写一种读法必然误杀另一种。
-            magic=$(od -An -tx1 -N4 "$ipk" | tr -d ' \n')
-            case "$magic" in
-              1f8b*)
-                tar xzf "$ipk" -C "$d"
-                if [ ! -f "$d/data.tar.gz" ]; then
-                  echo "::error::$ipk 是 gzip-tar，但外层没有 data.tar.gz"
-                  exit 1
-                fi
-                ;;
-              213c6172)
-                # 明文 ar：!<ar
-                ar p "$ipk" data.tar.gz > "$d/data.tar.gz"
-                [ -s "$d/data.tar.gz" ] || {
-                  echo "::error::$ipk 是 ar 容器，但取不到 data.tar.gz"
-                  exit 1
-                }
-                ;;
-              *)
-                echo "::error::$ipk 未知容器格式（magic=$magic），拒绝静默跳过"
-                exit 1
-                ;;
-            esac
-            mkdir -p "$d/payload"
-            tar xzf "$d/data.tar.gz" -C "$d/payload"
-            if grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$d/payload"; then
-              echo "::error::$ipk 仍含 linecheck 残留"
-              exit 1
-            fi
-            rm -rf "$d"
+          # F8：25.12 job 只产 .apk，旧循环 glob 的是 out/*.ipk，于是循环空转、
+          # “通过”是假的（run 40827542758 / 40830192705 两次都这样）。
+          # 第一步先按分支钉死预期格式，缺了就报错，不允许真空通过。
+          case "${{ matrix.branch }}" in
+            25.12*) want=apk ;;
+            24.10*) want=ipk ;;
+            *) echo "::error::未知分支 ${{ matrix.branch }}，无法确定预期包格式"; exit 1 ;;
+          esac
+          ls out/*."$want" >/dev/null 2>&1 || {
+            echo "::error::${{ matrix.branch }} 没有产出 .$want，断言会真空通过"
+            exit 1
+          }
+          # LuCI 包是 CSS 泄漏（F7）唯一的载体。它要是没产出，断言就失去覆盖面。
+          ls out/luci-app-isp-split* >/dev/null 2>&1 || {
+            echo "::error::${{ matrix.branch }} 没有产出 luci-app-isp-split 包，CSS 断言面无产物"
+            exit 1
+          }
+          set --
+          for f in out/*.ipk out/*.apk; do
+            [ -f "$f" ] || continue
+            set -- "$@" "$f"
           done
+          # 容器嗅探 / 解包 / 零残留（含 CSS `.lc-*`）都在脚本里逐例判定，
+          # 未知容器格式或解不出来都会非零退出，不会再静默跳过。
+          sh scripts/verify-package-payload.sh verify "$@"
+
+      - name: 脚本路径产物 vs SDK 路径产物 payload 恒等
+        run: |
+          set -eu
+          # 本次教训：本地路径全绿 ≠ SDK 路径绿。同一份源码两条构建路径，
+          # payload 必须逐文件一致；不一致就是又分叉了（F7 的本质）。
+          sh scripts/build-ipk.sh
+          VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -1)
+          REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -1)
+          local_main="dist/isp-split_${VER}-${REL}_all.ipk"
+          local_luci="dist/luci-app-isp-split_${VER}-${REL}_all.ipk"
+          sdk_main=$(ls out/isp-split* | head -1)
+          test -f "$local_main"
+          echo "parity main: $sdk_main <-> $local_main"
+          sh scripts/verify-package-payload.sh parity "$sdk_main" "$local_main"
+          sdk_luci=$(ls out/luci-app-isp-split* | head -1)
+          test -f "$local_luci"
+          echo "parity luci: $sdk_luci <-> $local_luci"
+          sh scripts/verify-package-payload.sh parity "$sdk_luci" "$local_luci"
 
       - uses: actions/upload-artifact@v4
         with:

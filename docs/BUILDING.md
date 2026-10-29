@@ -147,9 +147,20 @@ FEATURE_LINECHECK=1 sh scripts/build-apk.sh 25.12.6 x86/64
 ```
 
 剥离由源文件里的 `lc:begin` / `lc:end` 标记驱动，`scripts/strip-linecheck.sh`
-统一执行（SDK 的 `Build/Prepare` 用同一套 sed 规则）。产物必须通过
-`tools/selftest.sh` 第 19 节：文件清单无 `linecheck.js`、menu 子节点=2、
-control `Depends` 无 `socat`、grep 零残留、被剥离的 CLI 固定拒绝文案。
+是**唯一**实现：手工打包直接调用它，两份 `Build/Prepare`（主包 / LuCI 包）也
+调用包目录里逐字节一致的副本 `$(CURDIR)/strip-linecheck.sh`——不再手抄 sed。
+标记必须包住内容本体，CSS 的 `.lc-*` 样式体整段在标记内（只包标题注释等于
+没包，0.2.3 的泄漏就是这么来的）。
+
+产物必须同时通过：
+
+- `tools/selftest.sh` 第 19 节：文件清单无 `linecheck.js`、menu 子节点=2、
+  control `Depends` 无 `socat`、grep 零残留、被剥离的 CLI 固定拒绝文案；
+- `scripts/verify-package-payload.sh verify`：按容器魔数嗅探 ipk（gzip-tar /
+  ar）与 apk（ADB，`ADBd`），逐个解包后断言零残留且 CSS 无 `.lc-*`；未知
+  容器显式失败，绝不在空 glob 上“通过”；
+- `scripts/verify-package-payload.sh parity`：本地脚本路径产物与 SDK 路径
+  产物 payload 必须逐文件一致（本地绿 ≠ SDK 绿）。
 
 > 0.2.3 不发布“源码 tarball”，只发运行时 install 包与 ipk/apk；
 > 0.3.0 起恢复完整源码包。

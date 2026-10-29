@@ -37,12 +37,19 @@ mkdir -p "$STAGE"
 if [ "$FEATURE_LINECHECK" = "1" ]; then
 	cp -a Makefile LICENSE README.md .gitignore "$STAGE/" 2>/dev/null || true
 	cp -a files scripts docs luci-app-isp-split tools "$STAGE/"
+	# 主包 Build/Prepare 用 $(CURDIR)/strip-linecheck.sh，包目录必须自带
+	cp -a strip-linecheck.sh "$STAGE/"
 	# 去掉不该分发的本地文件
 	rm -rf "$STAGE/tools/fixtures" 2>/dev/null || true
 	TARBALL=$OUT/$NAME.tar.gz
 else
 	# 0 版不发源码包：只发运行时 + 安装脚本，且运行时已物理剥离。
-	cp -a files luci-app-isp-split LICENSE "$STAGE/"
+	# LuCI 只暂存会被安装的 htdocs/root：包目录里的 Makefile 与
+	# strip-linecheck.sh 自带 `lc:begin` / linecheck 字样，整目录剥离会被
+	# 自己的零残留断言误杀。
+	cp -a files LICENSE "$STAGE/"
+	mkdir -p "$STAGE/luci-app-isp-split"
+	cp -a luci-app-isp-split/htdocs luci-app-isp-split/root "$STAGE/luci-app-isp-split/"
 	mkdir -p "$STAGE/scripts"
 	cp -a scripts/install.sh "$STAGE/scripts/"
 	sh "$ROOT/scripts/strip-linecheck.sh" "$STAGE/files" >/dev/null

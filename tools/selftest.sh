@@ -3413,6 +3413,9 @@ fi
 # 19.8 LuCI 面：menu 子节点 == 2，无体检页/节点文件
 cp "$ROOT"/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/*.js \
 	"$F30/luci/www/luci-static/resources/view/isp-split/" 2>/dev/null || true
+mkdir -p "$F30/luci/www/luci-static/resources/isp-split"
+cp "$ROOT"/luci-app-isp-split/htdocs/luci-static/resources/isp-split/isp-split.css \
+	"$F30/luci/www/luci-static/resources/isp-split/" 2>/dev/null || true
 cp "$ROOT"/luci-app-isp-split/root/usr/share/luci/menu.d/*.json "$F30/luci/usr/share/luci/menu.d/"
 cp "$ROOT"/luci-app-isp-split/root/usr/share/rpcd/acl.d/*.json "$F30/luci/usr/share/rpcd/acl.d/"
 sh "$ROOT/scripts/strip-linecheck.sh" "$F30/luci" >/dev/null 2>&1
@@ -3595,6 +3598,104 @@ if ! grep -q 'linecheck' "$ROOT/files/etc/init.d/isp-split" \
 	ok "19.14 init / uci-defaults / cron 无体检联动（无定时探测）"
 else
 	ng "19.14 init/cron 出现 linecheck 联动"
+fi
+
+# 19.15 剥离实现单一来源（F7）：仓库两份 + feed 两份，逐字节一致
+_bad_strip=""
+for _s in "$ROOT/strip-linecheck.sh" \
+          "$ROOT/luci-app-isp-split/strip-linecheck.sh" \
+          "$ROOT/feed/op-packages/isp-split/strip-linecheck.sh" \
+          "$ROOT/feed/op-packages/luci-app-isp-split/strip-linecheck.sh"; do
+	if [ ! -f "$_s" ]; then
+		_bad_strip="$_bad_strip 缺:$_s"
+	elif ! cmp -s "$ROOT/scripts/strip-linecheck.sh" "$_s"; then
+		_bad_strip="$_bad_strip 异:$_s"
+	fi
+done
+if [ -z "$_bad_strip" ]; then
+	ok "19.15 剥离脚本单一来源：仓库 2 份 + feed 2 份与 scripts/strip-linecheck.sh 逐字节一致"
+else
+	ng "19.15 剥离脚本副本漂移：$_bad_strip"
+fi
+
+# 19.16 两个 Makefile 的 Build/Prepare 必须调用同一份脚本，不许再手抄 sed
+if grep -q "sed -i '/lc:begin" "$ROOT/Makefile" "$ROOT/luci-app-isp-split/Makefile" 2>/dev/null; then
+	ng "19.16 Makefile 仍在手抄 sed 剥离（F7 的分叉源）"
+elif grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/Makefile" &&
+     grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/luci-app-isp-split/Makefile"; then
+	ok "19.16 主/luci Makefile 的 Build/Prepare 都调用 \$(CURDIR)/strip-linecheck.sh"
+else
+	ng "19.16 Makefile 没有调用统一的剥离脚本"
+fi
+
+# 19.17 CSS 样式体必须随标记一起消失（19.8 已经剥离过 LuCI 树）
+_css=$F30/luci/www/luci-static/resources/isp-split/isp-split.css
+_css_o=$(tr -cd '{' <"$_css" 2>/dev/null | wc -c | tr -d ' \n')
+_css_c=$(tr -cd '}' <"$_css" 2>/dev/null | wc -c | tr -d ' \n')
+if [ -f "$_css" ] && ! grep -q '\.lc-' "$_css" && [ "$_css_o" = "$_css_c" ]; then
+	ok "19.17 剥离后 isp-split.css 无 .lc-* 样式且花括号平衡"
+else
+	ng "19.17 剥离后 CSS 仍含 .lc-* 或规则体被切坏"
+fi
+
+# 19.18 反向：旧式“标记只包标题注释”必须被 strip 拒绝（F7 回归用例）
+mkdir -p "$F30/cssneg"
+cat > "$F30/cssneg/isp-split.css" <<'EOF'
+.isp-card { color: red; }
+
+/* lc:begin */
+/* 线路体检（0.3.0） */
+/* lc:end */
+
+.lc-cards { display: block; }
+EOF
+if sh "$ROOT/scripts/strip-linecheck.sh" "$F30/cssneg" >"$F30/cssneg.log" 2>&1; then
+	ng "19.18 旧式“只包标题”的 CSS 没有被拦截（.lc-* 会裸奔进包）"
+elif grep -q '\.lc-' "$F30/cssneg.log"; then
+	ok "19.18 旧式“只包标题”的 CSS 被拒绝（.lc-* 断言命中）"
+else
+	ng "19.18 CSS 反向用例失败原因不对：$(head -1 "$F30/cssneg.log")"
+fi
+
+# 19.19 未知容器 / 空列表：必须显式失败，不许真空通过（F8 的教训）
+printf 'NOT-A-PACKAGE-CONTAINER\n' > "$F30/unknown.pkg"
+if sh "$ROOT/scripts/verify-package-payload.sh" verify "$F30/unknown.pkg" >"$F30/unknown.log" 2>&1; then
+	ng "19.19 未知容器格式被静默接受"
+elif grep -q '未知容器格式' "$F30/unknown.log"; then
+	ok "19.19 未知容器格式：显式报错 + 非零退出（不静默跳过）"
+else
+	ng "19.19 未知容器失败原因不对：$(head -1 "$F30/unknown.log")"
+fi
+if sh "$ROOT/scripts/verify-package-payload.sh" verify >"$F30/empty.log" 2>&1; then
+	ng "19.19b 空产物列表被判通过（真空通过）"
+else
+	ok "19.19b 空产物列表：拒绝（真空通过不可能再发生）"
+fi
+
+# 19.20 正例：往 LuCI 包的 CSS 里塞一行 .lc-* 后，断言必须抓到（F7 断言面）
+_lp=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
+if [ -f "$_lp" ] && command -v tar >/dev/null 2>&1 &&
+   _ipk_unpack "$_lp" "$F30/leak/src"; then
+	_lcss=$F30/leak/src/data/www/luci-static/resources/isp-split/isp-split.css
+	if [ -f "$_lcss" ]; then
+		printf '\n.lc-probe { color: #f00; }\n' >>"$_lcss"
+		mkdir -p "$F30/leak/out"
+		cp "$F30/leak/src/x/control.tar.gz" "$F30/leak/out/control.tar.gz"
+		printf '2.0\n' >"$F30/leak/out/debian-binary"
+		( cd "$F30/leak/src/data" && tar czf "$F30/leak/out/data.tar.gz" . )
+		( cd "$F30/leak/out" && tar czf "$F30/leak/leak.ipk" ./debian-binary ./control.tar.gz ./data.tar.gz )
+		if sh "$ROOT/scripts/verify-package-payload.sh" verify "$F30/leak/leak.ipk" >"$F30/leak.log" 2>&1; then
+			ng "19.20 注入 .lc-* 的 ipk 被判通过（断言面又漏了）"
+		elif grep -q '\.lc-' "$F30/leak.log"; then
+			ok "19.20 注入 .lc-* 的 ipk 被断言抓到（CSS 面不再是盲区）"
+		else
+			ng "19.20 ipk 正例失败原因不对：$(head -1 "$F30/leak.log")"
+		fi
+	else
+		ng "19.20 ipk 正例解包后没有 CSS（打包规则变了？）"
+	fi
+else
+	ng "19.20 无法构造 ipk 正例（缺 dist 产物或无 tar）"
 fi
 
 echo

@@ -31,10 +31,11 @@ define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./htdocs $(PKG_BUILD_DIR)/htdocs
 	$(CP) ./root $(PKG_BUILD_DIR)/root
+	# 与主包同一份剥离实现（本目录自带 strip-linecheck.sh，与
+	# scripts/strip-linecheck.sh 逐字节一致）。曾经在这里手抄三行 sed，
+	# 只删 config.js，漏掉 isp-split.css 的 .lc-* 样式体 —— F7。
 	if [ "$(FEATURE_LINECHECK)" != "1" ]; then \
-		sed -i '/lc:begin/,/lc:end/d' $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/isp-split/config.js; \
-		rm -f $(PKG_BUILD_DIR)/htdocs/luci-static/resources/view/isp-split/linecheck.js; \
-		rm -f $(PKG_BUILD_DIR)/root/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json; \
+		sh $(CURDIR)/strip-linecheck.sh $(PKG_BUILD_DIR); \
 	fi
 endef
 

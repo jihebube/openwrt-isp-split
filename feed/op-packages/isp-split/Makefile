@@ -44,13 +44,11 @@ define Build/Prepare
 	rm -rf $(PKG_BUILD_DIR)
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./files $(PKG_BUILD_DIR)/files
-	# 标记区整段删除 + feature 专属文件删除；随后脚本自检 sh -n。
-	# 与 scripts/strip-linecheck.sh 同一套标记，SDK 与手工打包结果一致。
+	# 只调用仓库里那一份 strip-linecheck.sh（随包内 strip-linecheck.sh 逐字节
+	# 一致），不再手抄 sed：F7 的泄漏就是 SDK 侧另抄一份、覆盖不全造成的。
+	# 脚本自己会做标记配对、零残留、CSS `.lc-*` 与 sh -n 断言。
 	if [ "$(FEATURE_LINECHECK)" != "1" ]; then \
-		sed -i '/lc:begin/,/lc:end/d' $(PKG_BUILD_DIR)/files/usr/sbin/isp-split; \
-		sed -i '/lc:begin/,/lc:end/d' $(PKG_BUILD_DIR)/files/etc/isp-split.conf; \
-		rm -f $(PKG_BUILD_DIR)/files/usr/lib/isp-split/lc-run; \
-		sh -n $(PKG_BUILD_DIR)/files/usr/sbin/isp-split; \
+		sh $(CURDIR)/strip-linecheck.sh $(PKG_BUILD_DIR)/files; \
 	fi
 endef
 

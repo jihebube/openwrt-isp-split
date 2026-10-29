@@ -800,9 +800,10 @@
 }
 
 /* lc:begin */
-/* ---------------------------------------------------------------- 线路体检（0.3.0） */
-/* lc:end */
-
+/* ---------------------------------------------------------------- 线路体检（0.3.0）
+   本段到文件末尾全部是 .lc-* 样式（体检页 / 配置页开关区），
+   FEATURE_LINECHECK=0 时整段物理删除。
+   教训（F7）：标记必须包住样式体；只包一行标题注释，规则会裸奔进 0.2.3 包。 */
 .lc-cards {
 	grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
 }
@@ -1143,9 +1144,7 @@
 	cursor: default;
 }
 
-/* lc:begin */
 /* 尚未体检时的占位卡（BUG-23：没缓存也必须有一个能看的页面，不能白屏） */
-/* lc:end */
 .lc-placeholder {
 	grid-column: 1 / -1;
 	display: block;
@@ -1213,9 +1212,7 @@
 	}
 }
 
-/* lc:begin */
 /* 配置页：线路体检开关区的小字/行内控件 */
-/* lc:end */
 .lc-hint {
 	font-size: 0.74rem;
 	color: var(--isp-muted);
@@ -1237,3 +1234,5 @@
 	border-left: 3px solid var(--isp-primary);
 	padding-left: 10px;
 }
+
+/* lc:end */

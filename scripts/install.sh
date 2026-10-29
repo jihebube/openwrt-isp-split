@@ -96,9 +96,14 @@ if [ "$FEATURE_LINECHECK" != "1" ]; then
 		sh "$ROOT/scripts/strip-linecheck.sh" "$STAGE/files" >/dev/null
 		SRC=$STAGE/files
 	fi
-	if [ -d "$LUCI_SRC" ] && grep -rIq 'lc:begin' "$LUCI_SRC" 2>/dev/null; then
+	# 只暂存真正会被安装的两棵树。包目录里还有 Makefile / strip-linecheck.sh，
+	# 它们含有 `lc:begin` 与 `linecheck` 字样，整目录复制会被自己的断言误杀。
+	if [ -d "$LUCI_SRC" ] &&
+	   grep -rIq 'lc:begin' "$LUCI_SRC/htdocs" "$LUCI_SRC/root" 2>/dev/null; then
+		[ -n "${STAGE:-}" ] || STAGE=$(mktemp -d 2>/dev/null) ||
+			STAGE=$(mktemp -d /tmp/isp-split-stage.XXXXXX) || die "无法创建临时目录"
 		mkdir -p "$STAGE/luci"
-		cp -a "$LUCI_SRC/." "$STAGE/luci/"
+		cp -a "$LUCI_SRC/htdocs" "$LUCI_SRC/root" "$STAGE/luci/"
 		sh "$ROOT/scripts/strip-linecheck.sh" "$STAGE/luci" >/dev/null
 		LUCI_SRC=$STAGE/luci
 	fi
