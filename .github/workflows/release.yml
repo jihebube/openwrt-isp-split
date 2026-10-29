@@ -235,22 +235,28 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: rel/*
-          # 不自动生成 release notes：0.3.1 的对外口径要人工定稿（换装清单、体检彩蛋、
+          # 不自动生成 release notes：0.3.2 的对外口径要人工定稿（扫雷清单、体检修正、
           # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
-            ## v0.3.1-logo 换装更新
+            ## v0.3.2-full 扫雷更新
 
-            这个版本零逻辑变更，纯换装。分流照旧，改的是你打开仪表盘的心情。
+            这个版本是一次全库安全审计 + 全量 bug 回归的产物：审计 16 条发现全部闭环（其中高危 0 条），回归断言从 251 涨到 281 项。
 
-            **换了什么**
-            - 三大运营商换上 44px 官方风徽记，卡片头像化：电信蓝牛角 / 联通中国结 / 移动上古互字圆标——扫一眼就知道这月钱是交给谁的
-            - 兜底流量卡带着地球图标升格进网格：所有不属于任何运营商的流浪流量，从此和正经线路平起平坐
-            - 教育网卡退出默认视图（纯 UI 退场，集合与策略原样健在）：教育网那点 IP 地址，确实不够一张卡呼吸的
+            ### 安全加固（全库审计 audit v2）
 
-            **体检实战彩蛋（真实数据，非摆拍）**
-            本版开发期间生产线路跑了一次体检：联通，丢包 40%，评分 C，评语"建议检查光猫/线路质量"。重拨后原地复活满血。结论：北方联通的 PPPoE 会话是量子态——它坏没坏，取决于你看没看它；而体检功能第一次上线就抓着现行，这 40% 丢包它自己都不好意思。
-            至于移动：全国移动用户的公网地址挤在几条 CGNAT 段里隔墙喊话，我们移动卡上的条目数至今没凑满两百——不是我们不给镜头，是它家公网真的请不起座。
+            - 源数据下载体积闸门前置：流式截断 + 暂存 tmpfs + 磁盘空间预检，"先落盘 20MiB 再拒收"的旧路径作废
+            - init / dns / install / uninstall 四个写命令纳入全局操作锁，与定时同步彻底互斥
+            - `conf set` 的换行盲区堵死：UA / ACCEPT 等字段不再可能把注入头带进探测请求
+            - 回显源、探测 URL、DNS 目录、集合名、策略名全部补齐读取侧校验；export / teardown 加路径守卫（`ISP_SPLIT_BASE=/etc` 之类的危险指向会被直接拒绝）
+            - 状态与缓存目录收紧 700/600；ip-api 降级链路改为仅 HTTPS
+            - LuCI 渲染层经全链审计确认无注入面（文本节点语义），并新增回归断言防止未来改坏
+
+            ### 体检修正（来自生产实测反馈）
+
+            - 出口回显源换为境内服务（ip.3322.net / myip.ipip.net / ddns.oray.com），"出口 IP 未取到"不再是境外源不可达造成的冤案
+            - 回显逐源记录 HTTP 码与错误，页面能区分"回显源不可达"与"真的没出网"
+            - DNS 段按线路实测（从 DNS_TABLE 取对应运营商 DNS），不再测到本机 dnsmasq 热缓存；亚毫秒显示 `<1ms`，未测显示 `—`，两者不再混淆
 
             ### 安装
 
@@ -259,10 +265,10 @@ jobs:
             ```sh
             wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
             mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-            sh /tmp/isp/isp-split-0.3.1/scripts/install.sh --all
+            sh /tmp/isp/isp-split-0.3.2/scripts/install.sh --all
             ```
 
-            （注意：busybox tar 不支持 --strip-components，所以进目录跑，别抄 GNU 姿势。）
+            （busybox tar 不支持 --strip-components，进目录跑即可。）
 
             若本页附带 `.apk`（CI 用 SDK 编译）：
 
@@ -276,5 +282,4 @@ jobs:
             opkg install isp-split_*_all.ipk luci-app-isp-split_*_all.ipk
             ```
 
-            opkg 用户务必重下本页 ipk——0.2.3 起容器格式已对齐官方 gzip-tar，旧版自产 ipk 装不上。
-            LuCI 更新后浏览器强刷一次（Ctrl+F5），旧 JS 缓存会让你以为换装失败。
+            opkg 用户务必重下本页 ipk（0.2.3 起容器格式已对齐官方）。LuCI 更新后浏览器强刷一次。
