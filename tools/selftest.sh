@@ -445,7 +445,7 @@ echo "== 7. dnsmasq 实际 conf-dir 探测（BUG-6）"
 # 写着 conf-dir=/tmp/dnsmasq.cfgXXXX.d（OpenClash 接管 DNS 的形态）。
 mkdir -p "$TMP/bug6/fakebin" "$TMP/bug6/var/etc" \
 	"$TMP/bug6/run/cfg01411c.d" "$TMP/bug6/run/other.d" \
-	"$TMP/bug6/run/default.d" "$TMP/bug6/run/legacy.d" "$TMP/bug6/run/uci.d"
+	"$TMP/bug6/run/default.d" "$TMP/bug6/run/dnsmasq.legacy.d" "$TMP/bug6/run/uci.d"
 cat > "$TMP/bug6/fakebin/uci" <<'FAKE_UCI'
 #!/bin/sh
 [ -n "${FAKE_UCI_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_UCI_LOG"
@@ -480,7 +480,7 @@ _bug6_detect() {
 		ISP_SPLIT_BASE="$TMP/bug6/base"
 		DNSMASQ_CONF_GLOB="$1"
 		DNSMASQ_DEFAULT_DIR="$TMP/bug6/run/default.d"
-		DNSDIR="$TMP/bug6/run/legacy.d"
+		DNSDIR="$TMP/bug6/run/dnsmasq.legacy.d"
 		FAKE_UCI_CONFDIR="$2"
 		FAKE_UCI_LOG="$TMP/bug6/uci.log"
 		export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB \
@@ -512,7 +512,7 @@ fi
 # 卸载：探测路径下没有状态文件，也必须按探测结果删片段，且不碰 UCI。
 # F-14 起这段逻辑在 teardown.sh（卸载清理的唯一实现）里，这里直接调它，
 # 顺带保证"install 路径"也覆盖同一份实现。
-for _d in cfg01411c.d other.d default.d legacy.d; do
+for _d in cfg01411c.d other.d default.d dnsmasq.legacy.d; do
 	: > "$TMP/bug6/run/$_d/isp-split.conf"
 done
 rm -f "$TMP/bug6/uci.log"
@@ -523,7 +523,7 @@ rm -f "$TMP/bug6/uci.log"
 	ISP_SPLIT_BASE="$TMP/bug6/base"
 	DNSMASQ_CONF_GLOB="$TMP/bug6/var/etc/dnsmasq.conf.*"
 	DNSMASQ_DEFAULT_DIR="$TMP/bug6/run/default.d"
-	DNSDIR="$TMP/bug6/run/legacy.d"
+	DNSDIR="$TMP/bug6/run/dnsmasq.legacy.d"
 	FAKE_UCI_CONFDIR=""
 	FAKE_UCI_LOG="$TMP/bug6/uci.log"
 	export PATH ISP_SPLIT_DESTDIR ISP_SPLIT_CONF ISP_SPLIT_BASE \
@@ -532,7 +532,7 @@ rm -f "$TMP/bug6/uci.log"
 	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" runtime
 )
 _bug6_left=""
-for _d in cfg01411c.d other.d default.d legacy.d; do
+for _d in cfg01411c.d other.d default.d dnsmasq.legacy.d; do
 	[ -e "$TMP/bug6/run/$_d/isp-split.conf" ] && _bug6_left="$_bug6_left $_d"
 done
 if [ -z "$_bug6_left" ] && ! grep -qE ' (set|delete|commit)( |$)' "$TMP/bug6/uci.log" 2>/dev/null; then
@@ -993,7 +993,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 [ -n "$out" ] || exit 1
-cp "$SEC_MIRROR/${url##*/}" "$out"
+if [ "$out" = "-" ]; then cat "$SEC_MIRROR/${url##*/}"; else cp "$SEC_MIRROR/${url##*/}" "$out"; fi
 FAKE_FETCH
 chmod +x "$TMP/sec/secbin/uclient-fetch"
 printf 'https://mirror.test\n' > "$TMP/sec/mirror-url"
@@ -1281,7 +1281,7 @@ done
 [ -n "$out" ] || exit 1
 rel=$(printf '%s' "$url" | sed 's|^https\?://||')
 [ -f "$MS_MIRROR/$rel" ] || exit 1
-cp "$MS_MIRROR/$rel" "$out"
+if [ "$out" = "-" ]; then cat "$MS_MIRROR/$rel"; else cp "$MS_MIRROR/$rel" "$out"; fi
 MS_FETCH
 chmod +x "$MS/bin/uclient-fetch"
 
@@ -4331,7 +4331,7 @@ while [ $# -gt 0 ]; do
 	esac
 done
 sleep "${FAKE_SLEEP:-0}"
-cp "$FAKE_MIRROR/${url##*/}" "$out"
+if [ "$out" = "-" ]; then cat "$FAKE_MIRROR/${url##*/}"; else cp "$FAKE_MIRROR/${url##*/}" "$out"; fi
 F28_FETCH
 chmod +x "$F28/bin/uclient-fetch"
 i=0
@@ -4523,7 +4523,7 @@ f14_seed() { # <root> <state>
 		"$_r/www/luci-static/resources/isp-split/logos" \
 		"$_r/usr/share/luci/menu.d" "$_r/usr/share/rpcd/acl.d" "$_r/etc/crontabs" \
 		"$_r/etc/isp-split/dnsmasq.d" "$_r/run/cfg.d" "$_r/run/default.d" \
-		"$_r/run/legacy.d"
+		"$_r/run/dnsmasq.legacy.d"
 	: > "$_r/usr/sbin/isp-split"
 	: > "$_r/etc/init.d/isp-split"
 	: > "$_r/usr/lib/isp-split/build.sh"
@@ -4544,7 +4544,7 @@ f14_seed() { # <root> <state>
 	: > "$_r/etc/isp-split/dnsmasq.d/isp-split.conf"
 	: > "$_r/run/cfg.d/isp-split.conf"
 	: > "$_r/run/default.d/isp-split.conf"
-	: > "$_r/run/legacy.d/isp-split.conf"
+	: > "$_r/run/dnsmasq.legacy.d/isp-split.conf"
 	: > "$2/counter"
 	: > "$2/nft.log"
 	: > "$2/uci.log"
@@ -4562,7 +4562,7 @@ f14_run() { # <root> <state> <teardown 参数...>
 		ISP_SPLIT_DESTDIR="$_r"
 		ISP_SPLIT_CONF="$_r/etc/isp-split.conf"
 		ISP_SPLIT_CRONTAB="$_r/etc/crontabs/root"
-		DNSDIR="$_r/run/legacy.d"
+		DNSDIR="$_r/run/dnsmasq.legacy.d"
 		DNSMASQ_DEFAULT_DIR="$_r/run/default.d"
 		DNSMASQ_CONF_GLOB="$_r/run/dnsmasq.conf.*"
 		export PATH FAKE_NFT_STATE FAKE_UCI_STATE ISP_SPLIT_DESTDIR \
@@ -4612,7 +4612,7 @@ done
 ls "$_r"/etc/isp-split.conf.bak.* >/dev/null 2>&1 && _left="$_left .conf.bak.*"
 [ -f "$F14/s1/counter" ] && _left="$_left 计数器"
 grep -q 'isp-split' "$_r/etc/crontabs/root" 2>/dev/null && _left="$_left cron行"
-for _d in etc/isp-split/dnsmasq.d run/cfg.d run/default.d run/legacy.d; do
+for _d in etc/isp-split/dnsmasq.d run/cfg.d run/default.d run/dnsmasq.legacy.d; do
 	[ -e "$_r/$_d/isp-split.conf" ] && _left="$_left 片段($_d)"
 done
 [ -e "$_r/etc/isp-split/state/dnsmasq.confdir.migrated" ] && _left="$_left 状态文件"
@@ -5205,6 +5205,363 @@ if [ -n "$_node" ]; then
 	fi
 else
 	skip "24.8 node --check（环境里没有 node/nodejs）"
+fi
+
+
+echo "== 25. audit v2 安全修复第一批（A-01..A-08）"
+A25=$TMP/a25
+mkdir -p "$A25/bin" "$A25/base" "$A25/tmp"
+
+# ---- A-01：20MiB 响应 + 1024 上限，落盘必须被流式截断 ----
+mkdir -p "$A25/a01"
+cat > "$A25/bin/uclient-fetch" <<'A25_UCLIENT'
+#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+	[ "$prev" = "-O" ] && out=$a
+	prev=$a
+done
+if [ "$out" = "-" ] || [ -z "$out" ]; then
+	head -c 20971520 /dev/zero
+else
+	head -c 20971520 /dev/zero > "$out"
+fi
+A25_UCLIENT
+chmod +x "$A25/bin/uclient-fetch"
+cat > "$A25/a01/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_SOURCES="s:primary:https://example.test"
+A25_CONF
+(
+	PATH="$A25/bin:$PATH"
+	TMPDIR="$A25/tmp"
+	ISP_SPLIT_CONF="$A25/a01/conf"
+	ISP_SPLIT_BASE="$A25/a01/base"
+	ISP_SPLIT_LIB="$LIB"
+	ISP_SPLIT_MAX_RAW_BYTES=1024
+	export PATH TMPDIR ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB ISP_SPLIT_MAX_RAW_BYTES
+	. "$TMP/isp-lib.sh"
+	_fetch_source s https://example.test "$A25/a01/out/s" primary
+) > "$A25/a01/run.log" 2>&1
+_a25_a01_rc=$?
+_a25_a01_sz=$(wc -c < "$A25/a01/out/s/s.txt" 2>/dev/null | tr -d ' \t')
+case "${_a25_a01_sz:-}" in '' | *[!0-9]*) _a25_a01_sz=999999999 ;; esac
+if [ "$_a25_a01_rc" -ne 0 ] && [ "$_a25_a01_sz" -le 2048 ]; then
+	ok "A-01 20MiB 响应在 MAX=1024 下落盘 ${_a25_a01_sz}B（≤2048B，流式截断生效）"
+else
+	ng "A-01 体积闸门未前置：rc=$_a25_a01_rc size=${_a25_a01_sz}B"
+fi
+
+# ---- A-02：四个写命令持同一把 op lock；并发临界区串行 ----
+_a25_lock_bad=""
+for _a25_f in cmd_init cmd_dns cmd_install cmd_uninstall; do
+	sed -n "/^$_a25_f() {/,/^}/p" "$ROOT/files/usr/sbin/isp-split" |
+		grep -q '_op_lock_acquire' || _a25_lock_bad="$_a25_lock_bad $_a25_f"
+done
+if [ -z "$_a25_lock_bad" ]; then
+	ok "A-02 cmd_init/cmd_dns/cmd_install/cmd_uninstall 均纳入 _op_lock_acquire"
+else
+	ng "A-02 未持锁的写命令:$_a25_lock_bad"
+fi
+
+mkdir -p "$A25/a02/base"
+cat > "$A25/a02/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A25_CONF
+cat > "$A25/a02/lock.sh" <<'A25_LOCK'
+#!/bin/sh
+tag=$1
+. "$ISP_SPLIT_LIBFILE"
+_op_lock_acquire || exit 2
+printf '%s-start\n' "$tag" >> "$A25_LOG"
+sleep 1
+printf '%s-end\n' "$tag" >> "$A25_LOG"
+_op_lock_release
+A25_LOCK
+cat > "$A25/a02/run.sh" <<'A25_RUN'
+#!/bin/sh
+ISP_SPLIT_CONF="$1" ISP_SPLIT_BASE="$2" ISP_SPLIT_LIBFILE="$3" \
+	A25_LOG="$4" ISP_SPLIT_LOCK_WAIT=10 \
+	sh "$5" "$6"
+A25_RUN
+: > "$A25/a02/log"
+sh "$A25/a02/run.sh" "$A25/a02/conf" "$A25/a02/base" "$TMP/isp-lib.sh" \
+	"$A25/a02/log" "$A25/a02/lock.sh" A >/dev/null 2>&1 &
+_a25_p=$!
+sleep 1
+# 让第二个进程在 A 已持锁后启动；若锁不生效，B-start 会落在 A-end 之前。
+sh "$A25/a02/run.sh" "$A25/a02/conf" "$A25/a02/base" "$TMP/isp-lib.sh" \
+	"$A25/a02/log" "$A25/a02/lock.sh" B >/dev/null 2>&1
+wait "$_a25_p"
+if awk '/^A-start$/{a=NR} /^A-end$/{ae=NR} /^B-start$/{b=NR} END{exit !(a && ae && b && b>ae)}' \
+	"$A25/a02/log"; then
+	ok "A-02 并发操作锁串行化：B-start 在 A-end 之后（uci 暂存区不重叠）"
+else
+	ng "A-02 操作锁未串行化: $(tr '\n' ' ' < "$A25/a02/log")"
+fi
+
+# ---- A-03：LF / | 转换 / CR / TAB 全部拒绝，conf 无残留 ----
+mkdir -p "$A25/a03/base"
+cat > "$A25/a03/conf" <<'A25_CONF'
+LINE_CHECK_UA="Mozilla/5.0"
+LINE_CHECK_ACCEPT="text/html"
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A25_CONF
+_a25_conf_run() {
+	(
+		ISP_SPLIT_CONF="$A25/a03/conf"
+		ISP_SPLIT_BASE="$A25/a03/base"
+		ISP_SPLIT_LIB="$LIB"
+		export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+		. "$TMP/isp-lib.sh"
+		"$@"
+	) >/dev/null 2>&1
+}
+_a25_a03_bad=""
+_a25_conf_run conf_set line_check_ua 'Mozilla/5.0|X-Injected-UA: yes' ||
+	_a25_a03_bad="$_a25_a03_bad pipe-rejected"
+[ "$_a25_a03_bad" = " pipe-rejected" ] || _a25_a03_bad="$_a25_a03_bad pipe-ACCEPTED"
+_lf_val=$(printf 'Mozilla/5.0\nX-Injected-LF: yes')
+_a25_conf_run conf_set line_check_ua "$_lf_val" ||
+	_a25_a03_bad="$_a25_a03_bad lf-rejected"
+[ "$_a25_a03_bad" = " pipe-rejected lf-rejected" ] ||
+	_a25_a03_bad="$_a25_a03_bad lf-ACCEPTED"
+_cr_val=$(printf 'Mozilla/5.0\rX: yes')
+_a25_conf_run conf_set line_check_ua "$_cr_val" ||
+	_a25_a03_bad="$_a25_a03_bad cr-rejected"
+_tab_val=$(printf 'Mozilla/5.0\tX: yes')
+_a25_conf_run conf_set line_check_ua "$_tab_val" ||
+	_a25_a03_bad="$_a25_a03_bad tab-rejected"
+if [ "$_a25_a03_bad" = " pipe-rejected lf-rejected cr-rejected tab-rejected" ] &&
+   ! grep -q 'X-Injected' "$A25/a03/conf"; then
+	ok "A-03 LF/| 注入 rc=1，CR/TAB 仍拒，conf 无残留"
+else
+	ng "A-03 控制字符校验异常:$_a25_a03_bad"
+fi
+
+# ---- A-04：PROBE_URLS / ECHO_URLS 的 -K 注入被读取侧拒绝 ----
+mkdir -p "$A25/a04/bin" "$A25/a04/base"
+cat > "$A25/a04/bin/curl" <<'A25_CURL'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_CURL_LOG:?}"
+echo "0 0"
+A25_CURL
+chmod +x "$A25/a04/bin/curl"
+cat > "$A25/a04/conf" <<'A25_CONF'
+PROBE_URLS="-K/tmp/curlrc"
+PROBE_IFACES="lo"
+PROBE_TIME=1
+PROBE_BYTES=1
+LINE_CHECK_ECHO_URLS="-K/tmp/curlrc"
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A25_CONF
+: > "$A25/a04/curl.log"
+(
+	PATH="$A25/a04/bin:$PATH"
+	FAKE_CURL_LOG="$A25/a04/curl.log"
+	ISP_SPLIT_CONF="$A25/a04/conf"
+	ISP_SPLIT_BASE="$A25/a04/base"
+	ISP_SPLIT_LIB="$LIB"
+	export PATH FAKE_CURL_LOG ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	cmd_probe
+) >/dev/null 2>&1
+_a25_a04_probe=$?
+(
+	ISP_SPLIT_CONF="$A25/a04/conf"
+	ISP_SPLIT_BASE="$A25/a04/base"
+	ISP_SPLIT_LIB="$LIB"
+	export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	_lc_echo_raw >/dev/null
+) >/dev/null 2>&1
+_a25_a04_echo=$?
+if [ "$_a25_a04_probe" -ne 0 ] && [ "$_a25_a04_echo" -ne 0 ] &&
+   [ ! -s "$A25/a04/curl.log" ]; then
+	ok "A-04 PROBE_URLS/ECHO_URLS 的 -K 注入被拒且 curl 未被调用"
+else
+	ng "A-04 --url/读取侧校验缺失：probe_rc=$_a25_a04_probe echo_rc=$_a25_a04_echo curl=$(cat "$A25/a04/curl.log" 2>/dev/null)"
+fi
+
+# ---- A-05：DNSDIR=/etc 被拒；teardown 不删白名单外目录 ----
+mkdir -p "$A25/a05/base" "$A25/a05/root/etc/isp-split"
+cat > "$A25/a05/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A25_CONF
+printf 'KEEP\n' > "$A25/a05/root/etc/isp-split.conf"
+_a25_a05_rc=0
+DNSDIR=/etc ISP_SPLIT_CONF="$A25/a05/conf" ISP_SPLIT_BASE="$A25/a05/base" \
+	ISP_SPLIT_LIB="$LIB" sh "$ROOT/files/usr/sbin/isp-split" dns \
+	> "$A25/a05/dns.log" 2>&1 || _a25_a05_rc=$?
+(
+	ISP_SPLIT_DESTDIR="$A25/a05/root"
+	ISP_SPLIT_BASE="$A25/a05/base"
+	DNSDIR="$A25/a05/root/etc"
+	DNSMASQ_CONF_GLOB="$A25/a05/no-such-conf.*"
+	DNSMASQ_DEFAULT_DIR="$A25/a05/root/tmp/dnsmasq.d"
+	export ISP_SPLIT_DESTDIR ISP_SPLIT_BASE DNSDIR DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" runtime
+) > "$A25/a05/teardown.log" 2>&1
+if [ "$_a25_a05_rc" -ne 0 ] && grep -q 'DNSDIR 非法' "$A25/a05/dns.log" &&
+   [ -f "$A25/a05/root/etc/isp-split.conf" ]; then
+	ok "A-05 DNSDIR=/etc rc=$_a25_a05_rc，teardown 未删白名单外 isp-split.conf"
+else
+	ng "A-05 DNSDIR 白名单未生效（rc=$_a25_a05_rc，文件 $( [ -f "$A25/a05/root/etc/isp-split.conf" ] && echo 在 || echo 丢失)）"
+fi
+
+# ---- A-06：坏集合名在 _lc_set_for/_lc_ip_isp 入口被拒 ----
+mkdir -p "$A25/a06/bin" "$A25/a06/base"
+cat > "$A25/a06/bin/nft" <<'A25_NFT'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_NFT_LOG:?}"
+exit 0
+A25_NFT
+chmod +x "$A25/a06/bin/nft"
+cat > "$A25/a06/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_tel;flush:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+A25_CONF
+: > "$A25/a06/nft.log"
+_a25_a06_set=0
+_a25_a06_ip=0
+(
+	PATH="$A25/a06/bin:$PATH"
+	FAKE_NFT_LOG="$A25/a06/nft.log"
+	ISP_SPLIT_CONF="$A25/a06/conf"
+	ISP_SPLIT_BASE="$A25/a06/base"
+	ISP_SPLIT_LIB="$LIB"
+	export PATH FAKE_NFT_LOG ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	_lc_set_for s
+) >/dev/null 2>&1 || _a25_a06_set=$?
+(
+	PATH="$A25/a06/bin:$PATH"
+	FAKE_NFT_LOG="$A25/a06/nft.log"
+	ISP_SPLIT_CONF="$A25/a06/conf"
+	ISP_SPLIT_BASE="$A25/a06/base"
+	ISP_SPLIT_LIB="$LIB"
+	export PATH FAKE_NFT_LOG ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	_lc_ip_isp 1.2.3.4
+) >/dev/null 2>&1 || _a25_a06_ip=$?
+if [ "$_a25_a06_set" -ne 0 ] && [ "$_a25_a06_ip" -ne 0 ] &&
+   ! grep -q 'isp_tel;flush' "$A25/a06/nft.log"; then
+	ok "A-06 坏集合名在 _lc_set_for/_lc_ip_isp 入口被拒，未进入 nft argv"
+else
+	ng "A-06 坏集合名未被入口拦截（set_rc=$_a25_a06_set ip_rc=$_a25_a06_ip nft=$(tr '\n' ';' < "$A25/a06/nft.log")）"
+fi
+
+# ---- A-07：坏 DNS_TABLE 策略名在 mwan3_policy_* argv 前被拒 ----
+mkdir -p "$A25/a07/bin" "$A25/a07/base"
+cat > "$A25/a07/bin/nft" <<'A25_NFT7'
+#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_NFT_LOG:?}"
+case "$*" in
+"list table inet mwan3") exit 0 ;;
+"list chain inet mwan3 mwan3_output")
+	printf '%s\n' 'table inet mwan3 {' '	chain mwan3_output {' \
+		'		type filter hook output priority mangle; policy accept;' \
+		'		jump mwan3_rules' '	}' '}'
+	exit 0
+	;;
+*) exit 0 ;;
+esac
+A25_NFT7
+chmod +x "$A25/a07/bin/nft"
+cat > "$A25/a07/bin/uci" <<'A25_UCI7'
+#!/bin/sh
+exit 1
+A25_UCI7
+chmod +x "$A25/a07/bin/uci"
+cat > "$A25/a07/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE="bad;flush:223.5.5.5"
+DNS_MODE="mark"
+A25_CONF
+: > "$A25/a07/nft.log"
+(
+	PATH="$A25/a07/bin:$PATH"
+	FAKE_NFT_LOG="$A25/a07/nft.log"
+	ISP_SPLIT_CONF="$A25/a07/conf"
+	ISP_SPLIT_BASE="$A25/a07/base"
+	ISP_SPLIT_LIB="$LIB"
+	DNS_RETRY_TRIES=1 DNS_RETRY_DELAY=0
+	export PATH FAKE_NFT_LOG ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB \
+		DNS_RETRY_TRIES DNS_RETRY_DELAY
+	. "$TMP/isp-lib.sh"
+	_dns_bypass 0
+) >/dev/null 2>&1
+_a25_a07_rc=$?
+_a25_a07_cmd=0
+PATH="$A25/a07/bin:$PATH" FAKE_NFT_LOG="$A25/a07/nft.log" \
+	ISP_SPLIT_CONF="$A25/a07/conf" ISP_SPLIT_BASE="$A25/a07/base" \
+	ISP_SPLIT_LIB="$LIB" DOMAIN_LIST_DIR="$A25/a07/domains" \
+	DNSMASQ_SERVICE=/bin/true DNSMASQ_CONF_GLOB="$A25/a07/no-such-conf.*" \
+	DNSMASQ_DEFAULT_DIR="$A25/a07/dnsmasq.d" \
+	sh "$ROOT/files/usr/sbin/isp-split" dns > "$A25/a07/dns.log" 2>&1 ||
+	_a25_a07_cmd=$?
+if [ "$_a25_a07_rc" -eq 2 ] && [ "$_a25_a07_cmd" -eq 1 ] &&
+   ! grep -q 'mwan3_policy_bad' "$A25/a07/nft.log"; then
+	ok "A-07 坏策略名：_dns_bypass rc=2，cmd_dns rc=1，未进入 nft argv"
+else
+	ng "A-07 坏策略名未被拦截（bypass_rc=$_a25_a07_rc cmd_rc=$_a25_a07_cmd nft=$(tr '\n' ';' < "$A25/a07/nft.log")）"
+fi
+
+# ---- A-08：health JSON 数值位/cron 字段注入后仍是合法 JSON ----
+mkdir -p "$A25/a08/base"
+cat > "$A25/a08/conf" <<'A25_CONF'
+ISP_TABLE="s:isp_s:wan_only:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_MIRROR="https://example.test"
+ISP_SOURCE_MAX_FAIL_DAYS='3,"injected":"yes"'
+ISP_CRON='17 4 * * *
+"cron_injected":"yes'
+A25_CONF
+(
+	ISP_SPLIT_CONF="$A25/a08/conf"
+	ISP_SPLIT_BASE="$A25/a08/base"
+	ISP_SPLIT_LIB="$LIB"
+	export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh"
+	cmd_health_json
+) > "$A25/a08/health.json" 2>/dev/null
+_a25_a08_json=$(cat "$A25/a08/health.json")
+_a25_a08_ok=0
+if command -v jsonfilter >/dev/null 2>&1; then
+	_a25_a08_max=$(printf '%s' "$_a25_a08_json" | jsonfilter -e '@.sources[0].max_fail' 2>/dev/null)
+	_a25_a08_inj=$(printf '%s' "$_a25_a08_json" | jsonfilter -e '@.sources[0].injected' 2>/dev/null)
+	[ "$_a25_a08_max" = "0" ] && [ -z "$_a25_a08_inj" ] && _a25_a08_ok=1
+elif command -v python3 >/dev/null 2>&1; then
+	python3 -c 'import json,sys; o=json.load(sys.stdin); assert o["sources"][0]["max_fail"]==0; assert "injected" not in o["sources"][0]' \
+		< "$A25/a08/health.json" >/dev/null 2>&1 && _a25_a08_ok=1
+else
+	printf '%s' "$_a25_a08_json" | grep -q '"max_fail":0' &&
+		! printf '%s' "$_a25_a08_json" | grep -q '"injected"' && _a25_a08_ok=1
+fi
+if [ "$_a25_a08_ok" = "1" ]; then
+	ok "A-08 注入值被归一化，health JSON 可被 jsonfilter/python3 解析"
+else
+	ng "A-08 health JSON 仍非法或含注入字段: $_a25_a08_json"
 fi
 
 echo

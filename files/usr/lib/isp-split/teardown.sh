@@ -229,6 +229,31 @@ _state_read() {
 	return 0
 }
 
+# A-05：DNSDIR 白名单（与 isp-split 主脚本同一口径）。只允许 $BASE 子树
+# 或 /tmp/dnsmasq*.d 形态；/etc、/、.. 一律不参与删除。
+_dnsdir_ok() {
+	_ddo=${1:-}
+	case "$_ddo" in "" | "/" | "." | ".." | *..*) return 1 ;; esac
+	case "$_ddo" in /*) ;; *) return 1 ;; esac
+	while [ "$_ddo" != "/" ] && [ "${_ddo%/}" != "$_ddo" ]; do
+		_ddo=${_ddo%/}
+	done
+	case "$_ddo" in
+	"$BASE"/*) return 0 ;;
+	/tmp/dnsmasq*.d | /tmp/*/dnsmasq*.d) return 0 ;;
+	esac
+	return 1
+}
+
+# 删除片段的根目录限制：绝不 rm -f /isp-split.conf 或 /etc/isp-split.conf。
+_frag_delete_ok() {
+	_fdo=${1:-}
+	case "$_fdo" in "" | "/" | "/etc" | "." | ".." | *..*) return 1 ;; esac
+	case "$_fdo" in /*) ;; *) return 1 ;; esac
+	[ -d "$_fdo" ] || return 1
+	return 0
+}
+
 # 片段可能残留的目录：运行配置里的 conf-dir=（权威源）+ UCI 当前值 +
 # 状态文件记录值 + 默认目录 + 旧版目录，去重后逐行输出。
 _frag_dirs() {
@@ -238,7 +263,8 @@ _frag_dirs() {
 			sed -n 's/^[[:space:]]*conf-dir=//p' "$_fd_f" 2>/dev/null
 		done
 		printf '%s\n' "${_frag_uci:-}" "${_frag_state:-}" \
-			"$DNSMASQ_DEFAULT_DIR" "$DNSDIR"
+			"$DNSMASQ_DEFAULT_DIR"
+		_dnsdir_ok "$DNSDIR" && printf '%s\n' "$DNSDIR"
 	} | tr ' ' '\n' |
 		sed -e 's/,.*$//' -e 's/^"//' -e 's/"$//' -e 's:/*$::' |
 		awk 'NF && !seen[$0]++'
@@ -272,6 +298,7 @@ cmd_runtime() {
 	# 2) 清片段。探测来源优先，但不依赖探测是否成功——目录列表是并集。
 	_n=0
 	for _d in $(_frag_dirs); do
+		_frag_delete_ok "$_d" || continue
 		[ -f "$_d/isp-split.conf" ] || continue
 		rm -f "$_d/isp-split.conf" 2>/dev/null && _n=$((_n + 1))
 	done
