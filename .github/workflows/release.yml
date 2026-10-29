@@ -49,8 +49,34 @@ jobs:
           for ipk in out/*.ipk; do
             [ -f "$ipk" ] || continue
             d=$(mktemp -d)
-            ar p "$ipk" data.tar.gz | tar -xz -C "$d"
-            if grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$d"; then
+            # 容器嗅探：23.05/24.10 官方 ipk 是 gzip 包裹的 tar（1f 8b），
+            # 成员为 ./debian-binary ./control.tar.gz ./data.tar.gz；
+            # 历史格式才是明文 ar（!<arch>）。只写一种读法必然误杀另一种。
+            magic=$(od -An -tx1 -N4 "$ipk" | tr -d ' \n')
+            case "$magic" in
+              1f8b*)
+                tar xzf "$ipk" -C "$d"
+                if [ ! -f "$d/data.tar.gz" ]; then
+                  echo "::error::$ipk 是 gzip-tar，但外层没有 data.tar.gz"
+                  exit 1
+                fi
+                ;;
+              213c6172)
+                # 明文 ar：!<ar
+                ar p "$ipk" data.tar.gz > "$d/data.tar.gz"
+                [ -s "$d/data.tar.gz" ] || {
+                  echo "::error::$ipk 是 ar 容器，但取不到 data.tar.gz"
+                  exit 1
+                }
+                ;;
+              *)
+                echo "::error::$ipk 未知容器格式（magic=$magic），拒绝静默跳过"
+                exit 1
+                ;;
+            esac
+            mkdir -p "$d/payload"
+            tar xzf "$d/data.tar.gz" -C "$d/payload"
+            if grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$d/payload"; then
               echo "::error::$ipk 仍含 linecheck 残留"
               exit 1
             fi

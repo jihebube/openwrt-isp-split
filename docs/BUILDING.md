@@ -5,7 +5,7 @@
 | 目标固件 | 产物 | 命令 | 要求 |
 |---|---|---|---|
 | Kwrt / OpenWrt 25.12+（apk） | `.apk` | `scripts/build-apk-docker.sh`（推荐）或 `scripts/build-apk.sh` | Docker，或 Linux x86_64 |
-| OpenWrt ≤ 24.10（opkg） | `.ipk` | `scripts/build-ipk.sh` | 无（任何能跑 sh/tar/ar 的机器） |
+| OpenWrt ≤ 24.10（opkg） | `.ipk` | `scripts/build-ipk.sh` | 无（任何能跑 sh/tar/gzip 的机器） |
 | 自编译固件 | 镜像 | 见 [FIRMWARE.md](FIRMWARE.md) | buildroot 环境 |
 
 只想安装、不想构建：直接从 [Releases](../../releases) 下载 `isp-split-*.tar.gz`，解包后执行 `sh scripts/install.sh --all`。
@@ -18,9 +18,36 @@
 sh scripts/build-ipk.sh
 ```
 
-不需要 OpenWrt 环境，产物为 `dist/isp-split_<版本>_all.ipk`。脚本已处理 macOS BSD `ar` 的差异，并对生成的 ipk 做结构校验。
+不需要 OpenWrt 环境，产物为 `dist/isp-split_<版本>_all.ipk`（另有可选的
+`luci-app-isp-split_<版本>_all.ipk`）。脚本对产物做容器嗅探式冒烟校验：
+必须是 gzip 包裹的 tar（magic `1f 8b`），且成员恰好为
+`./debian-binary`、`./control.tar.gz`、`./data.tar.gz`。
 
 安装：`opkg install isp-split_*_all.ipk`
+
+### ipk 容器是 gzip-tar，不是明文 ar
+
+OpenWrt 23.05 / 24.10 官方仓库的 ipk 都是 **gzip 包裹的 tar**（不是 Debian
+那种明文 `!<arch>` ar）。opkg 的读取实现只认前者：
+
+- `libbb/unarchive.c` 的 `deb_extract()` 先把整个包当 gzip 流解开，再按 tar
+  遍历外层，找到 `control.tar.gz` / `data.tar.gz` 成员后再解内层 gzip；
+- 解压由 `gzip_exec()`（`libbb/gzip.c`）完成，实际执行
+  `execlp("gzip", "gzip", "-d", "-c", ...)`，对 `!<arch>` 输入直接失败
+  （子进程 stderr 被丢弃，用户只能看到最终的 Malformed 报错）；
+- 24.10.4 的 opkg 二进制里只有 `get_header_tar`，没有 `get_header_ar`，也没有
+  `!<arch>` 字面量。
+
+所以明文 ar 的 ipk 在 23.05/24.10 上无法解析，opkg 会报
+`pkg_init_from_file: Malformed package file`。
+`build-ipk.sh` 默认产出 gzip-tar；只有极老固件（明文 ar 时代）才需要显式回退：
+
+```sh
+ISP_SPLIT_IPK_FORMAT=ar sh scripts/build-ipk.sh
+```
+
+`tools/selftest.sh` 的 §19.10 也用同一套嗅探读法（gzip-tar / ar 都能读，
+未知格式判失败），并在 §19.10a 断言产物必须是 gzip-tar。
 
 ---
 
@@ -70,7 +97,8 @@ git tag v0.2.1 && git push origin v0.2.1
 1. 更新 `Makefile` 与 `luci-app-isp-split/Makefile` 中的 `PKG_VERSION` / `PKG_RELEASE`
 2. 确认 `dist/` 在 `.gitignore` 中（构建产物不入库）
 3. 打 tag 并推送，等待 CI 完成
-4. 检查 Release 页产物的完整性与 `SHA256SUMS`
+4. 检查 Release 页产物的完整性与 `SHA256SUMS`；ipk 的前两字节应为 `1f 8b`
+   （gzip-tar），不是 `21 3c`（明文 ar）
 
 ## 自建 opkg 软件源（可选，仅 ≤24.10）
 
@@ -79,7 +107,15 @@ mkdir -p repo/packages && cp dist/*.ipk repo/packages/
 cd repo/packages
 {
   for f in *.ipk; do
-    ar p "$f" control.tar.gz | tar xzO ./control
+    d=$(mktemp -d)
+    # 官方 23.05/24.10 是 gzip-tar；老格式是明文 ar。两种都要能读。
+    if tar xzf "$f" -C "$d" 2>/dev/null; then
+      :
+    else
+      ar p "$f" control.tar.gz > "$d/control.tar.gz"
+    fi
+    tar xzOf "$d/control.tar.gz" ./control
+    rm -rf "$d"
     echo "Filename: $f"
     echo "Size: $(wc -c < "$f")"
     echo

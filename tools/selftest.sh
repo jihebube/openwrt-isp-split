@@ -3439,9 +3439,23 @@ else
 fi
 
 # 19.10 ipk：主包 + LuCI 包的文件清单 / menu 子节点 / Depends
-# 有 ar 用 ar；没有 ar（如 OpenWrt 精简固件）就用 dd/tail 直接读 ar 头部，
-# 保证 §19 在 VM root 上也能完整跑，而不是“跳过”。
-_ipk_pull() { # <ipk> <member> <out>
+# 容器嗅探：23.05/24.10 官方与 build-ipk.sh 默认产物是 gzip-tar（magic 1f 8b），
+# 历史格式才是明文 ar（!<arch>）。两种都要能读，未知格式必须判失败。
+# 不用 od（OpenWrt 精简固件没有），用 dd + cmp 比 magic。
+printf '\037\213' > "$F30/magic.gz"
+printf '!<ar' > "$F30/magic.ar"
+_ipk_magic() { # <ipk> -> gzip | ar | unknown
+	if dd if="$1" bs=1 count=2 2>/dev/null | cmp -s - "$F30/magic.gz"; then
+		echo gzip
+	elif dd if="$1" bs=1 count=4 2>/dev/null | cmp -s - "$F30/magic.ar"; then
+		echo ar
+	else
+		echo unknown
+	fi
+}
+# 只有 ar 容器才走这里：有 ar 用 ar；没有 ar（如 OpenWrt 精简固件）
+# 就用 dd/tail 直接读 60 字节头，保证 §19 在 VM root 上也能完整跑。
+_ipk_pull_ar() { # <ipk> <member> <out>
 	if command -v ar >/dev/null 2>&1; then
 		ar p "$1" "$2" >"$3" && return 0
 	fi
@@ -3465,16 +3479,35 @@ _ipk_pull() { # <ipk> <member> <out>
 }
 _ipk_unpack() { # <ipk> <dest>
 	rm -rf "$2"
-	mkdir -p "$2/data" "$2/ctl"
-	_ipk_pull "$1" data.tar.gz "$2/data.tar.gz" &&
-		_ipk_pull "$1" control.tar.gz "$2/control.tar.gz" &&
-		tar -xzf "$2/data.tar.gz" -C "$2/data" 2>/dev/null &&
-		tar -xzf "$2/control.tar.gz" -C "$2/ctl" 2>/dev/null
+	mkdir -p "$2/data" "$2/ctl" "$2/x"
+	case "$(_ipk_magic "$1")" in
+	gzip)
+		# gzip-tar：外层解开就是 debian-binary / control.tar.gz / data.tar.gz
+		tar xzf "$1" -C "$2/x" 2>/dev/null || return 1
+		;;
+	ar)
+		_ipk_pull_ar "$1" data.tar.gz "$2/x/data.tar.gz" || return 1
+		_ipk_pull_ar "$1" control.tar.gz "$2/x/control.tar.gz" || return 1
+		;;
+	*)
+		return 1
+		;;
+	esac
+	[ -f "$2/x/data.tar.gz" ] && [ -f "$2/x/control.tar.gz" ] || return 1
+	tar -xzf "$2/x/data.tar.gz" -C "$2/data" 2>/dev/null &&
+		tar -xzf "$2/x/control.tar.gz" -C "$2/ctl" 2>/dev/null
 }
 if command -v tar >/dev/null 2>&1; then
 	if sh "$ROOT/scripts/build-ipk.sh" >"$F30/ipk-build.log" 2>&1; then
 		_mipk=$ROOT/dist/isp-split_${ISPVER}-1_all.ipk
 		_lipk=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
+		_mfmt=$(_ipk_magic "$_mipk")
+		_lfmt=$(_ipk_magic "$_lipk")
+		if [ "$_mfmt" = gzip ] && [ "$_lfmt" = gzip ]; then
+			ok "19.10a ipk 容器嗅探：gzip-tar（与 23.05/24.10 官方一致）"
+		else
+			ng "19.10a ipk 容器不是 gzip-tar（main=${_mfmt:-?} luci=${_lfmt:-?}）"
+		fi
 		if _ipk_unpack "$_mipk" "$F30/mipk" && _ipk_unpack "$_lipk" "$F30/lipk"; then
 			_m_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/mipk/data" 2>/dev/null || true)
 			_l_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/lipk/data" 2>/dev/null || true)

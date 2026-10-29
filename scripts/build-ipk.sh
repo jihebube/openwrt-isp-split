@@ -1,6 +1,13 @@
 #!/bin/sh
 # 构建 opkg 可安装的 .ipk
 #
+# 产物容器与 OpenWrt 23.05/24.10 官方一致：外层 gzip 包一个 tar，成员为
+# ./debian-binary / ./control.tar.gz / ./data.tar.gz。不是 Debian 那种明文
+# ar（!<arch>）——opkg 的 libbb/deb_extract 只会先 gunzip 外层再按 tar
+# 遍历成员，明文 ar 在 23.05+ 上直接 "Malformed package file"。
+# 极老固件（明文 ar 时代）可显式回退：
+#   ISP_SPLIT_IPK_FORMAT=ar sh scripts/build-ipk.sh
+#
 # 适用：opkg 系的 OpenWrt（≤ 24.10，以及仍用 opkg 的衍生固件）
 # 不适用：OpenWrt 25.12+ 已改用 apk-tools 3.x，包格式完全不同，
 #        请在 SDK / buildroot 中用仓库根目录的 Makefile 编译。
@@ -23,10 +30,17 @@ OUT=$ROOT/dist
 WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
+# 容器格式：tar = gzip-tar（默认，23.05/24.10 官方同款）；ar = 历史明文 ar
+IPK_FORMAT=${ISP_SPLIT_IPK_FORMAT:-tar}
+case "$IPK_FORMAT" in
+tar|ar) ;;
+*) echo "ISP_SPLIT_IPK_FORMAT 只能是 tar 或 ar" >&2; exit 1 ;;
+esac
+
 [ -f "$ROOT/files/usr/sbin/isp-split" ] || { echo "找不到源码，请在仓库根目录运行" >&2; exit 1; }
 
-# 没有 ar 的固件（部分 OpenWrt 精简镜像）也能本地打包：直接写 ar 头。
-# 与 `ar rcS` 等价（不写符号表），§19 在 VM 上因此可以真正解包断言。
+# 仅 ISP_SPLIT_IPK_FORMAT=ar 时用到：给极老 opkg 的明文 ar。
+# 没有 ar 的机器也能打包：直接写 ar 头，与 `ar rcS` 等价（不写符号表）。
 _mkar() { # <out> <member>...
 	_out=$1
 	shift
@@ -90,33 +104,65 @@ EOF
 chmod 755 "$WORK/control/postinst" "$WORK/control/prerm"
 
 # ---- 打包 ----
-# .ipk = ar 归档，成员依次为 debian-binary / control.tar.gz / data.tar.gz
+# 内层 data.tar.gz / control.tar.gz 始终是 gzip 压缩的 tar；外层容器二选一：
+#   tar（默认）：gzip + tar，成员 ./debian-binary ./control.tar.gz ./data.tar.gz
+#   ar（兼容）：明文 !<arch>，只有极老 opkg 认，23.05+ 会拒绝
 ( cd "$WORK/data" && tar czf "$WORK/data.tar.gz" . )
 ( cd "$WORK/control" && tar czf "$WORK/control.tar.gz" . )
 printf '2.0\n' > "$WORK/debian-binary"
 
+_ipk_pack() { # <dir> <out>
+	case "$IPK_FORMAT" in
+	tar)
+		# ./ 前缀与官方产物一致；opkg 匹配成员时会自己剥掉 "./"
+		( cd "$1" && tar czf "$2" ./debian-binary ./control.tar.gz ./data.tar.gz )
+		;;
+	ar)
+		# GNU ar 会写符号表，BSD ar 不会；必须加 S（不生成符号表）。
+		# BSD ar 默认会尝试 ranlib，对非目标文件的成员直接丢弃，
+		# 产出一个只有 __.SYMDEF 的空壳归档。
+		if command -v ar >/dev/null 2>&1; then
+			( cd "$1" && ar rcS "$2" debian-binary control.tar.gz data.tar.gz ) ||
+				( cd "$1" && ar rc "$2" debian-binary control.tar.gz data.tar.gz )
+		else
+			( cd "$1" && _mkar "$2" debian-binary control.tar.gz data.tar.gz )
+		fi
+		;;
+	esac
+}
+
+_ipk_check() { # <ipk>：容器 magic 正确且恰好三个成员
+	_n=0
+	case "$IPK_FORMAT" in
+	tar)
+		printf '\037\213' > "$WORK/.magic.gz"
+		if ! dd if="$1" bs=1 count=2 2>/dev/null | cmp -s - "$WORK/.magic.gz"; then
+			echo "容器 magic 不是 1f 8b（gzip-tar）" >&2
+			return 1
+		fi
+		_n=$(tar tzf "$1" 2>/dev/null |
+			grep -cE '^(\./)?(debian-binary|control\.tar\.gz|data\.tar\.gz)$' || true)
+		;;
+	ar)
+		if command -v ar >/dev/null 2>&1; then
+			_n=$(ar t "$1" 2>/dev/null |
+				grep -cE '^(debian-binary|control\.tar\.gz|data\.tar\.gz)$' || true)
+		else
+			_n=$(head -c 8 "$1" | grep -c '^!<arch>' || true)
+			[ "$_n" -eq 1 ] && _n=3
+		fi
+		;;
+	esac
+	[ "$_n" -eq 3 ]
+}
+
 IPK=$OUT/${PKG}_${VER}-${REL}_${ARCH}.ipk
 rm -f "$IPK"
+_ipk_pack "$WORK" "$IPK" || { echo "打包失败: $IPK" >&2; exit 1; }
 
-# GNU ar 会写符号表，BSD ar 不会；用 rc 并清掉可能残留的旧文件
-# 关键：必须加 S（不生成符号表）。BSD ar 默认会尝试 ranlib，
-# 对非目标文件的成员直接丢弃，产出一个只有 __.SYMDEF 的空壳归档。
-if [ "${ISP_SPLIT_NO_AR:-0}" != "1" ] && command -v ar >/dev/null 2>&1; then
-	( cd "$WORK" && ar rcS "$IPK" debian-binary control.tar.gz data.tar.gz ) ||
-		( cd "$WORK" && ar rc "$IPK" debian-binary control.tar.gz data.tar.gz )
-else
-	( cd "$WORK" && _mkar "$IPK" debian-binary control.tar.gz data.tar.gz )
-fi
-
-# 冒烟校验：必须正好三个成员
-if command -v ar >/dev/null 2>&1; then
-	_n=$(ar t "$IPK" 2>/dev/null | grep -cE '^(debian-binary|control\.tar\.gz|data\.tar\.gz)$' || true)
-else
-	_n=$(head -c 8 "$IPK" | grep -c '^!<arch>' || true)
-	[ "$_n" -eq 1 ] && _n=3
-fi
-[ "$_n" -eq 3 ] || {
-	echo "归档成员不正确（$_n 个），可能是 ar 的平台差异" >&2
+# 冒烟校验：不要用 `... | head -N && echo ✓` 这种恒真判断
+_ipk_check "$IPK" || {
+	echo "归档结构不正确（格式=$IPK_FORMAT，成员=${_n:-0} 个）" >&2
 	exit 1
 }
 
@@ -161,19 +207,24 @@ LPOST
 	printf '2.0\n' > "$LW/debian-binary"
 	LIPK=$OUT/luci-app-isp-split_${VER}-${REL}_${ARCH}.ipk
 	rm -f "$LIPK"
-	if [ "${ISP_SPLIT_NO_AR:-0}" != "1" ] && command -v ar >/dev/null 2>&1; then
-		( cd "$LW" && ar rcS "$LIPK" debian-binary control.tar.gz data.tar.gz ) ||
-			( cd "$LW" && ar rc "$LIPK" debian-binary control.tar.gz data.tar.gz )
-	else
-		( cd "$LW" && _mkar "$LIPK" debian-binary control.tar.gz data.tar.gz )
-	fi
+	_ipk_pack "$LW" "$LIPK" || { echo "打包失败: $LIPK" >&2; exit 1; }
+	_ipk_check "$LIPK" || {
+		echo "归档结构不正确: $LIPK（格式=$IPK_FORMAT，成员=${_n:-0} 个）" >&2
+		exit 1
+	}
 	echo "已生成: $LIPK  ($(du -h "$LIPK" | cut -f1))"
 fi
 
 echo "已生成: $IPK  ($(du -h "$IPK" | cut -f1))"
 echo
-echo "归档内容:"
-ar t "$IPK" | sed 's/^/  /'
+echo "归档内容（$IPK_FORMAT 容器）:"
+if [ "$IPK_FORMAT" = tar ]; then
+	tar tzf "$IPK" | sed 's/^/  /'
+elif command -v ar >/dev/null 2>&1; then
+	ar t "$IPK" | sed 's/^/  /'
+else
+	echo "  (无 ar 命令，跳过列表)"
+fi
 echo
 echo "包元信息:"
 sed 's/^/  /' "$WORK/control/control"
