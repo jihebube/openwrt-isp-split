@@ -46,6 +46,8 @@ CFG_MWAN3=${ISP_SPLIT_MWAN3:-/etc/config/mwan3}
 # crontab 文件与 dnsmasq 服务脚本：允许覆盖仅用于离线自检。
 CRONTAB=${ISP_SPLIT_CRONTAB:-/etc/crontabs/root}
 DNSMASQ_SERVICE=${DNSMASQ_SERVICE:-/etc/init.d/dnsmasq}
+# mwan3 服务脚本：允许覆盖仅用于自检（stub reload 验证失败路径）。
+MWAN3_SERVICE=${MWAN3_SERVICE:-/etc/init.d/mwan3}
 
 [ -f "$CONF" ] || { echo "缺少 $CONF" >&2; exit 1; }
 . "$CONF"
@@ -95,9 +97,154 @@ log() {
 }
 
 die() {
+	_op_lock_cleanup
 	log "错误: $*"
 	exit 1
 }
+
+# ---- 全局操作锁（F-28）----
+# fetch/wire/apply/sync 共用固定的 $WORK/raw.new、out.new、compose.new、
+# data.new 与 mwan3 候选配置；cron refresh 与手动 sync 并发时彼此 rm -rf、
+# 半套数据互踩（实测 4 个并发 fetch 全部"构建产物为空"，DATA 都没生成）。
+#
+# 选型：单把操作锁，而不是"每次调用唯一临时名 + 原子 mv"。理由：
+#   1) 冲突点不只在临时文件——DATA 目录整体 mv、历史快照、.stamp/.sets
+#      事务、mwan3 落盘 + reload 都必须串行，唯一临时名解决不了后三者；
+#   2) 锁语义与既有的体检锁实现一致（mkdir 原子建锁 + pid/started +
+#      陈旧回收），运维只需要理解一种锁。
+# 嵌套调用（sync -> fetch -> wire -> apply）按同一 pid 重入，深度归零才释放。
+OP_LOCK=$STATE_DIR/op.lock
+OP_LOCK_OWNER=0
+OP_LOCK_DEPTH=0
+OP_LOCK_PID=""
+OP_LOCK_AGE=""
+
+# 锁年龄。pid/started 写入有窗口期，缺失时退回目录 mtime，绝不把"还没写"
+# 当成 epoch 0（否则刚建的锁会被立刻误判成陈旧锁）。
+_op_lock_age() {
+	_ol_t=$(cat "$OP_LOCK/started" 2>/dev/null)
+	case "$_ol_t" in '' | *[!0-9]*) _ol_t="" ;; esac
+	if [ -z "$_ol_t" ]; then
+		_ol_t=$(stat -c %Y "$OP_LOCK" 2>/dev/null)
+		case "$_ol_t" in '' | *[!0-9]*) _ol_t="" ;; esac
+	fi
+	if [ -z "$_ol_t" ]; then
+		printf '0'
+		return 0
+	fi
+	_ol_a=$(( $(date +%s) - _ol_t ))
+	[ "$_ol_a" -ge 0 ] 2>/dev/null || _ol_a=0
+	printf '%s' "$_ol_a"
+}
+
+# 0=拿到锁 1=已有操作在跑（OP_LOCK_PID/OP_LOCK_AGE） 2=建不了锁目录
+#
+# 与体检锁的差异（有意）：持锁进程活着就按"在跑"处理，不设 5 分钟上限
+# （fetch 在慢速 MIPS 路由器上可能跑很久）。只有超过 6 小时才回收，防 pid
+# 复用永久锁死；进程不存在时按 5 秒宽限回收。
+_op_lock_try() {
+	OP_LOCK_PID=""
+	OP_LOCK_AGE=""
+	mkdir -p "$STATE_DIR" 2>/dev/null || return 2
+	if mkdir "$OP_LOCK" 2>/dev/null; then
+		date +%s >"$OP_LOCK/started" 2>/dev/null || true
+		printf '%s\n' "$$" >"$OP_LOCK/pid" 2>/dev/null || true
+		OP_LOCK_OWNER=1
+		return 0
+	fi
+	_ol_p=$(cat "$OP_LOCK/pid" 2>/dev/null)
+	case "$_ol_p" in '' | *[!0-9]*) _ol_p="" ;; esac
+	_ol_s=$(cat "$OP_LOCK/started" 2>/dev/null)
+	case "$_ol_s" in '' | *[!0-9]*) _ol_s="" ;; esac
+	_ol_age=$(_op_lock_age)
+	case "$_ol_age" in '' | *[!0-9]*) _ol_age=0 ;; esac
+	# 元数据还没写全：锁刚 mkdir，持锁者正在写；宽限期内按在跑处理。
+	if [ -z "$_ol_p" ] && [ -z "$_ol_s" ]; then
+		OP_LOCK_AGE=$_ol_age
+		return 1
+	fi
+	# 活着的 pid 算持锁；只有超过 6 小时才允许回收（防 pid 复用永久锁死）。
+	if [ -n "$_ol_p" ] && kill -0 "$_ol_p" 2>/dev/null && [ "$_ol_age" -lt 21600 ]; then
+		OP_LOCK_PID=$_ol_p
+		OP_LOCK_AGE=$_ol_age
+		return 1
+	fi
+	# 刚创建/刚交接：宽限期内不回收，避免踩到 mkdir -> 写文件窗口。
+	if [ "$_ol_age" -lt 5 ]; then
+		[ -n "$_ol_p" ] && OP_LOCK_PID=$_ol_p
+		OP_LOCK_AGE=$_ol_age
+		return 1
+	fi
+	# 陈旧锁：rename 原子搬走再重建，避免 A 刚 rm、B 又 rm 掉 A 的新锁。
+	_stale=$OP_LOCK.stale.$$
+	rm -rf "$_stale" 2>/dev/null
+	if mv "$OP_LOCK" "$_stale" 2>/dev/null; then
+		rm -rf "$_stale" 2>/dev/null
+		if mkdir "$OP_LOCK" 2>/dev/null; then
+			date +%s >"$OP_LOCK/started" 2>/dev/null || true
+			printf '%s\n' "$$" >"$OP_LOCK/pid" 2>/dev/null || true
+			OP_LOCK_OWNER=1
+			return 0
+		fi
+	fi
+	OP_LOCK_AGE=$_ol_age
+	return 1
+}
+
+# 获取锁；已被本进程持有时只增加深度。等待上限 ISP_SPLIT_LOCK_WAIT 秒
+# （默认 30，0=不等待直接失败）。返回非 0 时调用方必须放弃并保持现状。
+_op_lock_acquire() {
+	if [ "${OP_LOCK_OWNER:-0}" = "1" ]; then
+		OP_LOCK_DEPTH=$((OP_LOCK_DEPTH + 1))
+		return 0
+	fi
+	_limit=${ISP_SPLIT_LOCK_WAIT:-30}
+	case "$_limit" in '' | *[!0-9]*) _limit=30 ;; esac
+	_waited=0
+	while :; do
+		_op_lock_try
+		_rc=$?
+		if [ "$_rc" -eq 0 ]; then
+			OP_LOCK_DEPTH=1
+			[ "$_waited" -gt 0 ] &&
+				log "已获取操作锁（等待 ${_waited}s）"
+			return 0
+		fi
+		if [ "$_rc" -eq 2 ]; then
+			log "错误：无法创建锁目录 $STATE_DIR（BASE 不可写？）"
+			return 1
+		fi
+		[ "$_waited" -eq 0 ] &&
+			log "另一个 isp-split 操作正在运行（pid ${OP_LOCK_PID:-?}），最多等待 ${_limit}s"
+		[ "$_waited" -ge "$_limit" ] && return 1
+		sleep 1
+		_waited=$((_waited + 1))
+	done
+}
+
+# 释放一层；深度归零且 pid 仍是自己时才删目录。
+_op_lock_release() {
+	[ "${OP_LOCK_OWNER:-0}" = "1" ] || return 0
+	OP_LOCK_DEPTH=$((OP_LOCK_DEPTH - 1))
+	[ "$OP_LOCK_DEPTH" -gt 0 ] && return 0
+	if [ "$(cat "$OP_LOCK/pid" 2>/dev/null)" = "$$" ]; then
+		rm -rf "$OP_LOCK" 2>/dev/null
+	fi
+	OP_LOCK_OWNER=0
+	OP_LOCK_DEPTH=0
+	return 0
+}
+
+# 进程退出/致命错误时把锁整体放掉（不受嵌套深度影响）。
+_op_lock_cleanup() {
+	[ "${OP_LOCK_OWNER:-0}" = "1" ] || return 0
+	OP_LOCK_DEPTH=1
+	_op_lock_release
+}
+
+# 正常路径也由 EXIT 兜底；cmd_wire 的 trap 会覆盖它，故 wire 内部显式恢复。
+trap '_op_lock_cleanup' EXIT
+trap '_op_lock_cleanup; exit 130' INT TERM
 
 need_nft() {
 	command -v nft >/dev/null 2>&1 || die "未找到 nft 命令"
@@ -872,7 +1019,7 @@ _mwan3_lines() {
 	'
 }
 
-cmd_fetch() {
+_cmd_fetch_body() {
 	mkdir -p "$WORK" || die "无法创建 $WORK"
 
 	# 源声明先校验，再联网：非法 URL/角色不该等到下载一半才发现。
@@ -1005,8 +1152,13 @@ cmd_fetch() {
 	_compose_raw "$_primary" "$WORK/raw.new/$_primary" "$WORK/compose.new" ||
 		die "按 ISP_SOURCE_FILES 合成失败，保留现有数据不动"
 
+	# 第三参数=全部行（保持 build.sh 的原始优先级序号与每个运营商的数据
+	# 文件），第四参数=只有 enabled=1 的行参与 claimed 差集占位（F-27）。
+	# 禁用行仍会生成自己的 .txt（重新启用后无需立刻重抓），但不会把地址
+	# 从后面启用的运营商里扣走。
 	ISP_SPLIT_LIB=$LIB sh "$LIB/build.sh" "$WORK/compose.new" "$WORK/out.new" \
-		"$(priority_list)" || die "构建失败，保留现有数据不动"
+		"$(priority_list)" "$(_enabled_src_list)" ||
+		die "构建失败，保留现有数据不动"
 
 	# 至少要有启用集合的非空产物，否则视为构建异常
 	_ok=0
@@ -1139,6 +1291,16 @@ cmd_fetch() {
 	fi
 
 	log "数据已更新：$(wc -l "$DATA"/*.txt | tail -1)"
+}
+
+# F-28：fetch 的固定 work 路径（raw.new/out.new/compose.new/data.new）
+# 必须串行使用。锁在整段 fetch 期间持有；失败路径由 die/EXIT trap 释放。
+cmd_fetch() {
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
+	_cmd_fetch_body
+	_rc=$?
+	_op_lock_release
+	return $_rc
 }
 
 # ---------------------------------------------------------------- diff
@@ -1438,7 +1600,7 @@ _fallback_counter() {
 	nft add rule inet mwan3 mwan3_rules "$_COND" 2>/dev/null || true
 }
 
-cmd_apply() {
+_cmd_apply_body() {
 	_openclash_fakeip_warn
 	need_nft
 	[ -f "$DATA/.stamp" ] || die "还没有数据，先执行: isp-split fetch"
@@ -1494,6 +1656,16 @@ cmd_apply() {
 	_dns_bypass 1 "$_ap_waited" ||
 		die "DNS 旁路规则恢复失败（mwan3 未就绪或 DNS_TABLE 配置错误，见上方日志）"
 	log "已生效"
+}
+
+# F-28：apply 与 fetch/wire 共用 WORK（batch.nft）和 nft 事务，
+# 与 fetch 的 DATA 替换、wire 的 reload 必须互斥。
+cmd_apply() {
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
+	_cmd_apply_body
+	_rc=$?
+	_op_lock_release
+	return $_rc
 }
 
 # 干跑校验：让 nft 完整解析并检查，但不提交任何改动。
@@ -2383,7 +2555,38 @@ _mwan3_atomic_install() {
 	mv -f "$_mi_src" "$CFG_MWAN3"
 }
 
-cmd_wire() {
+# reload 之后的最小形状复核（F-29）：mwan3 reload 的返回码并不可靠
+# （nft 批处理失败时也可能返回 0），必须确认每个启用集合真的被
+# mwan3_rules 引用。stage 的 RULE_ENABLED=0 是故意不渲染，直接跳过。
+_wire_runtime_check() {
+	[ "${RULE_ENABLED:-1}" = "1" ] || return 0
+	_wrc_any=0
+	_wrc_mark() { _wrc_any=1; }
+	foreach_enabled _wrc_mark
+	[ "$_wrc_any" = "1" ] || return 0
+
+	_wrc_tries=${MWAN3_READY_TRIES:-15}
+	_wrc_delay=${MWAN3_READY_DELAY:-1}
+	_wrc_i=0
+	while :; do
+		_wrc_body=$(_mwan3_rules_body)
+		_WRC_MISSING=""
+		_wrc_chk() {
+			if printf '%s\n' "$_wrc_body" | grep -q "@$2 " ||
+				printf '%s\n' "$_wrc_body" | grep -q "@$2\$"; then
+				return 0
+			fi
+			_WRC_MISSING="$_WRC_MISSING $2"
+		}
+		foreach_enabled _wrc_chk
+		[ -z "$_WRC_MISSING" ] && return 0
+		[ "$_wrc_i" -ge "$_wrc_tries" ] && return 1
+		_wrc_i=$((_wrc_i + 1))
+		sleep "$_wrc_delay"
+	done
+}
+
+_cmd_wire_body() {
 	_openclash_fakeip_warn
 	need_nft
 	# 先确认 work 目录可写再动 UCI：否则可能写到一半才发现写不了规则片段。
@@ -2418,8 +2621,8 @@ cmd_wire() {
 	_wire_cleanup() {
 		[ "${WIRE_DIRTY:-0}" = "1" ] && uci -q revert mwan3 2>/dev/null
 	}
-	trap '_wire_cleanup' EXIT
-	trap '_wire_cleanup; exit 130' INT TERM
+	trap '_wire_cleanup; _op_lock_cleanup' EXIT
+	trap '_wire_cleanup; _op_lock_cleanup; exit 130' INT TERM
 	_wire_all() { _wire_ipset "$1" "$2"; }
 	foreach_enabled _wire_all
 
@@ -2462,20 +2665,32 @@ cmd_wire() {
 	#    commit 失败也只清暂存区并告警，不把已校验的配置回退成旧的。
 	if uci -q commit mwan3; then
 		WIRE_DIRTY=0
-		trap - EXIT INT TERM
+		trap '_op_lock_cleanup' EXIT
+		trap '_op_lock_cleanup; exit 130' INT TERM
 	else
 		uci -q revert mwan3 2>/dev/null
 		WIRE_DIRTY=0
-		trap - EXIT INT TERM
+		trap '_op_lock_cleanup' EXIT
+		trap '_op_lock_cleanup; exit 130' INT TERM
 		log "警告：uci commit mwan3 失败；$CFG_MWAN3 已按校验通过的内容原子替换"
 	fi
-	log "规则已注入（备份: $WORK/mwan3.bak）"
+	log "mwan3 配置已写入（备份: $WORK/mwan3.bak），正在 reload…"
 	# 7. 收敛孤儿 ipset / policy / member 段：必须放在规则块重写之后 ——
 	# 改名时旧规则这一刻才消失；若在注入前做，旧规则仍引用旧段，会被
 	# 误判成"保留"。
 	_prune_orphan_ipsets
 	_prune_orphan_policies
-	/etc/init.d/mwan3 reload
+	if ! "$MWAN3_SERVICE" reload; then
+		die "mwan3 reload 失败：新配置已写入 $CFG_MWAN3 但未生效（备份: $WORK/mwan3.bak）。回滚: cp $WORK/mwan3.bak $CFG_MWAN3 && $MWAN3_SERVICE reload；或检查 mwan3 日志后重试 wire"
+	fi
+	if ! _wire_runtime_check; then
+		die "mwan3 reload 返回成功，但 nft 规则未按预期渲染（缺失集合:${_WRC_MISSING:- ?}；备份: $WORK/mwan3.bak）。回滚: cp $WORK/mwan3.bak $CFG_MWAN3 && $MWAN3_SERVICE reload；或检查 mwan3 日志后重试 wire"
+	fi
+	if [ "${RULE_ENABLED:-1}" = "1" ]; then
+		log "规则已注入并生效（备份: $WORK/mwan3.bak）"
+	else
+		log "规则已写入但未启用（stage；备份: $WORK/mwan3.bak）"
+	fi
 	_fallback_counter ||
 		log "警告：兜底计数规则未安装成功（status 的兜底行会缺失或为旧值），可稍后重跑 isp-split apply"
 	# reload 刚返回时 mwan3_output 往往还没重建完，这里必须等/重试；
@@ -2484,19 +2699,32 @@ cmd_wire() {
 		die "DNS 旁路规则恢复失败（mwan3 未就绪或 DNS_TABLE 配置错误，见上方日志）"
 }
 
+# F-28：wire 写 WORK 下的候选配置并 reload mwan3，与 fetch/apply 互斥。
+cmd_wire() {
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
+	_cmd_wire_body
+	_rc=$?
+	_op_lock_release
+	return $_rc
+}
+
 # 只刷新数据并原子刷入，不重写 mwan3 配置、不 reload mwan3。
 # 日常定时任务应该用它：规则结构没变，每天重写配置再 reload 是没必要的抖动。
 cmd_refresh() {
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
 	cmd_fetch
 	cmd_apply
+	_op_lock_release
 	log "数据已刷新（mwan3 配置未改动）。要改规则映射请用 wire / sync"
 }
 
 cmd_sync() {
 	_openclash_fakeip_warn
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
 	cmd_fetch
 	cmd_wire
 	cmd_apply
+	_op_lock_release
 	log "同步完成，用 isp-split status 验证"
 }
 
@@ -2745,8 +2973,15 @@ cmd_plan() {
 
 	echo
 	echo "将会写入的 mwan3 规则（插在第一个匹配 '$ISP_ANCHOR' 的规则之前）:"
-	_tmp=$(mktemp)
-	: > "$_tmp"
+	# B-6：mktemp 必须带模板并检查失败。裸 mktemp 在 TMPDIR 不可用时
+	# 返回空串，随后 `: > ""` 把错误抛到下一行（can't create : nonexistent
+	# directory），用户只看到半截输出。这里直接干净退出。
+	_tmp=$(mktemp "${TMPDIR:-/tmp}/isp-split-plan-rules.XXXXXX" 2>/dev/null) ||
+		die "无法创建临时文件（TMPDIR=${TMPDIR:-/tmp} 不可用？），plan 未做任何改动"
+	: > "$_tmp" || {
+		rm -f "$_tmp"
+		die "无法写入临时文件 $_tmp，plan 未做任何改动"
+	}
 	_p4() {
 		_src=$1
 		_set=$2
@@ -2760,9 +2995,16 @@ cmd_plan() {
 	echo
 	echo "注入后的规则匹配顺序（预演结果）:"
 	if [ -f "$CFG_MWAN3" ]; then
-		_rtmp=$(mktemp)
-		_wtmp=$(mktemp)
-		: > "$_wtmp"
+		_rtmp=$(mktemp "${TMPDIR:-/tmp}/isp-split-plan-order.XXXXXX" 2>/dev/null) ||
+			die "无法创建临时文件（TMPDIR=${TMPDIR:-/tmp} 不可用？），plan 未做任何改动"
+		_wtmp=$(mktemp "${TMPDIR:-/tmp}/isp-split-plan-wire.XXXXXX" 2>/dev/null) || {
+			rm -f "$_rtmp"
+			die "无法创建临时文件（TMPDIR=${TMPDIR:-/tmp} 不可用？），plan 未做任何改动"
+		}
+		: > "$_wtmp" || {
+			rm -f "$_rtmp" "$_wtmp"
+			die "无法写入临时文件 $_wtmp，plan 未做任何改动"
+		}
 		_p5() {
 			_src=$1
 			_set=$2
@@ -3447,17 +3689,71 @@ _restore_dns_confdir() {
 }
 
 # 策略 -> 出接口设备名（策略取第一个成员）
+#
+# F-13：bind 模式只允许绑定"运行时确实 up 且有 IPv4 地址"的 l3_device。
+# 旧实现 ifstatus 没有 l3_device 时回退 uci network.X.device——PPPoE 未就绪
+# 窗口里那是底层 VLAN（eth1.10），dnsmasq 会静默 SO_BINDTODEVICE 到没有
+# 会话的口上，域名解析全部失败但脚本返回 0。
+#
+# 现在：
+#   · 接口非 up / 无 IPv4 / 无 l3_device -> POLICY_DEV 为空，POLICY_DEV_STATE
+#     给出原因（down/no-ip/no-l3），调用方（cmd_dns）跳过绑定并明确告警；
+#   · 绝不回退 uci device 去"凑一个名字"，宁可少一条规则也不绑错口。
+# 兼容：仍把设备名打印到 stdout，但需要状态时请读 POLICY_DEV_* 全局变量
+# （命令替换会丢全局，cmd_dns 改为直接调用后读变量）。
 policy_device() {
+	POLICY_DEV=""
+	POLICY_DEV_STATE="config"
+	POLICY_DEV_IFACE=""
 	_m=$(uci -q get "mwan3.$1.use_member" 2>/dev/null | awk '{print $1}')
-	[ -n "$_m" ] || return 0
+	[ -n "$_m" ] || {
+		POLICY_DEV_STATE="no-member"
+		return 0
+	}
 	_i=$(uci -q get "mwan3.$_m.interface" 2>/dev/null)
-	[ -n "$_i" ] || return 0
-	# pppoe 等虚拟接口的运行时设备取 l3_device（如 pppoe-wan1）；
-	# uci 的 device 字段可能是底层 VLAN（如 eth1.10），DNS 绑定会失败
-	_d=$(ifstatus "$_i" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
-	[ -z "$_d" ] && _d=$(uci -q get "network.$_i.device" 2>/dev/null)
-	[ -z "$_d" ] && _d=$(uci -q get "network.$_i.ifname" 2>/dev/null)
-	echo "$_d"
+	[ -n "$_i" ] || {
+		POLICY_DEV_STATE="no-iface"
+		return 0
+	}
+	POLICY_DEV_IFACE=$_i
+
+	case "$(_iface_runtime_state "$_i")" in
+	up) ;;
+	*)
+		POLICY_DEV_STATE="down"
+		return 0
+		;;
+	esac
+
+	_pd_raw=$(ifstatus "$_i" 2>/dev/null) || _pd_raw=""
+	_d=""
+	_ip=""
+	if [ -n "$_pd_raw" ]; then
+		if command -v jsonfilter >/dev/null 2>&1; then
+			_d=$(printf '%s' "$_pd_raw" | jsonfilter -e '@.l3_device' 2>/dev/null)
+			# 字段名带连字符，jsonfilter 必须用带引号的下标写法
+			_ip=$(printf '%s' "$_pd_raw" |
+				jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+		fi
+		[ -n "$_d" ] || _d=$(printf '%s\n' "$_pd_raw" |
+			sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+		# jsonfilter 不在时也不能把"能用的接口"误判成 no-ip：
+		# 从 ifstatus 的 ipv4-address 段里取第一个 address。
+		[ -n "$_ip" ] || _ip=$(printf '%s\n' "$_pd_raw" |
+			sed -n '/"ipv4-address"/,/]/s/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+			head -1)
+	fi
+	if [ -z "$_ip" ]; then
+		POLICY_DEV_STATE="no-ip"
+		return 0
+	fi
+	if [ -z "$_d" ]; then
+		POLICY_DEV_STATE="no-l3"
+		return 0
+	fi
+	POLICY_DEV=$_d
+	POLICY_DEV_STATE="ok"
+	printf '%s\n' "$_d"
 }
 
 # 策略 -> 该线路的 DNS
@@ -3704,6 +4000,158 @@ _dns_chain_ok() {
 		grep -qE 'dport 53 (counter packets [0-9]+ bytes [0-9]+ )?(return|jump mwan3_policy_)'
 }
 
+# 域名合法字符：只允许主机名/后缀实际会用到的字符。外部清单里出现
+# 空格、/、#、分号等会破坏 server=/域名/IP 的语法（dnsmasq 可能直接
+# 拒绝整份配置，全屋 DNS 中断），必须在拼接前挡掉。
+_dns_domain_ok() {
+	case "$1" in
+	"" | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
+# 解析策略的出线 DNS 与绑定设备（F-13）。
+# 成功：_DNS_DNS / _DNS_DEV / _DNS_BIND 就绪，返回 0。
+# 失败：已打印明确原因并计入 _DNS_SKIP，返回 1。
+# bind 模式只接受 POLICY_DEV_STATE=ok（运行时 up + 有 IPv4 + 有 l3_device），
+# 绝不回退 uci network.X.device —— PPPoE 未就绪时那是底层 VLAN。
+_dns_policy_bind() {
+	_dpb_pol=$1
+	_dpb_what=$2
+	_TARGET=$_dpb_pol
+	_DNS_DNS=$(dns_of_policy)
+	if [ -z "$_DNS_DNS" ]; then
+		log "跳过 $_dpb_what（策略 $_dpb_pol 缺少 DNS_TABLE 条目）"
+		_DNS_SKIP=$((_DNS_SKIP + 1))
+		return 1
+	fi
+	policy_device "$_dpb_pol" >/dev/null
+	_DNS_DEV=$POLICY_DEV
+	if [ "${DNS_MODE:-bind}" = "bind" ]; then
+		case "$POLICY_DEV_STATE" in
+		ok) ;;
+		down | no-ip | no-l3)
+			log "警告：跳过 $_dpb_what（策略 $_dpb_pol 的线路 ${POLICY_DEV_IFACE:-?} 未就绪: $POLICY_DEV_STATE）。此时绑定会指到底层设备/VLAN，已拒绝；等待 WAN up 后重跑 isp-split dns"
+			_DNS_SKIP=$((_DNS_SKIP + 1))
+			return 1
+			;;
+		*)
+			log "跳过 $_dpb_what（策略 $_dpb_pol 找不到可用成员/接口: $POLICY_DEV_STATE）"
+			_DNS_SKIP=$((_DNS_SKIP + 1))
+			return 1
+			;;
+		esac
+	fi
+	_DNS_BIND=""
+	[ "${DNS_MODE:-bind}" = "bind" ] && _DNS_BIND="@$_DNS_DEV"
+	return 0
+}
+
+# 生成 server= 规则到 <out>。返回后读 _DNS_RULE_N / _DNS_SKIP / _DNS_BAD。
+# 外部清单用一次 awk 完成：CR 清理、注释、server=/... 取域名、字符校验、
+# 末行无换行（awk 天然处理）都在同一进程里，不再逐行 printf|tr 双 fork。
+_dns_emit_rules() {
+	_der_out=$1
+	_der_err=$_der_out.warn
+	_DNS_RULE_N=0
+	_DNS_SKIP=0
+	_DNS_BAD=0
+	_DNS_DNS=""
+	_DNS_DEV=""
+	_DNS_BIND=""
+	: > "$_der_err" || true
+
+	# 1) 内联域名配置：DOMAIN_SPLIT="域名:策略 ..."
+	for row in ${DOMAIN_SPLIT:-}; do
+		_dom=${row%%:*}
+		_pol=${row#*:}
+		[ -n "$_dom" ] && [ -n "$_pol" ] || continue
+		if ! _dns_domain_ok "$_dom"; then
+			log "警告：DOMAIN_SPLIT 里的域名非法，已跳过: $(printf '%s' "$_dom" | cut -c1-80)"
+			_DNS_BAD=$((_DNS_BAD + 1))
+			continue
+		fi
+		_dns_policy_bind "$_pol" "$_dom" || continue
+		printf 'server=/%s/%s%s\n' "$_dom" "$_DNS_DNS" "$_DNS_BIND" >> "$_der_out" ||
+			die "无法写入 $_der_out"
+		_DNS_RULE_N=$((_DNS_RULE_N + 1))
+	done
+
+	# 2) 外部域名清单：$DOMAINDIR/<策略>.txt
+	#    每行一个域名；也兼容 felixonmars/dnsmasq-china-list 的
+	#    server=/domain/1.2.3.4 形式（只取域名，DNS 用本线路的）
+	for _f in "$DOMAINDIR"/*.txt; do
+		[ -f "$_f" ] || continue
+		_pol=${_f##*/}
+		_pol=${_pol%.txt}
+		_dns_policy_bind "$_pol" "$_f" || continue
+		# 规则由 awk 直接追加到 out，stdout 只留计数（否则计数会被
+		# 追加进片段文件，_DNS_RULE_N 永远是 0）。
+		_c=$(awk -v dns="$_DNS_DNS" -v bind="$_DNS_BIND" -v src="$_f" -v out="$_der_out" '
+			{ sub(/\r$/, "") }
+			/^[[:space:]]*#/ { next }
+			/^[[:space:]]*$/ { next }
+			{
+				line = $0
+				d = line
+				if (line ~ /^server=\//) {
+					sub(/^server=\//, "", d)
+					sub(/\/.*/, "", d)
+				}
+				if (d == "" || d ~ /^\./) next
+				if (d !~ /^[A-Za-z0-9._-]+$/) {
+					printf "%s 第 %d 行域名非法，已跳过: %s\n", src, NR, substr(line, 1, 80) > "/dev/stderr"
+					next
+				}
+				printf "server=/%s/%s%s\n", d, dns, bind >> out
+				n++
+			}
+			END { print n + 0 }
+		' "$_f" 2>>"$_der_err")
+		case "$_c" in '' | *[!0-9]*) _c=0 ;; esac
+		if [ "$_c" -gt 0 ]; then
+			log "$_f: $_c 条域名 -> $_DNS_DNS${_DNS_DEV:+@$_DNS_DEV}"
+			_DNS_RULE_N=$((_DNS_RULE_N + _c))
+		fi
+	done
+
+	if [ -s "$_der_err" ]; then
+		while IFS= read -r _w; do
+			log "警告：$_w"
+			_DNS_BAD=$((_DNS_BAD + 1))
+		done < "$_der_err"
+	fi
+	rm -f "$_der_err"
+	return 0
+}
+
+# 片段语法自检（F-12）。dnsmasq 缺失 -> 降级告警（不算失败）；
+# dnsmasq --test 在当前环境本身跑不起来（容器/无 /dev/urandom）-> 同样降级，
+# 否则会把环境问题误判成配置错误。基线能跑而本片段失败才是硬错误。
+_dns_check_fragment() {
+	_dcf_file=$1
+	command -v dnsmasq >/dev/null 2>&1 || {
+		log "警告：未找到 dnsmasq，跳过片段语法自检"
+		return 0
+	}
+	if ! dnsmasq --test --conf-file=/dev/null >/dev/null 2>&1; then
+		log "警告：dnsmasq --test 在当前环境不可用（基线自检失败），跳过片段语法自检"
+		return 0
+	fi
+	_dcf_out=$(dnsmasq --test --conf-file="$_dcf_file" 2>&1) && return 0
+	log "错误：生成的 dnsmasq 片段未通过 dnsmasq --test：$(printf '%s' "$_dcf_out" | head -2 | tr '\n' ' ')"
+	return 1
+}
+
+# 只回显前几条规则：LuCI 通过 ubus 捕获 stdout，十万条规则全量回显会
+# 撑爆响应（F-12）。完整内容始终在文件里。
+_dns_print_preview() {
+	echo "生成的规则（前 3 条，共 $2 条；完整内容: $1）："
+	grep '^server=' "$1" 2>/dev/null | head -n 3 | sed 's/^/  /'
+	[ "$2" -gt 3 ] && echo "  …（其余 $(( $2 - 3 )) 条见文件）"
+	return 0
+}
+
 cmd_dns() {
 	need_nft
 	mkdir -p "$DNS_STATE" "$DOMAINDIR"
@@ -3769,69 +4217,18 @@ cmd_dns() {
 		die "无法写入 $_out_tmp"
 	}
 
-	_n=0
-	_skip=0
+	_dns_emit_rules "$_out_tmp"
+	_n=$_DNS_RULE_N
+	_skip=$_DNS_SKIP
+	_bad=$_DNS_BAD
 
-	# 1) 内联域名配置：DOMAIN_SPLIT="域名:策略 ..."
-	for row in ${DOMAIN_SPLIT:-}; do
-		_dom=${row%%:*}
-		_pol=${row#*:}
-		[ -n "$_dom" ] && [ -n "$_pol" ] || continue
-		_TARGET=$_pol
-		_dns=$(dns_of_policy)
-		_dev=$(policy_device "$_pol")
-		_bind=""
-		[ "$DNS_MODE" = "bind" ] && _bind="@$_dev"
-		if [ -z "$_dns" ] || { [ "$DNS_MODE" = "bind" ] && [ -z "$_dev" ]; }; then
-			log "跳过 $_dom（策略 $_pol 缺少 DNS_TABLE 或设备名）"
-			_skip=$((_skip + 1))
-			continue
-		fi
-		echo "server=/$_dom/$_dns$_bind" >> "$_out_tmp"
-		_n=$((_n + 1))
-	done
+	# 3) 先做片段语法自检：坏片段在动 nft 之前就拒绝，不留下半套旁路。
+	if [ "$_n" -gt 0 ] && ! _dns_check_fragment "$_out_tmp"; then
+		rm -f "$_out_tmp"
+		die "生成的 dnsmasq 片段未通过语法自检，已放弃（现有片段未改动）"
+	fi
 
-	# 2) 外部域名清单：$DOMAINDIR/<策略>.txt
-	#    每行一个域名；也兼容 felixonmars/dnsmasq-china-list 的
-	#    server=/domain/1.2.3.4 形式（只取域名，DNS 用本线路的）
-	for _f in "$DOMAINDIR"/*.txt; do
-		[ -f "$_f" ] || continue
-		_pol=${_f##*/}
-		_pol=${_pol%.txt}
-		_TARGET=$_pol
-		_dns=$(dns_of_policy)
-		_dev=$(policy_device "$_pol")
-		_bind=""
-		[ "$DNS_MODE" = "bind" ] && _bind="@$_dev"
-		if [ -z "$_dns" ] || { [ "$DNS_MODE" = "bind" ] && [ -z "$_dev" ]; }; then
-			log "跳过 $_f（策略 $_pol 缺少 DNS_TABLE 或设备名）"
-			_skip=$((_skip + 1))
-			continue
-		fi
-		_c=0
-		while IFS= read -r _line; do
-			_line=$(printf '%s' "$_line" | tr -d '\r')
-			case "$_line" in
-			""|"#"*) continue ;;
-			server=/*)
-				# server=/domain/1.2.3.4 -> domain
-				_d=${_line#server=/}
-				_d=${_d%%/*}
-				;;
-			*) _d=$_line ;;
-			esac
-			case "$_d" in
-			""|.*) continue ;;
-			esac
-			echo "server=/$_d/$_dns$_bind" >> "$_out_tmp"
-			_c=$((_c + 1))
-		done < "$_f"
-		[ "$_c" -gt 0 ] || continue
-		log "$_f: $_c 条域名 -> $_dns@$_dev"
-		_n=$((_n + _c))
-	done
-
-	# 3) 处理 DNS 查询的出线（幂等，mwan3 重启后重跑 wire/apply/dns 即恢复）
+	# 4) 处理 DNS 查询的出线（幂等，mwan3 重启后重跑 wire/apply/dns 即恢复）
 	# dns 命令即使 mwan3 暂时未就绪也要把 dnsmasq 片段写出来，
 	# 所以 required=0；但配置错误必须立即失败，不能静默生成坏片段。
 	_dns_bypass 0
@@ -3845,14 +4242,22 @@ cmd_dns() {
 	fi
 
 	if [ "$_n" -eq 0 ]; then
-		rm -f "$_out_tmp" "$_out"
-		log "没有域名分流规则（DNS 旁路已按 DNS_TABLE 就位）"
-		log "要启用域名分流请配置 DOMAIN_SPLIT，或在 $DOMAINDIR/<策略>.txt 放入域名清单"
+		rm -f "$_out_tmp"
+		if [ -f "$_out" ] && { [ "$_skip" -gt 0 ] || [ "$_bad" -gt 0 ]; }; then
+			# 线路未就绪/清单全非法时不要删掉上一份可用片段：开机时
+			# PPPoE 往往还没 up，删掉会让域名分流一直空到下次手动 dns。
+			# 明确告警，等 WAN up 后重跑即可覆盖。
+			log "警告：本次没有生成任何规则（线路未就绪或清单非法），保留现有片段 $_out 不动；WAN up 后请重跑 isp-split dns"
+		else
+			rm -f "$_out"
+			log "没有域名分流规则（DNS 旁路已按 DNS_TABLE 就位）"
+			log "要启用域名分流请配置 DOMAIN_SPLIT，或在 $DOMAINDIR/<策略>.txt 放入域名清单"
+		fi
 		return 0
 	fi
 
-	# 4) 片段原子落位（rename 不跟随符号链接），再让 dnsmasq 重新加载。
-	#    runtime/ps 路径不改 UCI，避免覆盖 OpenClash/adblock 等接管配置。
+	# 5) 片段原子落位（rename 不跟随符号链接），再让 dnsmasq 重新加载。
+	#    runtime/ps 路径不改 UCI，避免覆盖 OpenClash/adblock 等接管配置；
 	#    卸载时按同一探测结果清理。
 	# mktemp 建的是 0600；dnsmasq 以 dnsmasq 用户读 conf-dir，
 	# 片段必须是全局可读的（旧实现直接重定向，权限是 umask 的 0644）。
@@ -3864,10 +4269,10 @@ cmd_dns() {
 	"$DNSMASQ_SERVICE" restart >/dev/null 2>&1 || log "警告：dnsmasq 重启失败"
 
 	log "已生成 $_n 条域名 DNS 规则 -> $_out（confdir: $_confdir，来源: $DNS_CONFDIR_SOURCE，$_uci_note）"
-	[ "$_skip" -gt 0 ] && log "有 $_skip 组因缺配置被跳过"
+	[ "$_skip" -gt 0 ] && log "有 $_skip 组因配置缺失/线路未就绪被跳过"
+	[ "$_bad" -gt 0 ] && log "有 $_bad 行域名因字符非法被跳过"
 	echo
-	echo "生成的规则："
-	sed 's/^/  /' "$_out"
+	_dns_print_preview "$_out" "$_n"
 }
 
 # ---------------------------------------------------------------- conf
@@ -4717,7 +5122,7 @@ EOF
 
 # ---------------------------------------------------------------- rollback
 
-cmd_rollback() {
+_cmd_rollback_body() {
 	_last=$(ls -1d "$BASE/.history"/*/ 2>/dev/null | sort | tail -1)
 	[ -n "$_last" ] || die "没有可回滚的历史数据"
 
@@ -4756,6 +5161,15 @@ cmd_rollback() {
 
 	log "回滚到 $_last"
 	cmd_apply
+}
+
+# F-28：rollback 同样 mv DATA 并调用 apply，必须与 fetch/wire 互斥。
+cmd_rollback() {
+	_op_lock_acquire || die "另一个 isp-split 操作正在运行（锁: $OP_LOCK），本次未做任何改动；稍后重试"
+	_cmd_rollback_body
+	_rc=$?
+	_op_lock_release
+	return $_rc
 }
 
 # ---------------------------------------------------------------- install

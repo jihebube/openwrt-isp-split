@@ -29,14 +29,16 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 die() { echo "$*" >&2; exit 1; }
 
-WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/verify-pkg.XXXXXX)
+WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/verify-pkg.XXXXXX) ||
+	die "无法创建临时目录"
 trap 'rm -rf "$WORK"' EXIT
 printf '\037\213' >"$WORK/m.gz"
 printf '!<ar' >"$WORK/m.ar"
 printf 'ADBd' >"$WORK/m.adb"
 
 mkdtemp() {
-	mktemp -d 2>/dev/null || mktemp -d /tmp/verify-pkg.XXXXXX
+	mktemp -d 2>/dev/null || mktemp -d /tmp/verify-pkg.XXXXXX ||
+		die "无法创建临时目录"
 }
 
 magic_id() { # <pkg> -> gzip | ar | apk | unknown

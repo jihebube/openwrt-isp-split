@@ -22,7 +22,8 @@ ROOT=${1:-}
 [ -n "$ROOT" ] || { echo "用法: sh strip-linecheck.sh <staging-root>" >&2; exit 1; }
 [ -d "$ROOT" ] || { echo "目录不存在: $ROOT" >&2; exit 1; }
 
-WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/lcstrip.XXXXXX)
+WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/lcstrip.XXXXXX) ||
+	{ echo "无法创建临时目录" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
 # 0) 标记配对自检：缺 lc:end 时 sed 会静默删到文件末尾，必须在剥离前拦住。

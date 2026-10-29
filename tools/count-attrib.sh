@@ -105,7 +105,8 @@ rule_shape() {
 	fi
 }
 
-TMPD=$(mktemp -d 2>/dev/null) || TMPD=/tmp/count-attrib.$$
+TMPD=$(mktemp -d 2>/dev/null) || TMPD=$(mktemp -d /tmp/count-attrib.XXXXXX) ||
+	{ echo "无法创建临时目录" >&2; exit 1; }
 mkdir -p "$TMPD"
 trap 'rm -rf "$TMPD"' EXIT INT TERM
 

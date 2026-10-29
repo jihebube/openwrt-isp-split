@@ -24,7 +24,8 @@ case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 
 NAME=isp-split-$VER
 
 OUT=$ROOT/dist
-WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX)
+WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX) ||
+	{ echo "无法创建临时目录" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$OUT"

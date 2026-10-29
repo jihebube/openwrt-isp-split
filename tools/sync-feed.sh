@@ -7,7 +7,9 @@ cp -f files/usr/sbin/isp-split          feed/op-packages/isp-split/files/usr/sbi
 cp -f files/etc/isp-split.conf          feed/op-packages/isp-split/files/etc/isp-split.conf 2>/dev/null || true
 cp -f files/etc/init.d/isp-split        feed/op-packages/isp-split/files/etc/init.d/isp-split 2>/dev/null || true
 mkdir -p feed/op-packages/isp-split/files/usr/lib/isp-split
-cp -f files/usr/lib/isp-split/lc-run    feed/op-packages/isp-split/files/usr/lib/isp-split/lc-run 2>/dev/null || true
+# 数据管线与体检运行时的全部文件：下方逐字节校验覆盖 build.sh/*.awk，
+# 只拷 lc-run 会让 build.sh 在改版后悄悄漂移（cmp 失败才暴露）。
+cp -f files/usr/lib/isp-split/* feed/op-packages/isp-split/files/usr/lib/isp-split/
 # 两个包 Makefile 与主源码逐字节一致：FEATURE_LINECHECK / strip 规则不会漂移
 cp -f Makefile                          feed/op-packages/isp-split/Makefile
 cp -f luci-app-isp-split/Makefile       feed/op-packages/luci-app-isp-split/Makefile

@@ -28,7 +28,8 @@ ARCH=all
 FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 OUT=$ROOT/dist
-WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX)
+WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX) ||
+	{ echo "无法创建临时目录" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
 # 容器格式：tar = gzip-tar（默认，23.05/24.10 官方同款）；ar = 历史明文 ar

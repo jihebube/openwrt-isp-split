@@ -2774,11 +2774,25 @@ list)
 		echo "table inet mwan3 {"
 		echo "	chain mwan3_rules {"
 		echo "		ip daddr @isp_tel meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only"
+		# F-29 形状复核：默认两个启用集合都渲染；FAKE_NFT_OMIT_SET
+		# 用来模拟"reload 返回 0 但某集合没进 mwan3_rules"。
+		case " ${FAKE_NFT_OMIT_SET:-} " in
+		*" isp_uni "*) ;;
+		*) echo "		ip daddr @isp_uni meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wanb_only" ;;
+		esac
 		echo "	}"
 		echo "}"
 		exit 0
 		;;
-	"chain inet mwan3 mwan3_output") exit 0 ;;
+	"chain inet mwan3 mwan3_output")
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_output {"
+		echo "		type filter hook output priority mangle; policy accept;"
+		echo "		jump mwan3_rules"
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
 	"counter inet mwan3 isp_fallback")
 		echo 'counter isp_fallback { packets 0 bytes 0 }'
 		exit 0
@@ -2790,6 +2804,11 @@ esac
 exit 0
 FAKE_NFT_B25
 chmod +x "$B25/bin/uci" "$B25/bin/nft"
+# mwan3 服务桩：默认成功（不碰 VM 的真实 mwan3），F-29 用 fail 桩重放
+# Hermes 的"reload 必 exit 1"复现法。
+printf '#!/bin/sh\nexit 0\n' > "$B25/bin/mwan3-ok"
+printf '#!/bin/sh\nexit 1\n' > "$B25/bin/mwan3-fail"
+chmod +x "$B25/bin/mwan3-ok" "$B25/bin/mwan3-fail"
 
 cat > "$B25/conf" <<'B25_CONF'
 ISP_TABLE="
@@ -2856,7 +2875,7 @@ b25_run() { # <state> <conf> <args...>
 	shift 2
 	(
 		PATH="$B25/bin:$PATH"
-		TMPDIR="$B25/tmp"
+		TMPDIR="${B25_TMPDIR:-$B25/tmp}"
 		FAKE_UCI_STATE="$_b25_st"
 		ISP_SPLIT_CONF="$_b25_cf"
 		ISP_SPLIT_BASE="$B25/base"
@@ -2864,8 +2883,12 @@ b25_run() { # <state> <conf> <args...>
 		ISP_SPLIT_MWAN3="$B25/mwan3"
 		DNSMASQ_CONF_GLOB="$B25/no-such-dnsmasq.conf.*"
 		DNSMASQ_DEFAULT_DIR="$B25/dnsmasq.d"
+		MWAN3_SERVICE="${MWAN3_SERVICE:-$B25/bin/mwan3-ok}"
+		MWAN3_READY_TRIES="${MWAN3_READY_TRIES:-1}"
+		MWAN3_READY_DELAY="${MWAN3_READY_DELAY:-0}"
 		export PATH TMPDIR FAKE_UCI_STATE ISP_SPLIT_CONF ISP_SPLIT_BASE \
-			ISP_SPLIT_LIB ISP_SPLIT_MWAN3 DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
+			ISP_SPLIT_LIB ISP_SPLIT_MWAN3 DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR \
+			MWAN3_SERVICE MWAN3_READY_TRIES MWAN3_READY_DELAY
 		sh "$ROOT/files/usr/sbin/isp-split" "$@"
 	)
 }
@@ -3963,6 +3986,431 @@ if [ -f "${_mipk:-}" ] && [ -f "${_lipk:-}" ]; then
 	fi
 else
 	skip "19b.17 方向鉴别（缺 19b.10 的 0 版产物）"
+fi
+
+
+# ---- 20. 运行时行为欠账（fix32a：F-12余项/F-13/F-27/F-28/F-29/B-6） ----
+# 这一节的断言全部按"可观察行为"写，编号只放在注释里：
+#   F-27  禁用行不参与差集占位，但仍按原顺序生成数据文件
+#   F-13  bind 时线路未就绪必须跳过并告警，绝不绑到底层设备
+#   F-12  外部清单单次 awk、末行不丢、非法域名跳过、dnsmasq 自检、只回显前几条
+#   F-28  fetch/sync 并发互斥，第二个调用干净失败而不是互踩
+#   F-29  reload 失败 / reload 成功但规则没渲染，都必须让 wire 非零
+#   B-6   TMPDIR 不可用时 plan 干净报错，不再 can't create 崩在半截
+echo "== 20. 运行时行为（fix32a）"
+F32=$TMP/f32
+mkdir -p "$F32"
+
+# ---- 20.1 F-27：禁用行不占位，但仍按原顺序生成文件 ----
+mkdir -p "$F32/f27/raw"
+printf '10.10.0.0/16\n10.20.0.0/16\n' > "$F32/f27/raw/hi.raw"
+printf '10.10.0.0/16\n10.30.0.0/16\n' > "$F32/f27/raw/lo.raw"
+sh "$LIB/build.sh" "$F32/f27/raw" "$F32/f27/out-disabled" "hi lo" "lo" \
+	2> "$F32/f27/report-disabled"
+if grep -qx '10.10.0.0/16' "$F32/f27/out-disabled/lo.txt" &&
+   grep -qx '10.30.0.0/16' "$F32/f27/out-disabled/lo.txt" &&
+   grep -qx '10.20.0.0/16' "$F32/f27/out-disabled/hi.txt"; then
+	ok "20.1 禁用的高优先级行不再抢走启用行的重叠地址（F-27）"
+else
+	ng "20.1 禁用行仍占位：lo=[$(tr '\n' ' ' < "$F32/f27/out-disabled/lo.txt" 2>/dev/null)]（F-27）"
+fi
+sh "$LIB/build.sh" "$F32/f27/raw" "$F32/f27/out-enabled" "hi lo" "hi lo" \
+	2> "$F32/f27/report-enabled"
+if [ ! -s "$F32/f27/out-enabled/lo.txt" ] ||
+   ! grep -qx '10.10.0.0/16' "$F32/f27/out-enabled/lo.txt"; then
+	ok "20.1b 启用后恢复正常占位（互相重叠的地址只归高优先级）（F-27）"
+else
+	ng "20.1b 启用 hi 后 lo 仍拿到 10.10.0.0/16（F-27）"
+fi
+sh "$LIB/build.sh" "$F32/f27/raw" "$F32/f27/out-default" "hi lo" \
+	2> /dev/null
+if ! grep -qx '10.10.0.0/16' "$F32/f27/out-default/lo.txt"; then
+	ok "20.1c 三参数调用保持旧语义（缺省=全部占位，向后兼容）（F-27）"
+else
+	ng "20.1c 三参数调用的旧语义被破坏（F-27）"
+fi
+
+# ---- 20.2 F-13：bind 只认运行时 up + 有 IP + 有 l3_device ----
+F13=$F32/f13
+mkdir -p "$F13/bin" "$F13/list" "$F13/out"
+cat > "$F13/bin/uci" <<'F13_UCI'
+#!/bin/sh
+[ "${1:-}" = "-q" ] && shift
+[ "${1:-}" = "get" ] || exit 1
+case "${2:-}" in
+mwan3.pol.use_member) echo m1 ;;
+mwan3.m1.interface) echo wanx ;;
+network.wanx.device) echo eth1.10 ;;
+network.wanx.ifname) echo eth1.10 ;;
+*) exit 1 ;;
+esac
+F13_UCI
+cat > "$F13/bin/ubus" <<'F13_UBUS'
+#!/bin/sh
+[ "${1:-}" = "call" ] || exit 1
+case "${FAKE_IFACE_UP:-0}" in
+1) echo '{"up":true}' ;;
+*) echo '{"up":false}' ;;
+esac
+exit 0
+F13_UBUS
+cat > "$F13/bin/ifstatus" <<'F13_IFSTATUS'
+#!/bin/sh
+if [ "${FAKE_IFACE_UP:-0}" = "1" ]; then
+	if [ "${FAKE_IFACE_IP:-1}" = "1" ]; then
+		echo '{"up":true,"l3_device":"pppoe-wanx","ipv4-address":[{"address":"10.0.0.2"}]}'
+	else
+		echo '{"up":true,"l3_device":"pppoe-wanx","ipv4-address":[]}'
+	fi
+else
+	echo '{"up":false,"device":"eth1.10"}'
+fi
+exit 0
+F13_IFSTATUS
+cat > "$F13/bin/jsonfilter" <<'F13_JSONFILTER'
+#!/bin/sh
+[ "${1:-}" = "-e" ] && shift
+expr=${1:-}
+input=$(cat)
+if [ "$expr" = "@.up" ]; then
+	case "$input" in
+	*'"up":true'*) echo true ;;
+	*'"up":false'*) echo false ;;
+	esac
+elif [ "$expr" = "@.l3_device" ]; then
+	printf '%s' "$input" | sed -n 's/.*"l3_device":"\([^"]*\)".*/\1/p'
+elif [ "$expr" = '@["ipv4-address"][0].address' ]; then
+	printf '%s' "$input" | sed -n 's/.*"address":"\([^"]*\)".*/\1/p'
+fi
+exit 0
+F13_JSONFILTER
+chmod +x "$F13/bin/"*
+cat > "$F13/conf" <<F13_CONF
+ISP_TABLE=""
+DNS_TABLE="
+pol:223.5.5.5
+"
+DOMAIN_SPLIT="
+test.example:pol
+"
+DOMAIN_LIST_DIR="$F13/list"
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+F13_CONF
+
+f13_emit() { # <up> <has-ip> <out> [extra conf]
+	_f13_up=$1
+	_f13_ip=$2
+	_f13_out=$3
+	_f13_cf=${4:-$F13/conf}
+	(
+		PATH="$F13/bin:$PATH"
+		FAKE_IFACE_UP=$_f13_up
+		FAKE_IFACE_IP=$_f13_ip
+		ISP_SPLIT_CONF=$_f13_cf
+		ISP_SPLIT_BASE="$F13/base"
+		ISP_SPLIT_LIB="$LIB"
+		export PATH FAKE_IFACE_UP FAKE_IFACE_IP ISP_SPLIT_CONF \
+			ISP_SPLIT_BASE ISP_SPLIT_LIB
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		_dns_emit_rules "$_f13_out"
+		printf 'N=%s SKIP=%s BAD=%s DEV=%s STATE=%s\n' \
+			"$_DNS_RULE_N" "$_DNS_SKIP" "$_DNS_BAD" "$_DNS_DEV" "$POLICY_DEV_STATE"
+	)
+}
+
+f13_emit 0 1 "$F13/out/down" > "$F13/down.log" 2>&1
+if grep -q '未就绪' "$F13/down.log" &&
+   ! grep -q 'server=' "$F13/out/down" 2>/dev/null &&
+   ! grep -q 'eth1.10' "$F13/down.log"; then
+	ok "20.2 线路 down 时不生成 server=、不绑底层 eth1.10，并明确告警（F-13）"
+else
+	ng "20.2 线路 down 时仍生成规则或回退到底层设备（F-13）: $(tail -1 "$F13/down.log")"
+fi
+f13_emit 1 0 "$F13/out/noip" > "$F13/noip.log" 2>&1
+if grep -q '未就绪: no-ip' "$F13/noip.log" &&
+   ! grep -q 'server=' "$F13/out/noip" 2>/dev/null; then
+	ok "20.2b 接口 up 但无 IPv4 时同样跳过（no-ip）（F-13）"
+else
+	ng "20.2b 无 IPv4 时仍绑定了设备（F-13）: $(tail -1 "$F13/noip.log")"
+fi
+f13_emit 1 1 "$F13/out/up" > "$F13/up.log" 2>&1
+if grep -q 'server=/test.example/223.5.5.5@pppoe-wanx' "$F13/out/up" 2>/dev/null; then
+	ok "20.2c 运行时就绪时绑定 l3_device（pppoe-wanx），不是 uci VLAN（F-13）"
+else
+	ng "20.2c 就绪时未绑定 l3_device（F-13）: $(tail -2 "$F13/up.log" | tr '\n' ' ')"
+fi
+
+# ---- 20.3 F-12：外部清单单次 awk、末行不丢、非法跳过、自检、预览 ----
+F12=$F32/f12
+mkdir -p "$F12/bin" "$F12/list" "$F12/out" "$F12/emptybin"
+REAL_TR=$(command -v tr)
+cat > "$F12/bin/tr" <<'F12_TR'
+#!/bin/sh
+echo "tr-call" >> "${TR_LOG:-/dev/null}"
+exec "${REAL_TR:-/usr/bin/tr}" "$@"
+F12_TR
+chmod +x "$F12/bin/tr"
+: > "$F12/list/pol.txt"
+printf 'a.example\nb.example\nserver=/c.example/9.9.9.9\n' >> "$F12/list/pol.txt"
+printf '  # leading space comment\r\nbad domain.example\r\nx/y.example\r\ncrlf.example\r\n' >> "$F12/list/pol.txt"
+# 500 行大清单：逐行 printf|tr 会有 1000 次 fork；单次 awk 应为 0 次
+_i=0
+while [ "$_i" -lt 500 ]; do
+	printf 'bulk%s.example\n' "$_i" >> "$F12/list/pol.txt"
+	_i=$((_i + 1))
+done
+printf 'last.example' >> "$F12/list/pol.txt"
+cat > "$F12/conf" <<F12_CONF
+ISP_TABLE=""
+DNS_TABLE="
+pol:223.5.5.5
+"
+DOMAIN_SPLIT=""
+DOMAIN_LIST_DIR="$F12/list"
+DNS_MODE="mark"
+COUNT_FALLBACK="0"
+F12_CONF
+: > "$F12/tr.log"
+(
+	PATH="$F12/bin:$F13/bin:$PATH"
+	TR_LOG="$F12/tr.log"
+	REAL_TR="$REAL_TR"
+	ISP_SPLIT_CONF="$F12/conf"
+	ISP_SPLIT_BASE="$F12/base"
+	ISP_SPLIT_LIB="$LIB"
+	export PATH TR_LOG REAL_TR ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	# 只统计生成阶段：source 配置时本身的 tr 不算逐行 fork
+	: > "$TR_LOG"
+	_dns_emit_rules "$F12/out/rules"
+	printf 'N=%s SKIP=%s BAD=%s\n' "$_DNS_RULE_N" "$_DNS_SKIP" "$_DNS_BAD"
+) > "$F12/emit.log" 2>&1
+_f12_rules=$(grep -c '^server=' "$F12/out/rules" 2>/dev/null)
+_f12_rules=${_f12_rules:-0}
+if [ "$_f12_rules" = "505" ] &&
+   grep -qx 'server=/last.example/223.5.5.5' "$F12/out/rules" &&
+   grep -qx 'server=/crlf.example/223.5.5.5' "$F12/out/rules" &&
+   ! grep -q 'bad domain\|x/y.example\|leading space' "$F12/out/rules"; then
+	ok "20.3 外部清单：末行无换行不丢、CRLF 清理、非法行不拼进 server=（F-12）"
+else
+	ng "20.3 外部清单输出异常（$_f12_rules 条）：$(tr '\n' '|' < "$F12/out/rules" 2>/dev/null)（F-12）"
+fi
+if grep -q '域名非法' "$F12/emit.log" &&
+   [ "$(grep -c '域名非法' "$F12/emit.log")" -ge 2 ]; then
+	ok "20.3b 非法域名逐行告警并跳过（含空格式的 server= 注入）（F-12）"
+else
+	ng "20.3b 非法域名告警缺失（F-12）: $(tail -3 "$F12/emit.log" | tr '\n' ' ')"
+fi
+if [ ! -s "$F12/tr.log" ]; then
+	ok "20.3c 大清单不再逐行 printf|tr 双 fork（500 行 0 次 tr 调用）（F-12）"
+else
+	ng "20.3c 仍逐行调用 tr（$(wc -l < "$F12/tr.log") 次）（F-12）"
+fi
+
+# dnsmasq --test：合法片段通过、坏片段硬失败、缺 dnsmasq / 基线不可用时降级
+mkdir -p "$F12/dnsbin"
+cat > "$F12/dnsbin/dnsmasq" <<'F12_DNSMASQ'
+#!/bin/sh
+f=""
+for a do
+	case "$a" in --conf-file=*) f=${a#--conf-file=} ;; esac
+done
+[ "$f" = "/dev/null" ] && exit 0
+if grep -q 'BAD' "$f" 2>/dev/null; then
+	echo "dnsmasq: bad syntax"
+	exit 1
+fi
+exit 0
+F12_DNSMASQ
+chmod +x "$F12/dnsbin/dnsmasq"
+printf 'server=/ok.example/223.5.5.5\n' > "$F12/out/good.conf"
+printf 'server=/BAD/223.5.5.5\n' > "$F12/out/bad.conf"
+_f12_good=1
+_f12_bad=1
+(
+	PATH="$F12/dnsbin:$PATH"
+	export PATH
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	_dns_check_fragment "$F12/out/good.conf" || exit 1
+	_dns_check_fragment "$F12/out/bad.conf" && exit 2
+	exit 0
+) > "$F12/dnscheck.log" 2>&1
+_f12_rc=$?
+if [ "$_f12_rc" -eq 0 ]; then
+	ok "20.3d 片段通过 dnsmasq --test；坏片段被拒绝（rc 非 0）（F-12）"
+else
+	ng "20.3d dnsmasq 片段自检方向错误（rc=$_f12_rc）：$(tail -2 "$F12/dnscheck.log" | tr '\n' ' ')"
+fi
+mkdir -p "$F12/dnsbin-baseline"
+printf '#!/bin/sh\nexit 5\n' > "$F12/dnsbin-baseline/dnsmasq"
+chmod +x "$F12/dnsbin-baseline/dnsmasq"
+(
+	PATH="$F12/dnsbin-baseline:$PATH"
+	export PATH
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	_dns_check_fragment "$F12/out/bad.conf"
+) > "$F12/dnsbase.log" 2>&1
+_f12_rc=$?
+if [ "$_f12_rc" -eq 0 ] && grep -q '基线自检失败' "$F12/dnsbase.log"; then
+	ok "20.3e dnsmasq --test 环境不可用时降级告警，不误杀配置（F-12）"
+else
+	ng "20.3e 基线不可用被误判为配置错误（rc=$_f12_rc）（F-12）"
+fi
+(
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	PATH="$F12/emptybin"
+	export PATH
+	_dns_check_fragment "$F12/out/bad.conf"
+) > "$F12/dnsmissing.log" 2>&1
+_f12_rc=$?
+if [ "$_f12_rc" -eq 0 ] && grep -q '未找到 dnsmasq' "$F12/dnsmissing.log"; then
+	ok "20.3f dnsmasq 缺失时降级告警、不硬失败（F-12）"
+else
+	ng "20.3f dnsmasq 缺失时行为异常（rc=$_f12_rc）（F-12）"
+fi
+printf 'server=/a.example/1.1.1.1\nserver=/b.example/1.1.1.1\nserver=/c.example/1.1.1.1\nserver=/d.example/1.1.1.1\nserver=/e.example/1.1.1.1\n' \
+	> "$F12/out/preview.conf"
+(
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	_dns_print_preview "$F12/out/preview.conf" 5
+) > "$F12/preview.log" 2>&1
+if [ "$(grep -c '^  server=' "$F12/preview.log")" -eq 3 ] &&
+   grep -q '共 5 条' "$F12/preview.log" &&
+   ! grep -q 'e.example' "$F12/preview.log"; then
+	ok "20.3g 只回显前 3 条规则（不再把整份清单 echo 给 ubus）（F-12）"
+else
+	ng "20.3g 规则回显未收敛（F-12）: $(tr '\n' '|' < "$F12/preview.log")"
+fi
+
+# ---- 20.4 F-28：并发 fetch 互斥（第二个干净失败，不互踩 DATA） ----
+F28=$F32/f28
+mkdir -p "$F28/bin" "$F28/mirror"
+cat > "$F28/bin/uclient-fetch" <<'F28_FETCH'
+#!/bin/sh
+out=""
+url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-O) out=$2; shift 2 ;;
+	-q) shift ;;
+	-T) shift 2 ;;
+	*) url=$1; shift ;;
+	esac
+done
+sleep "${FAKE_SLEEP:-0}"
+cp "$FAKE_MIRROR/${url##*/}" "$out"
+F28_FETCH
+chmod +x "$F28/bin/uclient-fetch"
+i=0
+: > "$F28/mirror/a.txt"
+while [ "$i" -lt 2000 ]; do
+	echo "10.$((i / 256)).$((i % 256)).0/24" >> "$F28/mirror/a.txt"
+	i=$((i + 1))
+done
+cat > "$F28/conf" <<F28_CONF
+ISP_TABLE="a:isp_a:wan_wanb:1"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+ISP_MIRROR="https://mirror.test"
+COUNT_FALLBACK="0"
+F28_CONF
+f28_fetch() { # <sleep>
+	FAKE_SLEEP=$1 FAKE_MIRROR="$F28/mirror" \
+	PATH="$F28/bin:$PATH" ISP_SPLIT_CONF="$F28/conf" \
+	ISP_SPLIT_BASE="$F28/base" ISP_SPLIT_LIB="$LIB" \
+		sh "$ROOT/files/usr/sbin/isp-split" fetch
+}
+f28_fetch 3 > "$F28/a.log" 2>&1 &
+_f28_pa=$!
+_i=0
+while [ ! -d "$F28/base/state/op.lock" ] && [ "$_i" -lt 8 ]; do
+	_i=$((_i + 1))
+	sleep 1
+done
+ISP_SPLIT_LOCK_WAIT=0
+export ISP_SPLIT_LOCK_WAIT
+f28_fetch 3 > "$F28/b.log" 2>&1
+_f28_rb=$?
+unset ISP_SPLIT_LOCK_WAIT
+wait "$_f28_pa"
+_f28_ra=$?
+if [ "$_f28_ra" -eq 0 ] && [ "$_f28_rb" -ne 0 ] &&
+   grep -q '另一个 isp-split 操作正在运行' "$F28/b.log" &&
+   [ -s "$F28/base/data/a.txt" ] && [ ! -d "$F28/base/state/op.lock" ]; then
+	ok "20.4 并发 fetch：第二个被操作锁拒绝（rc=$_f28_rb），首个成功且数据/锁干净（F-28）"
+else
+	ng "20.4 并发 fetch 互斥失败（rcA=$_f28_ra rcB=$_f28_rb）：$(tail -2 "$F28/b.log" | tr '\n' ' ')（F-28）"
+fi
+
+# ---- 20.5 F-29：reload 失败 / 规则未渲染都必须让 wire 非零 ----
+b25_reset "$B25/s12"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s12" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s12" wanb_only isp_split_wanb_only_m1 wan2 marked
+MWAN3_SERVICE="$B25/bin/mwan3-fail"
+export MWAN3_SERVICE
+b25_run "$B25/s12" "$B25/conf" wire > "$F32/f29-reload-fail.log" 2>&1
+_f29_rc=$?
+unset MWAN3_SERVICE
+if [ "$_f29_rc" -ne 0 ] &&
+   grep -q 'mwan3 reload 失败' "$F32/f29-reload-fail.log" &&
+   grep -q '回滚: cp' "$F32/f29-reload-fail.log" &&
+   ! grep -q '规则已注入并生效' "$F32/f29-reload-fail.log"; then
+	ok "20.5 reload 必失败时 wire 非零且不再打印成功语义（挡住 Hermes 重放）（F-29）"
+else
+	ng "20.5 reload 失败仍被当成成功（rc=$_f29_rc）（F-29）: $(tail -2 "$F32/f29-reload-fail.log" | tr '\n' ' ')"
+fi
+b25_reset "$B25/s13"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s13" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s13" wanb_only isp_split_wanb_only_m1 wan2 marked
+b25_run "$B25/s13" "$B25/conf" wire > "$F32/f29-ok.log" 2>&1
+_f29_rc=$?
+if [ "$_f29_rc" -eq 0 ] && grep -q '规则已注入并生效' "$F32/f29-ok.log"; then
+	ok "20.5b reload 成功且两个集合都渲染时 wire 正常（rc=0）（F-29）"
+else
+	ng "20.5b 正常 wire 回归失败（rc=$_f29_rc）（F-29）: $(tail -2 "$F32/f29-ok.log" | tr '\n' ' ')"
+fi
+b25_reset "$B25/s14"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s14" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s14" wanb_only isp_split_wanb_only_m1 wan2 marked
+FAKE_NFT_OMIT_SET=isp_uni
+export FAKE_NFT_OMIT_SET
+b25_run "$B25/s14" "$B25/conf" wire > "$F32/f29-shape.log" 2>&1
+_f29_rc=$?
+unset FAKE_NFT_OMIT_SET
+if [ "$_f29_rc" -ne 0 ] &&
+   grep -q '未按预期渲染' "$F32/f29-shape.log" &&
+   grep -q 'isp_uni' "$F32/f29-shape.log"; then
+	ok "20.5c reload 返回 0 但集合未进 mwan3_rules：wire 仍非零并点名缺失集合（F-29）"
+else
+	ng "20.5c 规则形状缺失未被发现（rc=$_f29_rc）（F-29）: $(tail -2 "$F32/f29-shape.log" | tr '\n' ' ')"
+fi
+
+# ---- 20.6 B-6：TMPDIR 不可用时 plan 干净报错 ----
+b25_reset "$B25/s15"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s15" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s15" wanb_only isp_split_wanb_only_m1 wan2 marked
+mkdir -p "$B25/base/data"
+printf '1.2.3.0/24\n' > "$B25/base/data/a.txt"
+printf '1\n' > "$B25/base/data/.stamp"
+B25_TMPDIR=/nonexistent-9x
+export B25_TMPDIR
+b25_run "$B25/s15" "$B25/conf" plan \
+	> "$F32/b6.log" 2>&1
+_b6_rc=$?
+unset B25_TMPDIR
+if [ "$_b6_rc" -ne 0 ] &&
+   grep -q '无法创建临时文件' "$F32/b6.log" &&
+   ! grep -q "can't create" "$F32/b6.log" &&
+   ! grep -q 'mktemp:' "$F32/b6.log"; then
+	ok "20.6 TMPDIR 不可用时 plan 干净报错退出（不再 can't create 崩在半截）（B-6）"
+else
+	ng "20.6 TMPDIR 不可用时 plan 仍崩在半截（rc=$_b6_rc）（B-6）: $(tail -3 "$F32/b6.log" | tr '\n' ' ')"
 fi
 
 
