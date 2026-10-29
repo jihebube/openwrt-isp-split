@@ -23,8 +23,9 @@ REL=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile" | head -1 | tr -d '[:space:]
 [ -n "$VER" ] || { echo "无法从 $ROOT/Makefile 读取 PKG_VERSION" >&2; exit 1; }
 REL=${REL:-1}
 ARCH=all
-# 出货门：0.2.3 默认 0（构建期物理剥离），0.3.0 功能版用 1。
-FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+# 出货门：1 = 完整功能（默认，含线路体检与 socat 依赖）；
+#         0 = 构建期物理剥离（剥离版，需显式指定）。
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 OUT=$ROOT/dist
 WORK=$(mktemp -d 2>/dev/null) || WORK=$(mktemp -d /tmp/isp-split-build.XXXXXX)
@@ -63,9 +64,19 @@ if [ "$FEATURE_LINECHECK" != "1" ]; then
 fi
 # 数据目录留给运行时创建，但先建好免得首次 apply 报错
 mkdir -p "$WORK/data/etc/isp-split/data"
+# 权限归一化：cp -a 会把工作区的权限位一路带进包里。0.3.0 实测过一次：
+# isp-split.css 在工作区被改成 0600 → 装到设备上 uhttpd 读不了 → 静态资源 403，
+# LuCI 页面裸奔（无样式）。git checkout 出来是 644，但本地直接打包/安装会中招，
+# 所以打包侧显式归一：目录 755、文件 644，再单独抬可执行文件。
+find "$WORK/data" -type d -exec chmod 755 {} \;
+find "$WORK/data" -type f -exec chmod 644 {} \;
 chmod 755 "$WORK/data/usr/sbin/isp-split" \
 	"$WORK/data/etc/init.d/isp-split" \
-	"$WORK/data/usr/lib/isp-split/build.sh"
+	"$WORK/data/usr/lib/isp-split/build.sh" \
+	"$WORK/data/etc/uci-defaults/99-isp-split"
+if [ -f "$WORK/data/usr/lib/isp-split/lc-run" ]; then
+	chmod 755 "$WORK/data/usr/lib/isp-split/lc-run"
+fi
 
 # ---- control ----
 cat > "$WORK/control/control" <<EOF
@@ -182,6 +193,9 @@ if [ -d "$ROOT/luci-app-isp-split" ]; then
 	if [ "$FEATURE_LINECHECK" != "1" ]; then
 		sh "$ROOT/scripts/strip-linecheck.sh" "$LW/data" >/dev/null
 	fi
+	# 同一套权限归一化（静态资源必须 uhttpd 可读；0600 会变成 403 裸页面）
+	find "$LW/data" -type d -exec chmod 755 {} \;
+	find "$LW/data" -type f -exec chmod 644 {} \;
 	cat > "$LW/control/control" <<LCTL
 Package: luci-app-isp-split
 Version: $VER-$REL

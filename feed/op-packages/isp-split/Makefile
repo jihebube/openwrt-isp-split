@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
-PKG_VERSION:=0.2.3
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -9,11 +9,12 @@ PKG_MAINTAINER:=jihebube <jihebube@users.noreply.github.com>
 
 include $(INCLUDE_DIR)/package.mk
 
-# 线路体检（linecheck）不在 0.2.3 的出货面出现。
-#   0 = 构建期物理剥离：实现、CLI、conf 键、LuCI 页/菜单、socat 依赖全部不进包；
-#   1 = 保留完整功能（0.3.0 及后续功能版用）。
+# 线路体检（linecheck）自 0.3.0 起随包发货，默认 1。
+#   1 = 完整功能（默认，正式发行版走这条路径）；
+#   0 = 构建期物理剥离：实现、CLI、conf 键、LuCI 页/菜单、socat 依赖全部不进包。
+#       小闪存 / 特殊渠道的可选剥离版，必须显式指定 FEATURE_LINECHECK=0。
 # 这是构建期开关，不是运行时开关：0 的产物里没有可被重新打开的代码。
-FEATURE_LINECHECK?=0
+FEATURE_LINECHECK?=1
 
 define Package/isp-split
   SECTION:=net

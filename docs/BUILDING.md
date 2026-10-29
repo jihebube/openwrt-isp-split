@@ -129,22 +129,27 @@ cd repo/packages
 
 ## 出货门：FEATURE_LINECHECK
 
-`FEATURE_LINECHECK` 是**构建期**开关，默认 `0`：
+`FEATURE_LINECHECK` 是**构建期**开关，0.3.0 起默认 `1`（线路体检随包发货）：
 
 | 值 | 用途 | 产物 |
 |----|------|------|
-| `0` | 0.2.3 纯修复版 | 线路体检的实现/CLI/conf 键/LuCI 页与菜单/`socat` 依赖全部不进包 |
-| `1` | 0.3.0 及后续功能版 | 完整线路体检 |
+| `1` | 默认，正式发行版 | 完整线路体检：`linecheck` 子命令、`lc-run`、LuCI 卡片页与菜单节点、`LINE_CHECK_*` 配置键、`socat` 依赖 |
+| `0` | 小闪存 / 特殊渠道的可选剥离版 | 上述内容全部**物理**不进包 |
 
 ```sh
-# 0.2.3（默认）
+# 默认就是完整版（0.3.0+）
 sh scripts/build-ipk.sh
-FEATURE_LINECHECK=0 sh scripts/build-apk.sh 25.12.6 x86/64
+sh scripts/build-apk.sh 25.12.6 x86/64
 
-# 0.3.0 预览：保留完整功能
-FEATURE_LINECHECK=1 sh scripts/build-ipk.sh
-FEATURE_LINECHECK=1 sh scripts/build-apk.sh 25.12.6 x86/64
+# 需要剥离版时必须显式关掉
+FEATURE_LINECHECK=0 sh scripts/build-ipk.sh
+FEATURE_LINECHECK=0 sh scripts/build-apk.sh 25.12.6 x86/64
 ```
+
+默认值只有一处来源：四个 Makefile（主包 / LuCI 包 / feed 两个壳）用
+`FEATURE_LINECHECK?=1`，四个脚本用 `${FEATURE_LINECHECK:-1}`，CI 的
+`release.yml` 用 `env: FEATURE_LINECHECK: "1"`。`tools/selftest.sh` 的 19.1
+会把这条链逐处核对——F7 的教训就是门散在多处、默认值一旦分叉，产物与断言就错位。
 
 剥离由源文件里的 `lc:begin` / `lc:end` 标记驱动，`scripts/strip-linecheck.sh`
 是**唯一**实现：手工打包直接调用它，两份 `Build/Prepare`（主包 / LuCI 包）也
@@ -152,18 +157,24 @@ FEATURE_LINECHECK=1 sh scripts/build-apk.sh 25.12.6 x86/64
 标记必须包住内容本体，CSS 的 `.lc-*` 样式体整段在标记内（只包标题注释等于
 没包，0.2.3 的泄漏就是这么来的）。
 
-产物必须同时通过：
+产物必须同时通过（方向必须显式给出，没有默认值）：
 
-- `tools/selftest.sh` 第 19 节：文件清单无 `linecheck.js`、menu 子节点=2、
-  control `Depends` 无 `socat`、grep 零残留、被剥离的 CLI 固定拒绝文案；
-- `scripts/verify-package-payload.sh verify`：按容器魔数嗅探 ipk（gzip-tar /
-  ar）与 apk（ADB，`ADBd`），逐个解包后断言零残留且 CSS 无 `.lc-*`；未知
-  容器显式失败，绝不在空 glob 上“通过”；
+- `scripts/verify-package-payload.sh verify --feature=1`：完整版期望面——
+  `linecheck` 子命令可调用、`lc-run` 在包里、`linecheck.js` + 菜单节点安装、
+  CSS 含 `.lc-*`、conf 有 `LINE_CHECK_*` 键、`Depends` 含 `socat`；
+- `scripts/verify-package-payload.sh verify --feature=0`：剥离版期望面——
+  grep 零残留、CSS 无 `.lc-*`（0.2.3 的断言资产，仍然可跑）；
+- 按容器魔数嗅探 ipk（gzip-tar / ar）与 apk（ADB，`ADBd`），逐个解包；
+  未知容器显式失败，绝不在空 glob 上“通过”；
 - `scripts/verify-package-payload.sh parity`：本地脚本路径产物与 SDK 路径
   产物 payload 必须逐文件一致（本地绿 ≠ SDK 绿）。
 
-> 0.2.3 不发布“源码 tarball”，只发运行时 install 包与 ipk/apk；
-> 0.3.0 起恢复完整源码包。
+`tools/selftest.sh` 的第 19 节按方向分成两段：§19 是默认完整版的正向断言
+（含 VM 上的 `linecheck --json --wan lo` 冒烟与 60s 缓存命中），§19b 是
+`FEATURE_LINECHECK=0` 的剥离版子集（原「零残留」用例，显式以 0 模式构建）。
+
+> 0.3.0 起恢复完整源码包（`isp-split-<ver>.tar.gz`，含 docs/tools/selftest）；
+> 剥离版只发运行时 install 包 + ipk/apk。
 
 ## 常见问题
 

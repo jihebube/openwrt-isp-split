@@ -14,8 +14,9 @@ set -eu
 
 VER=${1:-25.12.6}
 ARCH=${2:-x86/64}
-# 出货门：0 = 构建期剥离线路体检（0.2.3），1 = 完整功能（0.3.0+）。
-FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+# 出货门：1 = 完整功能（默认，0.3.0 起线路体检随包发货）；
+#         0 = 显式构建剥离版（小闪存 / 特殊渠道）。
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${OWRT_WORK:-$ROOT/.sdk-build}

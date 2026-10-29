@@ -1,9 +1,16 @@
 #!/bin/sh
-# 产物 payload 断言：容器嗅探 + 零残留 + 两条构建路径恒等。
+# 产物 payload 断言：容器嗅探 + 双向期望面 + 两条构建路径恒等。
 #
 # 用法：
-#   sh scripts/verify-package-payload.sh verify <pkg>...
+#   sh scripts/verify-package-payload.sh verify --feature=1 <pkg>...   # 0.3.0 发货面
+#   sh scripts/verify-package-payload.sh verify --feature=0 <pkg>...   # 剥离版
 #   sh scripts/verify-package-payload.sh parity <pkgA> <pkgB>
+#
+# 期望面必须显式给出（不设默认值）：0.3.0 把断言方向从「零残留」翻成「必须有」，
+# 留一个默认值就会在发版时悄悄沿用旧方向，等于没断言。
+#   --feature=1：linecheck 子命令可调用、lc-run 在包里、linecheck.js + 菜单节点
+#                安装、CSS 含 .lc-*、conf 有 LINE_CHECK_* 键、Depends 含 socat；
+#   --feature=0：反向——grep 零残留、CSS 无 .lc-*（0.2.3 的剥离资产，保留可跑）。
 #
 # 支持的容器（按 magic 嗅探，不看扩展名）：
 #   · gzip-tar ipk（1f 8b）：23.05/24.10 官方与 scripts/build-ipk.sh 默认产物
@@ -167,7 +174,163 @@ assert_clean() { # <pkg> <payload-dir>
 	return 0
 }
 
+# 包的 Depends 原文（三个容器各走各的读法；读不到就返回 1，不静默算过）
+pkg_depends() { # <pkg>
+	_kind=$(magic_id "$1")
+	_w=$(mkdtemp)
+	case "$_kind" in
+	gzip)
+		# 成员名带 "./" 前缀（与官方产物一致），按名提取会被 tar 拒；
+		# 整包解开后再取 control.tar.gz。
+		mkdir -p "$_w/outer" "$_w/ctl"
+		tar xzf "$1" -C "$_w/outer" 2>/dev/null || { rm -rf "$_w"; return 1; }
+		[ -f "$_w/outer/control.tar.gz" ] || { rm -rf "$_w"; return 1; }
+		tar xzf "$_w/outer/control.tar.gz" -C "$_w/ctl" 2>/dev/null || { rm -rf "$_w"; return 1; }
+		[ -f "$_w/ctl/control" ] || { rm -rf "$_w"; return 1; }
+		sed -n 's/^Depends:[[:space:]]*//p' "$_w/ctl/control"
+		;;
+	ar)
+		ar_member "$1" control.tar.gz "$_w/control.tar.gz" || { rm -rf "$_w"; return 1; }
+		mkdir -p "$_w/ctl"
+		tar xzf "$_w/control.tar.gz" -C "$_w/ctl" 2>/dev/null || { rm -rf "$_w"; return 1; }
+		sed -n 's/^Depends:[[:space:]]*//p' "$_w/ctl/control"
+		;;
+	apk)
+		_apk=$(apk_bin) || { rm -rf "$_w"; return 1; }
+		"$_apk" adbdump "$1" 2>/dev/null >"$_w/adbdump" || { rm -rf "$_w"; return 1; }
+		sed -n '/^  depends:/,/^  [a-z]/p' "$_w/adbdump"
+		;;
+	*)
+		rm -rf "$_w"
+		return 1
+		;;
+	esac
+	rm -rf "$_w"
+}
+
+# feature=1 期望面：0.3.0 的产物**必须**含体检。
+# 这是 0 版「零残留」的镜像：同一批断言反过来证明体检真的在包里。
+assert_feature1() { # <pkg> <payload-dir>
+	_pkg=$1
+	_payload=$2
+	_bad=0
+	_main=$_payload/usr/sbin/isp-split
+	_views=$_payload/www/luci-static/resources/view/isp-split
+	_conf=$_payload/etc/isp-split.conf
+	_has_main=0
+	[ -f "$_main" ] && _has_main=1
+	_has_luci=0
+	[ -d "$_views" ] && _has_luci=1
+	if [ "$_has_main" = 0 ] && [ "$_has_luci" = 0 ]; then
+		echo "::error::$_pkg：payload 里既没有 usr/sbin/isp-split 也没有 LuCI 视图目录" >&2
+		return 1
+	fi
+
+	if [ "$_has_main" = 1 ]; then
+		# 1) 主脚本语法完好（标记区不能被切坏）
+		if ! sh -n "$_main" 2>/dev/null; then
+			echo "::error::$_pkg：usr/sbin/isp-split 语法错误（sh -n 失败）" >&2
+			_bad=1
+		fi
+		# 2) linecheck 子命令真的可调用：在临时 conf/base 上跑 usage 与 conf 写面
+		_t=$(mkdtemp)
+		mkdir -p "$_t/base"
+		if [ -f "$_conf" ]; then cp "$_conf" "$_t/conf"; else : >"$_t/conf"; fi
+		ISP_SPLIT_CONF="$_t/conf" ISP_SPLIT_BASE="$_t/base" \
+			sh "$_main" >"$_t/usage" 2>&1 || true
+		if ! grep -q 'linecheck' "$_t/usage"; then
+			echo "::error::$_pkg：usage 里没有 linecheck 子命令（体检没进 CLI 面）" >&2
+			_bad=1
+		fi
+		# conf 键必须被识别：与 19.7 的剥离版断言是同一个命令、相反方向
+		if ISP_SPLIT_CONF="$_t/conf" ISP_SPLIT_BASE="$_t/base" \
+			sh "$_main" conf set LINE_CHECK_GEO 0 >"$_t/confset" 2>&1 &&
+			grep -q '^LINE_CHECK_GEO="0"' "$_t/conf"; then
+			:
+		else
+			echo "::error::$_pkg：conf set LINE_CHECK_GEO 不被接受（conf 键面缺失）：" >&2
+			sed 's/^/  /' "$_t/confset" >&2
+			_bad=1
+		fi
+		rm -rf "$_t"
+		# 3) 后台探测引擎入口 lc-run 必须在包里
+		if [ ! -f "$_payload/usr/lib/isp-split/lc-run" ]; then
+			echo "::error::$_pkg：缺少 /usr/lib/isp-split/lc-run（--background 探测引擎）" >&2
+			_bad=1
+		elif ! sh -n "$_payload/usr/lib/isp-split/lc-run" 2>/dev/null; then
+			echo "::error::$_pkg：usr/lib/isp-split/lc-run 语法错误" >&2
+			_bad=1
+		fi
+		# 4) conf 必须有 LINE_CHECK_* 键（四项核心键，缺一项就说明标记区没进包）
+		for _k in LINE_CHECK_ENABLE LINE_CHECK_GEO LINE_CHECK_MIN_INTERVAL LINE_CHECK_STUN_SERVERS; do
+			if ! grep -q "^${_k}=" "$_conf" 2>/dev/null; then
+				echo "::error::$_pkg：/etc/isp-split.conf 缺少 ${_k}=" >&2
+				_bad=1
+			fi
+		done
+		# 5) Depends 必须含 socat（UDP STUN 锁线探测的实际依赖）
+		_kind=$(magic_id "$_pkg")
+		_dep=$(pkg_depends "$_pkg") || {
+			echo "::error::$_pkg：读不到包的 Depends（容器 $_kind）" >&2
+			_bad=1
+			_dep=""
+		}
+		if [ -n "$_dep" ] && ! printf '%s\n' "$_dep" | grep -qw 'socat'; then
+			echo "::error::$_pkg：Depends 不含 socat（实际：$(printf '%s' "$_dep" | tr '\n' ' ')）" >&2
+			_bad=1
+		fi
+	fi
+
+	if [ "$_has_luci" = 1 ]; then
+		# 6) 体检页与独立菜单节点必须安装
+		if [ ! -s "$_views/linecheck.js" ]; then
+			echo "::error::$_pkg：缺少 view/isp-split/linecheck.js（体检卡片页）" >&2
+			_bad=1
+		fi
+		_menu=$_payload/usr/share/luci/menu.d/luci-app-isp-split.json
+		_lmenu=$_payload/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json
+		if [ ! -s "$_lmenu" ] || ! grep -q '"admin/network/isp-split/linecheck"' "$_lmenu"; then
+			echo "::error::$_pkg：缺少线路体检菜单节点 luci-app-isp-split-linecheck.json" >&2
+			_bad=1
+		fi
+		# 7) 菜单子节点 = 3（状态 / 配置 / 线路体检）。
+		#    体检节点在独立文件里，LuCI 运行时会合并 menu.d，所以跨文件数。
+		_kids=$(cat "$_payload"/usr/share/luci/menu.d/*.json 2>/dev/null |
+			grep -c '"admin/network/isp-split/' || true)
+		if [ "${_kids:-0}" != "3" ]; then
+			echo "::error::$_pkg：menu 子节点=${_kids:-0}（完整版应为 3：状态/配置/线路体检）" >&2
+			_bad=1
+		fi
+		# 8) CSS 必须实际带体检样式类（与 0 版「无 .lc-*」相反的断言）
+		_css=$(find "$_payload" -type f -name '*.css' -exec grep -l '\.lc-' {} + 2>/dev/null || true)
+		if [ -z "$_css" ]; then
+			echo "::error::$_pkg：CSS 里没有 .lc-* 样式（体检卡片页会无样式）" >&2
+			_bad=1
+		fi
+		# 9) 线检页 JS 语法（有 node 才查；没有就跳过，不假装通过）
+		if command -v node >/dev/null 2>&1 && [ -s "$_views/linecheck.js" ]; then
+			if ! node --check "$_views/linecheck.js" 2>/dev/null; then
+				echo "::error::$_pkg：linecheck.js 语法错误（node --check 失败）" >&2
+				_bad=1
+			fi
+		fi
+	fi
+
+	return "$_bad"
+}
+
 cmd_verify() {
+	# 方向必须显式给出：默认值会让断言面在发版时悄悄反向（F7/F8 的教训）。
+	_feature=""
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--feature=0 | --feature=1) _feature=${1#--feature=} ;;
+		*) break ;;
+		esac
+		shift
+	done
+	[ -n "$_feature" ] ||
+		die "verify 必须显式指定期望面：--feature=0（剥离版零残留）或 --feature=1（完整版含体检）"
 	[ "$#" -gt 0 ] || die "verify：没有给任何产物（空列表=真空通过，拒绝）"
 	_checked=0
 	_bad=0
@@ -175,10 +338,18 @@ cmd_verify() {
 		[ -f "$p" ] || die "verify：产物不存在: $p（glob 没展开？）"
 		d=$(mkdtemp)
 		if extract_payload "$p" "$d/payload"; then
-			if assert_clean "$p" "$d/payload"; then
-				echo "[ok] $p（$(magic_id "$p") 容器，payload $(find "$d/payload" -type f | wc -l | tr -d ' ') 个文件，零残留）"
+			if [ "$_feature" = "1" ]; then
+				if assert_feature1 "$p" "$d/payload"; then
+					echo "[ok] $p（$(magic_id "$p") 容器，payload $(find "$d/payload" -type f | wc -l | tr -d ' ') 个文件，feature=1 期望面全中）"
+				else
+					_bad=1
+				fi
 			else
-				_bad=1
+				if assert_clean "$p" "$d/payload"; then
+					echo "[ok] $p（$(magic_id "$p") 容器，payload $(find "$d/payload" -type f | wc -l | tr -d ' ') 个文件，零残留）"
+				else
+					_bad=1
+				fi
 			fi
 		else
 			_bad=1
@@ -187,8 +358,8 @@ cmd_verify() {
 		_checked=$((_checked + 1))
 	done
 	[ "$_checked" -gt 0 ] || die "verify：实际检查了 0 个产物（真空通过，拒绝）"
-	[ "$_bad" -eq 0 ] || die "verify：有产物未通过零残留断言"
-	echo "verify：$_checked 个产物全部通过"
+	[ "$_bad" -eq 0 ] || die "verify：有产物未通过 feature=$_feature 断言"
+	echo "verify（feature=$_feature）：$_checked 个产物全部通过"
 }
 
 cmd_parity() {
@@ -220,7 +391,7 @@ cmd_parity() {
 }
 
 cmd=${1:-}
-[ -n "$cmd" ] || die "用法: sh scripts/verify-package-payload.sh verify|parity <pkg>..."
+[ -n "$cmd" ] || die "用法: sh scripts/verify-package-payload.sh verify --feature=0|1 <pkg>... | parity <pkgA> <pkgB>"
 shift || true
 case "$cmd" in
 verify) cmd_verify "$@" ;;

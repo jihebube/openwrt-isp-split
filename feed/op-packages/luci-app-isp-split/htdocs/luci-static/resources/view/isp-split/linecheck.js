@@ -126,11 +126,20 @@ function targetText(t) {
 		' · ' + (t.mode === 'same_isp' ? _('同运营商') : _('跨网基线'));
 }
 
-/* 一行 key/value；value 可以是字符串或 DOM 节点 */
+/* 一行 key/value；value 可以是字符串、DOM 节点，或它们的数组。
+ *
+ * 曾经写成 E('span', {class:'lc-val'}, [value])：value 是数组时 LuCI 会把它
+ * String() 掉，页面上直接显示 “HTMLSpanElement,HTMLSpanElement”
+ * （WAN IP / 出口 IP / NAT 类型三行都是这样）。数组必须作为 children 展开，
+ * 并过滤 null（没有 multi_nat 时那一项就是 null），否则会渲染出空文本节点。
+ */
 function row(label, value) {
+	var kids = (Array.isArray(value) ? value : [ value ]).filter(function(x) {
+		return x !== null && x !== undefined;
+	});
 	return E('div', { 'class': 'lc-row' }, [
 		E('span', { 'class': 'lc-key' }, [ label ]),
-		E('span', { 'class': 'lc-val' }, [ value ])
+		E('span', { 'class': 'lc-val' }, kids)
 	]);
 }
 
@@ -194,7 +203,9 @@ return view.extend({
 				this.poll(0);
 		}
 
-		return E('div', { 'class': 'isp-app cbi-map' }, [
+		/* 只读页：不能带 cbi-map —— LuCI 见到它会补一条 “Save & Apply” 底栏，
+		   而这一页没有任何可保存的表单，底栏只会误导用户。 */
+		return E('div', { 'class': 'isp-app' }, [
 			E('link', { 'rel': 'stylesheet', 'href': L.resource('isp-split/isp-split.css') }),
 
 			E('div', { 'class': 'isp-hero' }, [
@@ -559,5 +570,12 @@ return view.extend({
 		]));
 
 		return card;
-	}
+	},
+
+	/* 只读页：把三个保存钩子显式置空，LuCI 才不会补一条 “Save & Apply / Reset”
+	   底栏（overview.js 早就这么写了，linecheck 漏了）。这一页没有任何可保存的
+	   表单，底栏只会让人以为有未保存的改动。 */
+	handleSave: null,
+	handleSaveApply: null,
+	handleReset: null
 });

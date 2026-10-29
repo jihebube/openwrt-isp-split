@@ -17,8 +17,11 @@ trap 'rm -rf "$TMP"' EXIT
 
 pass=0
 fail=0
+skipn=0
 ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; pass=$((pass + 1)); }
 ng() { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail + 1)); }
+# 跳过不是通过：单独计数并显式打印原因（环境不满足时如实标注，不刷绿）
+skip() { printf '  \033[33m-\033[0m %s\n' "$1"; skipn=$((skipn + 1)); }
 
 # 非 root 环境提示：SEC-3 起 dnsmasq conf-dir 要求属主为 root（_dns_dir_ok
 # 校验 uid=0），所以 BUG-6 的「conf-dir 探测」与「卸载清理」2 项在非 root
@@ -3337,80 +3340,409 @@ else
 	ok "18.8 --wan .. / . 按 ifindex 判定后拒绝（健壮性）"
 fi
 
-# ---- 19. 发货门：FEATURE_LINECHECK=0 的“隐藏完备性” ----
-# 这些断言证明线路体检是构建期剥离，而不是运行时开关：
+# ---- 19. 发货面：默认 FEATURE_LINECHECK=1（0.3.0 起体检随包发货） ----
+# 0.2.3 的 §19 断言的是「体检不在包里」；0.3.0 方向反转：默认产物必须**含**体检。
+# 剥离版（FEATURE_LINECHECK=0）仍是受支持的构建期选项，它的整组断言挪到 §19b，
+# 两个方向都跑、两个方向都是资产。
+# F7 的教训：出货门散在 9 个位置（4 个 Makefile + 4 个脚本 + release.yml），
+# 任何一处默认值分叉都会让「产物」与「断言」错位，所以 19.1 先把全链默认=1
+# 钉死，后面的载荷断言才有意义。
+echo "== 19. 发货面（默认 FEATURE_LINECHECK=1，完整版）"
+F31=$TMP/fix31
+rm -rf "$F31"
+mkdir -p "$F31"
+# 构建失败时下面的断言要能给出"解包失败"，而不是 set -u 直接中断
+_mipk=""
+_lipk=""
+
+# 19.1 出货门默认值全链一致
+_gate_bad=""
+for _f in Makefile luci-app-isp-split/Makefile \
+	feed/op-packages/isp-split/Makefile feed/op-packages/luci-app-isp-split/Makefile; do
+	grep -q '^FEATURE_LINECHECK?=1' "$ROOT/$_f" 2>/dev/null || _gate_bad="$_gate_bad $_f"
+done
+for _f in scripts/build-apk.sh scripts/build-ipk.sh scripts/build-release.sh scripts/install.sh; do
+	grep -q 'FEATURE_LINECHECK:-1' "$ROOT/$_f" 2>/dev/null || _gate_bad="$_gate_bad $_f"
+done
+grep -qE '^[[:space:]]*FEATURE_LINECHECK:[[:space:]]*"1"' \
+	"$ROOT/.github/workflows/release.yml" 2>/dev/null ||
+	_gate_bad="$_gate_bad release.yml"
+if [ -z "$_gate_bad" ]; then
+	ok "19.1 出货门默认=1 全链一致（Makefile×4 / scripts×4 / release.yml）"
+else
+	ng "19.1 出货门默认值分叉：$_gate_bad"
+fi
+
+# 19.2 版本链：ISP_VERSION / 主 Makefile / luci Makefile / feed×2 / PKG_RELEASE
+_v_main=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1)
+_v_luci=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-isp-split/Makefile" | head -1)
+_v_f1=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/isp-split/Makefile" | head -1)
+_v_f2=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/luci-app-isp-split/Makefile" | head -1)
+_r_main=$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile" | head -1)
+if [ "$_v_main" = "$ISPVER" ] && [ "$_v_luci" = "$ISPVER" ] &&
+   [ "$_v_f1" = "$ISPVER" ] && [ "$_v_f2" = "$ISPVER" ] &&
+   [ "${_r_main:-1}" = "1" ]; then
+	ok "19.2 版本一致：ISP_VERSION=PKG_VERSION=$ISPVER，PKG_RELEASE=$_r_main（主/luci/feed×2）"
+else
+	ng "19.2 版本漂移：ISP=$ISPVER main=$_v_main luci=$_v_luci feed=$_v_f1/$_v_f2 rel=$_r_main"
+fi
+
+# 19.3 剥离实现单一来源（F7）：仓库两份 + feed 两份，逐字节一致
+_bad_strip=""
+for _s in "$ROOT/strip-linecheck.sh" \
+	"$ROOT/luci-app-isp-split/strip-linecheck.sh" \
+	"$ROOT/feed/op-packages/isp-split/strip-linecheck.sh" \
+	"$ROOT/feed/op-packages/luci-app-isp-split/strip-linecheck.sh"; do
+	if [ ! -f "$_s" ]; then
+		_bad_strip="$_bad_strip 缺:$_s"
+	elif ! cmp -s "$ROOT/scripts/strip-linecheck.sh" "$_s"; then
+		_bad_strip="$_bad_strip 异:$_s"
+	fi
+done
+if [ -z "$_bad_strip" ]; then
+	ok "19.3 剥离脚本单一来源：仓库 2 份 + feed 2 份与 scripts/strip-linecheck.sh 逐字节一致"
+else
+	ng "19.3 剥离脚本副本漂移：$_bad_strip"
+fi
+
+# 19.4 两个 Makefile 的 Build/Prepare 必须调用同一份脚本，不许再手抄 sed
+if grep -q "sed -i '/lc:begin" "$ROOT/Makefile" "$ROOT/luci-app-isp-split/Makefile" 2>/dev/null; then
+	ng "19.4 Makefile 仍在手抄 sed 剥离（F7 的分叉源）"
+elif grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/Makefile" &&
+     grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/luci-app-isp-split/Makefile"; then
+	ok "19.4 主/luci Makefile 的 Build/Prepare 都调用 \$(CURDIR)/strip-linecheck.sh"
+else
+	ng "19.4 Makefile 没有调用统一的剥离脚本"
+fi
+
+# ipk 解包助手（19.5 起与 §19b 共用）
+# 容器嗅探：23.05/24.10 官方与 build-ipk.sh 默认产物是 gzip-tar（magic 1f 8b），
+# 历史格式才是明文 ar（!<arch>）。两种都要能读，未知格式必须判失败。
+# 不用 od（OpenWrt 精简固件没有），用 dd + cmp 比 magic。
+printf '\037\213' > "$F31/magic.gz"
+printf '!<ar' > "$F31/magic.ar"
+_ipk_magic() { # <ipk> -> gzip | ar | unknown
+	if dd if="$1" bs=1 count=2 2>/dev/null | cmp -s - "$F31/magic.gz"; then
+		echo gzip
+	elif dd if="$1" bs=1 count=4 2>/dev/null | cmp -s - "$F31/magic.ar"; then
+		echo ar
+	else
+		echo unknown
+	fi
+}
+# 只有 ar 容器才走这里：有 ar 用 ar；没有 ar（如 OpenWrt 精简固件）
+# 就用 dd/tail 直接读 60 字节头。
+_ipk_pull_ar() { # <ipk> <member> <out>
+	if command -v ar >/dev/null 2>&1; then
+		ar p "$1" "$2" >"$3" && return 0
+	fi
+	_hp=$3.hdr
+	_pos=8
+	while :; do
+		# 必须落文件再解析：$(dd ...) 会吃掉头部末尾的换行，60 变 59
+		rm -f "$_hp"
+		dd if="$1" bs=1 skip="$_pos" count=60 of="$_hp" 2>/dev/null
+		[ "$(wc -c < "$_hp" 2>/dev/null || echo 0)" -eq 60 ] || return 1
+		_name=$(cut -c1-16 "$_hp" | sed 's/[[:space:]]*$//; s:/$::')
+		_size=$(cut -c49-58 "$_hp" | tr -cd '0-9')
+		_pos=$((_pos + 60))
+		if [ "$_name" = "$2" ]; then
+			tail -c +$((_pos + 1)) "$1" | head -c "$_size" >"$3"
+			return 0
+		fi
+		_pos=$((_pos + ${_size:-0}))
+		[ $((_pos % 2)) -eq 1 ] && _pos=$((_pos + 1))
+	done
+}
+_ipk_unpack() { # <ipk> <dest>
+	rm -rf "$2"
+	mkdir -p "$2/data" "$2/ctl" "$2/x"
+	case "$(_ipk_magic "$1")" in
+	gzip)
+		# 成员名带 "./" 前缀，整包解开再取 control/data
+		tar xzf "$1" -C "$2/x" 2>/dev/null || return 1
+		;;
+	ar)
+		_ipk_pull_ar "$1" data.tar.gz "$2/x/data.tar.gz" || return 1
+		_ipk_pull_ar "$1" control.tar.gz "$2/x/control.tar.gz" || return 1
+		;;
+	*)
+		return 1
+		;;
+	esac
+	[ -f "$2/x/data.tar.gz" ] && [ -f "$2/x/control.tar.gz" ] || return 1
+	tar -xzf "$2/x/data.tar.gz" -C "$2/data" 2>/dev/null &&
+		tar -xzf "$2/x/control.tar.gz" -C "$2/ctl" 2>/dev/null
+}
+
+# 19.5 默认路径构建 ipk（不传 FEATURE_LINECHECK，走脚本默认值）+ 容器格式
+if command -v tar >/dev/null 2>&1; then
+	if sh "$ROOT/scripts/build-ipk.sh" >"$F31/ipk-build.log" 2>&1; then
+		_mipk=$ROOT/dist/isp-split_${ISPVER}-1_all.ipk
+		_lipk=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
+		_mfmt=$(_ipk_magic "$_mipk")
+		_lfmt=$(_ipk_magic "$_lipk")
+		if [ "$_mfmt" = gzip ] && [ "$_lfmt" = gzip ]; then
+			ok "19.5 默认构建 ipk×2 成功，容器 gzip-tar（与 23.05/24.10 官方一致）"
+		else
+			ng "19.5 ipk 容器不是 gzip-tar（main=${_mfmt:-?} luci=${_lfmt:-?}）"
+		fi
+	else
+		ng "19.5 默认路径 build-ipk 失败"
+		sed 's/^/    /' "$F31/ipk-build.log" | tail -5
+	fi
+else
+	ng "19.5 缺少 tar，无法构建/检查 ipk"
+fi
+
+# 19.6 主包 payload：lc-run 在包里 + conf 有 LINE_CHECK_* 键 + 语法完好
+if [ -n "$_mipk" ] && _ipk_unpack "$_mipk" "$F31/m" 2>/dev/null; then
+	_m=$F31/m/data
+	_problem=""
+	[ -f "$_m/usr/lib/isp-split/lc-run" ] || _problem="$_problem 缺lc-run"
+	[ -f "$_m/usr/lib/isp-split/lc-run" ] && ! sh -n "$_m/usr/lib/isp-split/lc-run" 2>/dev/null &&
+		_problem="$_problem lc-run语法错"
+	sh -n "$_m/usr/sbin/isp-split" 2>/dev/null || _problem="$_problem 主脚本语法错"
+	for _k in LINE_CHECK_ENABLE LINE_CHECK_GEO LINE_CHECK_MIN_INTERVAL LINE_CHECK_STUN_SERVERS; do
+		grep -q "^${_k}=" "$_m/etc/isp-split.conf" 2>/dev/null || _problem="$_problem 缺${_k}"
+	done
+	if [ -z "$_problem" ]; then
+		ok "19.6 主包 payload：lc-run 在包里 + conf 四类 LINE_CHECK_* 键 + 语法通过"
+	else
+		ng "19.6 主包 payload 面缺失：$_problem"
+	fi
+else
+	ng "19.6 主包 ipk 解包失败"
+fi
+
+# 19.7 LuCI 包 payload：体检页 + 独立菜单节点 + 子节点=3 + CSS 含 .lc-*
+if [ -n "$_lipk" ] && _ipk_unpack "$_lipk" "$F31/l" 2>/dev/null; then
+	_l=$F31/l/data
+	_lproblem=""
+	[ -s "$_l/www/luci-static/resources/view/isp-split/linecheck.js" ] || _lproblem="$_lproblem 缺linecheck.js"
+	[ -s "$_l/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] ||
+		_lproblem="$_lproblem 缺体检菜单节点"
+	grep -q '"admin/network/isp-split/linecheck"' \
+		"$_l/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" 2>/dev/null ||
+		_lproblem="$_lproblem 菜单节点路径不对"
+	# 体检节点在独立 menu.d 文件里，LuCI 运行时合并菜单，所以跨文件数子节点
+	_kids=$(cat "$_l"/usr/share/luci/menu.d/*.json 2>/dev/null |
+		grep -c '"admin/network/isp-split/' || true)
+	[ "${_kids:-0}" = "3" ] || _lproblem="$_lproblem menu子节点=${_kids:-0}"
+	_css=$_l/www/luci-static/resources/isp-split/isp-split.css
+	grep -q '\.lc-' "$_css" 2>/dev/null || _lproblem="$_lproblem CSS无.lc-*"
+	if [ -f "$_css" ]; then
+		_co=$(tr -cd '{' <"$_css" | wc -c | tr -d ' \n')
+		_cc=$(tr -cd '}' <"$_css" | wc -c | tr -d ' \n')
+		[ "$_co" = "$_cc" ] || _lproblem="$_lproblem CSS花括号{$_co}/{$_cc}"
+	fi
+	if [ -z "$_lproblem" ]; then
+		ok "19.7 LuCI payload：linecheck.js + 体检菜单节点 + 子节点=3 + CSS 含 .lc-* 且花括号平衡"
+	else
+		ng "19.7 LuCI payload 面缺失：$_lproblem"
+	fi
+else
+	ng "19.7 LuCI 包解包失败"
+fi
+
+# 19.8 Depends 必须含 socat（UDP STUN 锁线探测的实际依赖）
+_dep=$(sed -n 's/^Depends:[[:space:]]*//p' "$F31/m/ctl/control" 2>/dev/null)
+if printf '%s' "$_dep" | grep -qw 'socat'; then
+	ok "19.8 主包 Depends 含 socat（原文：$_dep）"
+else
+	ng "19.8 主包 Depends 不含 socat（原文：${_dep:-读不到 control}）"
+fi
+
+# 19.9 verify --feature=1 期望面：真实产物必须全中
+if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 \
+	"$_mipk" "$_lipk" >"$F31/v1.log" 2>&1; then
+	ok "19.9 verify --feature=1：默认产物通过完整版断言面"
+else
+	ng "19.9 verify --feature=1 未通过"
+	sed 's/^/    /' "$F31/v1.log" | tail -8
+fi
+
+# 19.10 CLI 冒烟（VM）：linecheck 真跑一次，--wan lo，目标是不可达地址，
+#      2 秒内必返回；断言不是"没崩"而是 JSON 结构 + 评分/建议字段都在。
+#      非 root / 无 nft 的机器（CI 容器、开发机）如实跳过，不算通过。
+_lc_smoke_ok=0
+if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 &&
+   [ -f "$ROOT/files/usr/sbin/isp-split" ]; then
+	_lc=$F31/lc
+	rm -rf "$_lc"
+	mkdir -p "$_lc/base"
+	cat > "$_lc/conf" <<'LCCONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+LINE_CHECK_ENABLE=1
+LINE_CHECK_GEO=0
+LINE_CHECK_GEO_PROVIDER="off"
+LINE_CHECK_MIN_INTERVAL=60
+LINE_CHECK_TIMEOUT=1
+LINE_CHECK_BUDGET=8
+LINE_CHECK_TARGETS="
+chinatelecom:127.0.0.1
+"
+LINE_CHECK_BASELINE="127.0.0.1"
+LINE_CHECK_STUN_SERVERS="
+127.0.0.1:9
+"
+LINE_CHECK_ECHO_URLS="http://127.0.0.1:9"
+LINE_CHECK_UA="Mozilla/5.0 (selftest)"
+LCCONF
+	ISP_SPLIT_CONF="$_lc/conf" ISP_SPLIT_BASE="$_lc/base" \
+		sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --wan lo \
+		>"$_lc/o1.json" 2>"$_lc/e1.txt"
+	_lc_rc=$?
+	if [ "$_lc_rc" = "0" ] &&
+	   grep -q '"command":"linecheck"' "$_lc/o1.json" &&
+	   grep -q '"wans":\[{"iface":"lo"' "$_lc/o1.json" &&
+	   grep -q '"score":{"total":' "$_lc/o1.json" &&
+	   grep -q '"advice":"' "$_lc/o1.json" &&
+	   grep -q '"cached":false' "$_lc/o1.json"; then
+		ok "19.10 CLI 冒烟（VM）：linecheck --json --wan lo 返回 0，JSON 含 wans/score/advice，cached=false"
+		_lc_smoke_ok=1
+	else
+		ng "19.10 CLI 冒烟失败（rc=$_lc_rc）：$(head -2 "$_lc/e1.txt" 2>/dev/null | tr '\n' ' ')"
+	fi
+	# 19.11 60s 缓存：紧接着的第二次调用必须命中缓存（方向：cached=true，且结果一致）
+	if [ "$_lc_smoke_ok" = "1" ]; then
+		ISP_SPLIT_CONF="$_lc/conf" ISP_SPLIT_BASE="$_lc/base" \
+			sh "$ROOT/files/usr/sbin/isp-split" linecheck --json --wan lo \
+			>"$_lc/o2.json" 2>"$_lc/e2.txt"
+		if grep -q '"cached":true' "$_lc/o2.json" &&
+		   [ "$(sed 's/"cached":[a-z]*//; s/"age":[0-9]*//' "$_lc/o1.json")" = \
+		     "$(sed 's/"cached":[a-z]*//; s/"age":[0-9]*//' "$_lc/o2.json")" ]; then
+			ok "19.11 60s 缓存：第二次调用 cached=true 且除 cached/age 外结果与首次逐字节一致"
+		else
+			ng "19.11 缓存未命中或结果漂移（o2: $(head -c 120 "$_lc/o2.json" 2>/dev/null)）"
+		fi
+	else
+		skip "19.11 60s 缓存（依赖 19.10 的首次体检）"
+	fi
+else
+	skip "19.10 CLI 冒烟（linecheck --json --wan lo）——需要 root + nft（VM 环境）；本机跳过"
+	skip "19.11 60s 缓存——同上"
+fi
+
+# 19.12 方向安全：未知容器 / 空产物必须显式失败（F8）
+printf 'NOT-A-PACKAGE-CONTAINER\n' > "$F31/unknown.pkg"
+if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 "$F31/unknown.pkg" \
+	>"$F31/unknown.log" 2>&1; then
+	ng "19.12 未知容器格式被静默接受"
+elif grep -q '未知容器格式' "$F31/unknown.log"; then
+	ok "19.12 未知容器格式：显式报错 + 非零退出（不静默跳过）"
+else
+	ng "19.12 未知容器失败原因不对：$(head -1 "$F31/unknown.log")"
+fi
+if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 >"$F31/empty.log" 2>&1; then
+	ng "19.12b 空产物列表被判通过（真空通过）"
+else
+	ok "19.12b 空产物列表：拒绝（真空通过不可能再发生）"
+fi
+
+# 19.13 apk 容器（25.12）：有本轮版本的 SDK 产物就按 feature=1 断言。
+# 只认 ${ISPVER} 的 apk——dist 里可能留着上一版的包，拿它断言等于在测旧代码。
+if command -v tar >/dev/null 2>&1; then
+	set --
+	for _a in "$ROOT"/dist/sdk-*/isp-split-"${ISPVER}"-*.apk \
+		"$ROOT"/dist/sdk-*/luci-app-isp-split-"${ISPVER}"-*.apk; do
+		[ -f "$_a" ] && set -- "$@" "$_a"
+	done
+	if [ "$#" -gt 0 ]; then
+		if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 "$@" \
+			>"$F31/apk.log" 2>&1; then
+			ok "19.13 apk×$#（SDK 产物，${ISPVER}）：ADB 容器解包 + feature=1 期望面全中"
+		else
+			ng "19.13 apk 未通过 feature=1 断言"
+			sed 's/^/    /' "$F31/apk.log" | tail -8
+		fi
+	else
+		skip "19.13 apk 断言（dist 下没有 ${ISPVER} 的 SDK apk 产物；CI 的 25.12 分支会跑）"
+	fi
+else
+	skip "19.13 apk 断言（无 tar）"
+fi
+
+# ---- 19b. 剥离版子集（FEATURE_LINECHECK=0，可选构建；两个方向都是资产） ----
+# 默认路径已是完整版（§19），这一组只在显式 FEATURE_LINECHECK=0 时才有意义：
 #   · 剥离后的运行时树里没有实现/CLI/conf 键/页面/菜单；
 #   · 被剥离的 CLI 给出固定拒绝文案，且不留下 state 痕迹；
 #   · ipk 的文件清单与 Depends 里没有 linecheck / socat；
 #   · 文档按标记剥离后也没有剧透。
-echo "== 19. 发货门（线路体检构建期剥离）"
+echo "== 19b. 剥离版子集（FEATURE_LINECHECK=0）"
 F30=$TMP/fix30
+_mipk=""
+_lipk=""
 rm -rf "$F30"
 mkdir -p "$F30/root" "$F30/luci/www/luci-static/resources/view/isp-split" \
 	"$F30/luci/usr/share/luci/menu.d" "$F30/luci/usr/share/rpcd/acl.d"
 
-# 19.1 运行时树物理剥离
+# 19b.1 运行时树物理剥离
 cp -a "$ROOT/files/." "$F30/root/"
 if sh "$ROOT/scripts/strip-linecheck.sh" "$F30/root" >"$F30/strip.log" 2>&1; then
-	ok "19.1 strip-linecheck 成功剥离运行时树"
+	ok "19b.1 strip-linecheck 成功剥离运行时树"
 else
-	ng "19.1 strip-linecheck 失败"
+	ng "19b.1 strip-linecheck 失败"
 	sed 's/^/    /' "$F30/strip.log" | tail -5
 fi
 
-# 19.2 零残留（白名单为空）
+# 19b.2 零残留（白名单为空）
 _leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/root" 2>/dev/null || true)
 if [ -z "$_leak" ]; then
-	ok "19.2 剥离后运行时树 grep 零残留（linecheck / LINE_CHECK / 线路体检）"
+	ok "19b.2 剥离后运行时树 grep 零残留（linecheck / LINE_CHECK / 线路体检）"
 else
-	ng "19.2 剥离后仍有残留：$(printf '%s ' $_leak)"
+	ng "19b.2 剥离后仍有残留：$(printf '%s ' $_leak)"
 fi
 
-# 19.3 语法
+# 19b.3 语法
 if sh -n "$F30/root/usr/sbin/isp-split" && sh -n "$F30/root/etc/isp-split.conf"; then
-	ok "19.3 剥离后的 isp-split 与 conf 通过 sh -n"
+	ok "19b.3 剥离后的 isp-split 与 conf 通过 sh -n"
 else
-	ng "19.3 剥离后语法错误"
+	ng "19b.3 剥离后语法错误"
 fi
 
-# 19.4 CLI 固定拒绝文案 + 非零退出
+# 19b.4 CLI 固定拒绝文案 + 非零退出
 cp "$F30/root/etc/isp-split.conf" "$F30/conf"
 ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
 	sh "$F30/root/usr/sbin/isp-split" linecheck >"$F30/lc.out" 2>"$F30/lc.err"
 _lc_rc=$?
 if [ "$_lc_rc" -ne 0 ] && grep -q '此版本未包含该功能' "$F30/lc.err"; then
-	ok "19.4 剥离版 linecheck：固定文案「此版本未包含该功能」+ 退出码 $_lc_rc"
+	ok "19b.4 剥离版 linecheck：固定文案「此版本未包含该功能」+ 退出码 $_lc_rc"
 else
-	ng "19.4 剥离版 linecheck 未按约定拒绝（rc=$_lc_rc）"
+	ng "19b.4 剥离版 linecheck 未按约定拒绝（rc=$_lc_rc）"
 fi
 
-# 19.5 拒绝路径不得留下 state/linecheck*
+# 19b.5 拒绝路径不得留下 state/linecheck*
 if [ -z "$(ls -d "$F30"/base/state/linecheck* 2>/dev/null)" ]; then
-	ok "19.5 拒绝路径不创建 state/linecheck*（先判后建）"
+	ok "19b.5 拒绝路径不创建 state/linecheck*（先判后建）"
 else
-	ng "19.5 拒绝路径留下了 state/linecheck* 痕迹"
+	ng "19b.5 拒绝路径留下了 state/linecheck* 痕迹"
 fi
 
-# 19.6 usage 不含剧透
+# 19b.6 usage 不含剧透
 ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
 	sh "$F30/root/usr/sbin/isp-split" >"$F30/usage.txt" 2>&1
 if ! grep -q 'linecheck\|LINE_CHECK\|线路体检' "$F30/usage.txt"; then
-	ok "19.6 剥离版 usage 无 linecheck / 线路体检"
+	ok "19b.6 剥离版 usage 无 linecheck / 线路体检"
 else
-	ng "19.6 剥离版 usage 仍有剧透"
+	ng "19b.6 剥离版 usage 仍有剧透"
 fi
 
-# 19.7 conf 面：键名不被识别
+# 19b.7 conf 面：键名不被识别
 ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
 	sh "$F30/root/usr/sbin/isp-split" conf set LINE_CHECK_GEO 0 >"$F30/conf.out" 2>&1
 _cf_rc=$?
 if [ "$_cf_rc" -ne 0 ] && grep -q "未知配置项 'LINE_CHECK_GEO'" "$F30/conf.out"; then
-	ok "19.7 剥离版 conf set LINE_CHECK_GEO：未知配置项 + 非零退出"
+	ok "19b.7 剥离版 conf set LINE_CHECK_GEO：未知配置项 + 非零退出"
 else
-	ng "19.7 剥离版 conf 仍接受 LINE_CHECK_*（rc=$_cf_rc）"
+	ng "19b.7 剥离版 conf 仍接受 LINE_CHECK_*（rc=$_cf_rc）"
 fi
 
-# 19.8 LuCI 面：menu 子节点 == 2，无体检页/节点文件
+# 19b.8 LuCI 面：menu 子节点 == 2，无体检页/节点文件
 cp "$ROOT"/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/*.js \
 	"$F30/luci/www/luci-static/resources/view/isp-split/" 2>/dev/null || true
 mkdir -p "$F30/luci/www/luci-static/resources/isp-split"
@@ -3424,24 +3756,24 @@ if [ "$_kids" = "2" ] &&
    [ ! -f "$F30/luci/www/luci-static/resources/view/isp-split/linecheck.js" ] &&
    [ ! -f "$F30/luci/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
    ! grep -q 'linecheck' "$F30/luci/usr/share/rpcd/acl.d/luci-app-isp-split.json" 2>/dev/null; then
-	ok "19.8 剥离后 menu 子节点=2，无体检页 / 菜单节点 / acl 串"
+	ok "19b.8 剥离后 menu 子节点=2，无体检页 / 菜单节点 / acl 串"
 else
-	ng "19.8 剥离后 LuCI 面不干净（子节点=$_kids）"
+	ng "19b.8 剥离后 LuCI 面不干净（子节点=$_kids）"
 fi
 
-# 19.9 config.js：剥离后仍可被 JS 解析（有 node 时）
+# 19b.9 config.js：剥离后仍可被 JS 解析（有 node 时）
 if command -v node >/dev/null 2>&1 &&
    [ -f "$F30/luci/www/luci-static/resources/view/isp-split/config.js" ]; then
 	if node --check "$F30/luci/www/luci-static/resources/view/isp-split/config.js" 2>/dev/null; then
-		ok "19.9 剥离后 config.js 通过 node --check"
+		ok "19b.9 剥离后 config.js 通过 node --check"
 	else
-		ng "19.9 剥离后 config.js 语法错误"
+		ng "19b.9 剥离后 config.js 语法错误"
 	fi
 else
-	ok "19.9 跳过 node --check（无 node 或文件不存在）"
+	skip "19b.9 node --check（无 node 或文件不存在）"
 fi
 
-# 19.10 ipk：主包 + LuCI 包的文件清单 / menu 子节点 / Depends
+# 19b.10 ipk：主包 + LuCI 包的文件清单 / menu 子节点 / Depends
 # 容器嗅探：23.05/24.10 官方与 build-ipk.sh 默认产物是 gzip-tar（magic 1f 8b），
 # 历史格式才是明文 ar（!<arch>）。两种都要能读，未知格式必须判失败。
 # 不用 od（OpenWrt 精简固件没有），用 dd + cmp 比 magic。
@@ -3501,15 +3833,15 @@ _ipk_unpack() { # <ipk> <dest>
 		tar -xzf "$2/x/control.tar.gz" -C "$2/ctl" 2>/dev/null
 }
 if command -v tar >/dev/null 2>&1; then
-	if sh "$ROOT/scripts/build-ipk.sh" >"$F30/ipk-build.log" 2>&1; then
+	if FEATURE_LINECHECK=0 sh "$ROOT/scripts/build-ipk.sh" >"$F30/ipk-build.log" 2>&1; then
 		_mipk=$ROOT/dist/isp-split_${ISPVER}-1_all.ipk
 		_lipk=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
 		_mfmt=$(_ipk_magic "$_mipk")
 		_lfmt=$(_ipk_magic "$_lipk")
 		if [ "$_mfmt" = gzip ] && [ "$_lfmt" = gzip ]; then
-			ok "19.10a ipk 容器嗅探：gzip-tar（与 23.05/24.10 官方一致）"
+			ok "19b.10a ipk 容器嗅探：gzip-tar（与 23.05/24.10 官方一致）"
 		else
-			ng "19.10a ipk 容器不是 gzip-tar（main=${_mfmt:-?} luci=${_lfmt:-?}）"
+			ng "19b.10a ipk 容器不是 gzip-tar（main=${_mfmt:-?} luci=${_lfmt:-?}）"
 		fi
 		if _ipk_unpack "$_mipk" "$F30/mipk" && _ipk_unpack "$_lipk" "$F30/lipk"; then
 			_m_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/mipk/data" 2>/dev/null || true)
@@ -3522,123 +3854,57 @@ if command -v tar >/dev/null 2>&1; then
 			   [ ! -f "$F30/lipk/data/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
 			   [ "$_kids" = "2" ] &&
 			   ! grep -qi 'socat' "$F30/mipk/ctl/control" "$F30/lipk/ctl/control"; then
-				ok "19.10 ipk×2：payload 零残留、无 lc-run/体检页、menu 子节点=2、Depends 无 socat"
+				ok "19b.10 ipk×2：payload 零残留、无 lc-run/体检页、menu 子节点=2、Depends 无 socat"
 			else
-				ng "19.10 ipk 断言失败（menu 子节点=$_kids）"
+				ng "19b.10 ipk 断言失败（menu 子节点=$_kids）"
 			fi
 		else
-			ng "19.10 ipk 解包失败"
+			ng "19b.10 ipk 解包失败"
 		fi
 	else
-		ng "19.10 build-ipk 失败"
+		ng "19b.10 build-ipk 失败"
 		sed 's/^/    /' "$F30/ipk-build.log" | tail -5
 	fi
 else
-	ok "19.10 跳过 ipk 断言（无 tar）"
+	ok "19b.10 跳过 ipk 断言（无 tar）"
 fi
 
-# 19.11 文档：按标记剥离后无剧透
+# 19b.11 文档：按标记剥离后无剧透
 sed '/lc:begin/,/lc:end/d' "$ROOT/README.md" >"$F30/README.md"
 sed '/lc:begin/,/lc:end/d' "$ROOT/docs/CONFIGURATION.md" >"$F30/CONFIGURATION.md"
 sed '/lc:begin/,/lc:end/d' "$ROOT/docs/DESIGN.md" >"$F30/DESIGN.md"
 if ! grep -q 'linecheck\|LINE_CHECK\|线路体检' "$F30/README.md" "$F30/CONFIGURATION.md" "$F30/DESIGN.md"; then
-	ok "19.11 README / CONFIGURATION / DESIGN 剥离后无剧透"
+	ok "19b.11 README / CONFIGURATION / DESIGN 剥离后无剧透"
 else
-	ng "19.11 文档剥离后仍有剧透"
+	ng "19b.11 文档剥离后仍有剧透"
 fi
 
-# 19.12 版本一致性（主 Makefile / luci Makefile / feed 两个壳 / ISP_VERSION）
-_v_main=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1)
-_v_luci=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-isp-split/Makefile" | head -1)
-_v_f1=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/isp-split/Makefile" | head -1)
-_v_f2=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/luci-app-isp-split/Makefile" | head -1)
-if [ "$_v_main" = "$ISPVER" ] && [ "$_v_luci" = "$ISPVER" ] &&
-   [ "$_v_f1" = "$ISPVER" ] && [ "$_v_f2" = "$ISPVER" ]; then
-	ok "19.12 版本一致：ISP_VERSION=PKG_VERSION=$ISPVER（主/luci/feed×2）"
-else
-	ng "19.12 版本漂移：ISP=$ISPVER main=$_v_main luci=$_v_luci feed=$_v_f1/$_v_f2"
-fi
+# 19b.12 apk 容器（0 版）：默认发货路径已改为 feature=1，dist 下的 SDK apk 是
+# 完整版，不能再拿它当剥离版断言。0 版 apk 需要整轮 SDK 重编
+# （FEATURE_LINECHECK=0 sh scripts/build-apk.sh 25.12.6 x86/64），CI 不含该矩阵。
+# 如实跳过：apk 的完整版面由 §19.13 覆盖，剥离路径由本节 ipk + strip 断言覆盖。
+skip "19b.12 apk（0 版）断言——需整轮 SDK 重编，本次未构建（apk 完整版面见 §19.13）"
 
-# 19.13 apk：解包后断言文件清单 / Depends（有 apk 工具时）
-APKBIN=$(command -v apk 2>/dev/null || true)
-if [ -z "$APKBIN" ] && [ -x "$ROOT/.sdk-build/sdk/staging_dir/host/bin/apk" ]; then
-	APKBIN=$ROOT/.sdk-build/sdk/staging_dir/host/bin/apk
-fi
-if [ -n "$APKBIN" ]; then
-	_apk=$(ls "$ROOT"/dist/sdk-*/*.apk 2>/dev/null | head -1)
-	if [ -n "$_apk" ]; then
-		rm -rf "$F30/apkx" && mkdir -p "$F30/apkx"
-		# apk 3.0.5 的 extract 没有 --root，必须在目标目录里执行
-		if ( cd "$F30/apkx" && "$APKBIN" extract --allow-untrusted "$_apk" ) \
-			>"$F30/apk-extract.log" 2>&1; then
-			_apk_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/apkx" 2>/dev/null || true)
-			_apk_dep=$("$APKBIN" adbdump "$_apk" 2>/dev/null |
-				sed -n '/^  depends:/,/^  [a-z]/p')
-			if [ -z "$_apk_leak" ] &&
-			   [ ! -f "$F30/apkx/usr/lib/isp-split/lc-run" ] &&
-			   ! printf '%s' "$_apk_dep" | grep -qi 'socat'; then
-				ok "19.13 apk：解包零残留、无 lc-run、Depends 无 socat"
-			else
-				ng "19.13 apk 仍有 linecheck 内容或 socat 依赖"
-			fi
-		else
-			ok "19.13 跳过 apk 断言（apk 无法解包该文件）"
-		fi
-	else
-		ok "19.13 跳过 apk 断言（dist 下没有 SDK 产物）"
-	fi
-else
-	ok "19.13 跳过 apk 断言（无 apk 命令）"
-fi
-
-# 19.14 init / cron：确认没有体检联动（未来也不许偷偷加定时探测）
+# 19b.13 init / cron：确认没有体检联动（未来也不许偷偷加定时探测）
 if ! grep -q 'linecheck' "$ROOT/files/etc/init.d/isp-split" \
 	"$ROOT/files/etc/uci-defaults/99-isp-split" 2>/dev/null &&
    ! sed -n '/^add_cron()/,/^}/p' "$ROOT/scripts/install.sh" | grep -q 'linecheck'; then
-	ok "19.14 init / uci-defaults / cron 无体检联动（无定时探测）"
+	ok "19b.13 init / uci-defaults / cron 无体检联动（无定时探测）"
 else
-	ng "19.14 init/cron 出现 linecheck 联动"
+	ng "19b.13 init/cron 出现 linecheck 联动"
 fi
 
-# 19.15 剥离实现单一来源（F7）：仓库两份 + feed 两份，逐字节一致
-_bad_strip=""
-for _s in "$ROOT/strip-linecheck.sh" \
-          "$ROOT/luci-app-isp-split/strip-linecheck.sh" \
-          "$ROOT/feed/op-packages/isp-split/strip-linecheck.sh" \
-          "$ROOT/feed/op-packages/luci-app-isp-split/strip-linecheck.sh"; do
-	if [ ! -f "$_s" ]; then
-		_bad_strip="$_bad_strip 缺:$_s"
-	elif ! cmp -s "$ROOT/scripts/strip-linecheck.sh" "$_s"; then
-		_bad_strip="$_bad_strip 异:$_s"
-	fi
-done
-if [ -z "$_bad_strip" ]; then
-	ok "19.15 剥离脚本单一来源：仓库 2 份 + feed 2 份与 scripts/strip-linecheck.sh 逐字节一致"
-else
-	ng "19.15 剥离脚本副本漂移：$_bad_strip"
-fi
-
-# 19.16 两个 Makefile 的 Build/Prepare 必须调用同一份脚本，不许再手抄 sed
-if grep -q "sed -i '/lc:begin" "$ROOT/Makefile" "$ROOT/luci-app-isp-split/Makefile" 2>/dev/null; then
-	ng "19.16 Makefile 仍在手抄 sed 剥离（F7 的分叉源）"
-elif grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/Makefile" &&
-     grep -Fq 'sh $(CURDIR)/strip-linecheck.sh' "$ROOT/luci-app-isp-split/Makefile"; then
-	ok "19.16 主/luci Makefile 的 Build/Prepare 都调用 \$(CURDIR)/strip-linecheck.sh"
-else
-	ng "19.16 Makefile 没有调用统一的剥离脚本"
-fi
-
-# 19.17 CSS 样式体必须随标记一起消失（19.8 已经剥离过 LuCI 树）
+# 19b.14 CSS 样式体必须随标记一起消失（19.8 已经剥离过 LuCI 树）
 _css=$F30/luci/www/luci-static/resources/isp-split/isp-split.css
 _css_o=$(tr -cd '{' <"$_css" 2>/dev/null | wc -c | tr -d ' \n')
 _css_c=$(tr -cd '}' <"$_css" 2>/dev/null | wc -c | tr -d ' \n')
 if [ -f "$_css" ] && ! grep -q '\.lc-' "$_css" && [ "$_css_o" = "$_css_c" ]; then
-	ok "19.17 剥离后 isp-split.css 无 .lc-* 样式且花括号平衡"
+	ok "19b.14 剥离后 isp-split.css 无 .lc-* 样式且花括号平衡"
 else
-	ng "19.17 剥离后 CSS 仍含 .lc-* 或规则体被切坏"
+	ng "19b.14 剥离后 CSS 仍含 .lc-* 或规则体被切坏"
 fi
 
-# 19.18 反向：旧式“标记只包标题注释”必须被 strip 拒绝（F7 回归用例）
+# 19b.15 反向：旧式“标记只包标题注释”必须被 strip 拒绝（F7 回归用例）
 mkdir -p "$F30/cssneg"
 cat > "$F30/cssneg/isp-split.css" <<'EOF'
 .isp-card { color: red; }
@@ -3650,29 +3916,14 @@ cat > "$F30/cssneg/isp-split.css" <<'EOF'
 .lc-cards { display: block; }
 EOF
 if sh "$ROOT/scripts/strip-linecheck.sh" "$F30/cssneg" >"$F30/cssneg.log" 2>&1; then
-	ng "19.18 旧式“只包标题”的 CSS 没有被拦截（.lc-* 会裸奔进包）"
+	ng "19b.15 旧式“只包标题”的 CSS 没有被拦截（.lc-* 会裸奔进包）"
 elif grep -q '\.lc-' "$F30/cssneg.log"; then
-	ok "19.18 旧式“只包标题”的 CSS 被拒绝（.lc-* 断言命中）"
+	ok "19b.15 旧式“只包标题”的 CSS 被拒绝（.lc-* 断言命中）"
 else
-	ng "19.18 CSS 反向用例失败原因不对：$(head -1 "$F30/cssneg.log")"
+	ng "19b.15 CSS 反向用例失败原因不对：$(head -1 "$F30/cssneg.log")"
 fi
 
-# 19.19 未知容器 / 空列表：必须显式失败，不许真空通过（F8 的教训）
-printf 'NOT-A-PACKAGE-CONTAINER\n' > "$F30/unknown.pkg"
-if sh "$ROOT/scripts/verify-package-payload.sh" verify "$F30/unknown.pkg" >"$F30/unknown.log" 2>&1; then
-	ng "19.19 未知容器格式被静默接受"
-elif grep -q '未知容器格式' "$F30/unknown.log"; then
-	ok "19.19 未知容器格式：显式报错 + 非零退出（不静默跳过）"
-else
-	ng "19.19 未知容器失败原因不对：$(head -1 "$F30/unknown.log")"
-fi
-if sh "$ROOT/scripts/verify-package-payload.sh" verify >"$F30/empty.log" 2>&1; then
-	ng "19.19b 空产物列表被判通过（真空通过）"
-else
-	ok "19.19b 空产物列表：拒绝（真空通过不可能再发生）"
-fi
-
-# 19.20 正例：往 LuCI 包的 CSS 里塞一行 .lc-* 后，断言必须抓到（F7 断言面）
+# 19b.16 正例：往 LuCI 包的 CSS 里塞一行 .lc-* 后，断言必须抓到（F7 断言面）
 _lp=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
 if [ -f "$_lp" ] && command -v tar >/dev/null 2>&1 &&
    _ipk_unpack "$_lp" "$F30/leak/src"; then
@@ -3684,22 +3935,39 @@ if [ -f "$_lp" ] && command -v tar >/dev/null 2>&1 &&
 		printf '2.0\n' >"$F30/leak/out/debian-binary"
 		( cd "$F30/leak/src/data" && tar czf "$F30/leak/out/data.tar.gz" . )
 		( cd "$F30/leak/out" && tar czf "$F30/leak/leak.ipk" ./debian-binary ./control.tar.gz ./data.tar.gz )
-		if sh "$ROOT/scripts/verify-package-payload.sh" verify "$F30/leak/leak.ipk" >"$F30/leak.log" 2>&1; then
-			ng "19.20 注入 .lc-* 的 ipk 被判通过（断言面又漏了）"
+		if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=0 "$F30/leak/leak.ipk" >"$F30/leak.log" 2>&1; then
+			ng "19b.16 注入 .lc-* 的 ipk 被判通过（断言面又漏了）"
 		elif grep -q '\.lc-' "$F30/leak.log"; then
-			ok "19.20 注入 .lc-* 的 ipk 被断言抓到（CSS 面不再是盲区）"
+			ok "19b.16 注入 .lc-* 的 ipk 被断言抓到（CSS 面不再是盲区）"
 		else
-			ng "19.20 ipk 正例失败原因不对：$(head -1 "$F30/leak.log")"
+			ng "19b.16 ipk 正例失败原因不对：$(head -1 "$F30/leak.log")"
 		fi
 	else
-		ng "19.20 ipk 正例解包后没有 CSS（打包规则变了？）"
+		ng "19b.16 ipk 正例解包后没有 CSS（打包规则变了？）"
 	fi
 else
-	ng "19.20 无法构造 ipk 正例（缺 dist 产物或无 tar）"
+	ng "19b.16 无法构造 ipk 正例（缺 dist 产物或无 tar）"
 fi
 
+# 19b.17 方向鉴别：同一批 0 版产物，feature=1 期望面**必须**判失败。
+# 只有两边都跑过，才能证明断言方向真的翻了，而不是两套断言都恒真。
+if [ -f "${_mipk:-}" ] && [ -f "${_lipk:-}" ]; then
+	if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 \
+		"$_mipk" "$_lipk" >"$F30/dir.log" 2>&1; then
+		ng "19b.17 剥离版产物被 feature=1 期望面判通过（断言方向没翻）"
+	elif grep -q '缺少 /usr/lib/isp-split/lc-run' "$F30/dir.log" &&
+	     grep -q 'Depends 不含 socat' "$F30/dir.log"; then
+		ok "19b.17 方向鉴别：0 版产物被 feature=1 期望面拒绝（缺 lc-run / Depends 无 socat）"
+	else
+		ng "19b.17 拒绝原因不是预期的那几项：$(head -2 "$F30/dir.log" | tr '\n' ' ')"
+	fi
+else
+	skip "19b.17 方向鉴别（缺 19b.10 的 0 版产物）"
+fi
+
+
 echo
-echo "通过 $pass 项，失败 $fail 项"
+echo "通过 $pass 项，失败 $fail 项，跳过 $skipn 项"
 if [ "$fail" -ne 0 ] && [ "$(id -u)" -ne 0 ]; then
 	echo "（非 root 环境：依赖 uid=0 属主校验的 2 项属预期失败，已由 VM 覆盖）"
 fi

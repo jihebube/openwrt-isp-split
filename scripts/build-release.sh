@@ -16,10 +16,10 @@ REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -1)
 [ -n "$VER" ] || { echo "无法从 Makefile 读取 PKG_VERSION" >&2; exit 1; }
 REL=${REL:-1}
 # 与 Makefile / build-ipk.sh / install.sh 同一个出货门。
-#   1 = 完整功能版：发“源码 + 安装脚本”整包（含 docs/tools/selftest）。
-#   0 = 纯修复版：不发源码包；只发运行时的 install 包 + ipk，且在打包时
+#   1 = 完整功能版（默认）：发“源码 + 安装脚本”整包（含 docs/tools/selftest）。
+#   0 = 剥离版：不发源码包；只发运行时的 install 包 + ipk，且在打包时
 #       物理剥离线路体检（docs/tools 本来就不进这个包）。
-FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 NAME=isp-split-$VER
 

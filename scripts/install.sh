@@ -14,8 +14,8 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$ROOT/files
-# 出货门，与 Makefile / build-ipk.sh 同义：0 = 构建期剥离，1 = 完整功能。
-FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+# 出货门，与 Makefile / build-ipk.sh 同义：1 = 完整功能（默认），0 = 构建期剥离。
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 LUCI_SRC=$ROOT/luci-app-isp-split
 STAGE=""
@@ -158,6 +158,13 @@ install_luci() {
 	fi
 	cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split.json" /usr/share/luci/menu.d/
 	cp -f "$L/root/usr/share/rpcd/acl.d/luci-app-isp-split.json" /usr/share/rpcd/acl.d/
+	# 权限归一化：cp -f 会继承源文件权限位。工作区里若被改成 0600，
+	# 装到设备上 uhttpd 读不了 → 静态资源 403、页面裸奔（0.3.0 实测踩到）。
+	chmod 644 /www/luci-static/resources/isp-split/*.css 2>/dev/null || true
+	chmod 644 /www/luci-static/resources/isp-split/logos/*.svg 2>/dev/null || true
+	chmod 644 /www/luci-static/resources/view/isp-split/*.js 2>/dev/null || true
+	chmod 644 /usr/share/luci/menu.d/luci-app-isp-split*.json 2>/dev/null || true
+	chmod 644 /usr/share/rpcd/acl.d/luci-app-isp-split.json 2>/dev/null || true
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
 	# 只重启 rpcd（ACL 生效所需）。uhttpd 不必重启——
 	# 静态文件与 menu.d 都是按请求读取的，重启反而会造成短暂无法访问。

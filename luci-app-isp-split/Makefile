@@ -1,15 +1,16 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-isp-split
-PKG_VERSION:=0.2.3
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 
 include $(INCLUDE_DIR)/package.mk
 
-# 与主包同一个构建期开关：0.2.3 出货默认 0，LuCI 的体检页/菜单节点不进包。
-FEATURE_LINECHECK?=0
+# 与主包同一个构建期开关：默认 1（完整版，含体检页 / 菜单节点）；
+# 0 = 剥离版，体检页与菜单节点不进包。
+FEATURE_LINECHECK?=1
 
 define Package/luci-app-isp-split
   SECTION:=luci

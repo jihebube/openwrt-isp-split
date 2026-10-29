@@ -17,7 +17,7 @@
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
 <!-- lc:begin -->
-- **线路体检（0.3.0）**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
+- **线路体检**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
 <!-- lc:end -->
 - **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
 - **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
@@ -139,7 +139,7 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 生效方式：策略映射改动执行 `isp-split wire && isp-split apply`；DNS 改动执行 `isp-split dns`；也可在 LuCI 配置页操作。完整字段说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
 <!-- lc:begin -->
-线路体检（0.3.0）的开关与隐私：
+线路体检的开关与隐私：
 
 ```sh
 LINE_CHECK_ENABLE=1          # 总开关；0=完全不执行体检
@@ -236,8 +236,10 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 - [x] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），默认 `ISP_VERIFY_ENABLE=1`，
       校验源换 clang；`sources.tsv` 残留清理、LuCI 只读数据源区块
 <!-- lc:begin -->
-- [ ] **0.3.0**：线路体检 MVP——公网/CGNAT/私网分类、出口 IP、四段延迟、双 STUN
-      五态 NAT、归属地隐私开关、可解释评分、60s 缓存、LuCI 卡片页
+- [x] **0.3.0**：线路体检正式发货——逐条 WAN 的出口类型五态（公网 / 锥形 / 对称或多出口 /
+      CGNAT / 未知）、出口 IP 与多层 NAT、DNS/建连/TLS/首字节四段延迟、双 STUN、
+      归属地（默认开、可关）、可解释评分与一句话建议、60s 缓存；LuCI 卡片页只读缓存，
+      点按钮才起后台探测
 <!-- lc:end -->
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏

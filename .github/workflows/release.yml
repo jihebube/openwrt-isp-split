@@ -11,9 +11,10 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
-# 0.2.3 是纯修复版：构建期剥离线路体检（0.3.0 起改回 "1"）。
+# 0.3.0 起线路体检随包发货：默认 "1"（完整版）。
+# 需要剥离版时在这里改成 "0"，并用 FEATURE_LINECHECK=0 重跑一次 CI。
 env:
-  FEATURE_LINECHECK: "0"
+  FEATURE_LINECHECK: "1"
 
 permissions:
   contents: write
@@ -43,7 +44,7 @@ jobs:
           find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
           ls -lh out
 
-      - name: 零残留断言（ipk + apk 容器；未知格式显式失败）
+      - name: 发货面断言（完整版 feature=1；未知格式显式失败）
         run: |
           set -eu
           # F8：25.12 job 只产 .apk，旧循环 glob 的是 out/*.ipk，于是循环空转、
@@ -58,9 +59,9 @@ jobs:
             echo "::error::${{ matrix.branch }} 没有产出 .$want，断言会真空通过"
             exit 1
           }
-          # LuCI 包是 CSS 泄漏（F7）唯一的载体。它要是没产出，断言就失去覆盖面。
+          # LuCI 包是体检页与 CSS 的唯一载体。它要是没产出，断言就失去覆盖面。
           ls out/luci-app-isp-split* >/dev/null 2>&1 || {
-            echo "::error::${{ matrix.branch }} 没有产出 luci-app-isp-split 包，CSS 断言面无产物"
+            echo "::error::${{ matrix.branch }} 没有产出 luci-app-isp-split 包，断言面无产物"
             exit 1
           }
           set --
@@ -68,9 +69,11 @@ jobs:
             [ -f "$f" ] || continue
             set -- "$@" "$f"
           done
-          # 容器嗅探 / 解包 / 零残留（含 CSS `.lc-*`）都在脚本里逐例判定，
-          # 未知容器格式或解不出来都会非零退出，不会再静默跳过。
-          sh scripts/verify-package-payload.sh verify "$@"
+          # 0.3.0 起断言方向反转：不再要求「零残留」，而是要求体检**真的在包里**
+          # （linecheck 子命令 / lc-run / linecheck.js 与菜单节点 / CSS `.lc-*` /
+          #  conf 的 LINE_CHECK_* / Depends 的 socat）。方向由 --feature 显式给出，
+          # 与 env FEATURE_LINECHECK 同源，避免产物与断言各说各话。
+          sh scripts/verify-package-payload.sh verify --feature="${FEATURE_LINECHECK}" "$@"
 
       - name: 脚本路径产物 vs SDK 路径产物 payload 恒等
         run: |
@@ -120,15 +123,52 @@ jobs:
         run: |
           mkdir -p rel
           find artifacts -type f -exec cp -v {} rel/ \;
-          cd rel && sha256sum * 2>/dev/null > SHA256SUMS || shasum -a 256 * > SHA256SUMS
-          ls -lh
+          # 曾经的 bug：`sha256sum * > SHA256SUMS` 里，重定向先创建空文件，
+          # 于是 glob 把 SHA256SUMS 自己也算进去，清单里多出一行
+          # `e3b0c442...(空文件的 sha256)  SHA256SUMS`。这里逐个列并显式排除自身。
+          cd rel
+          : > SHA256SUMS
+          for f in *; do
+            [ -f "$f" ] || continue
+            [ "$f" = "SHA256SUMS" ] && continue
+            sha256sum "$f" >> SHA256SUMS 2>/dev/null || shasum -a 256 "$f" >> SHA256SUMS
+          done
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+          # 断言：清单非空，且不含自身
+          [ -s SHA256SUMS ] || { echo "::error::SHA256SUMS 为空"; exit 1; }
+          if grep -q ' SHA256SUMS$' SHA256SUMS; then
+            echo "::error::SHA256SUMS 把自己也列进了清单"
+            exit 1
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: rel/*
-          # 不自动生成 release notes：0.2.3 的 tag 区间包含 0.3.0 的功能提交，
-          # 自动 notes 会把线路体检的提交标题直接剧透。描述由运维手写。
+          # 不自动生成 release notes：0.3.0 的对外口径要人工定稿（功能边界、隐私说明、
+          # 升级注意事项都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
+            ## v0.3.0 望闻问切
+
+            按目标 IP 归属运营商分流的 mwan3-nft 工具，这一版把**线路体检**正式发货：
+            逐条 WAN 判定出口类型（公网 / 锥形 / 对称或多出口 / CGNAT / 未知，五态）、
+            测 DNS / 建连 / TLS / 首字节四段延迟、双 STUN 探 NAT、给出可解释评分与一句话建议，
+            结果缓存 60 秒；LuCI 新增「线路体检」卡片页。全程只读探测，不改 mwan3 / nft 规则。
+
+            **隐私口径**：归属地查询默认开启、可关闭（`LINE_CHECK_GEO=0`）。开启时只把每条
+            WAN 的**出口公网 IP** 发给归属地服务（默认百度，失败转 ip-api.com），不发送内网地址、
+            设备名、MAC 或流量内容。介意可关闭归属地，或把 `LINE_CHECK_GEO_PROVIDER` 固定为
+            `baidu`，避免走明文 HTTP 的 ip-api.com。
+
+            ### 本版变化
+
+            - 线路体检随包发货：`FEATURE_LINECHECK` 默认 `1`，含 `linecheck` 子命令、
+              后台探测引擎 `lc-run`、LuCI 卡片页与菜单节点，`socat` 进入 `Depends`
+            - 体检结果缓存 60 秒（`LINE_CHECK_MIN_INTERVAL`），Linux 侧脚本与页面共用同一份快照
+            - 归属地可关：只停第三方归属地查询，出口 IP 回显 / STUN / 延迟探测照常
+            - 其余不变：运营商网段每日更新、双源校验、与代理共存
+            - 小闪存 / 特殊渠道仍可自建剥离版：`FEATURE_LINECHECK=0 sh scripts/build-ipk.sh`
+
             ## 安装
 
             **OpenWrt 25.12+（apk 系，含 Kwrt 25.12）** —— 下载源码包用脚本安装：
@@ -155,4 +195,11 @@ jobs:
 
             ```sh
             isp-split plan && isp-split check && isp-split sync && isp-split verify
+            ```
+
+            体检单独跑：
+
+            ```sh
+            isp-split linecheck            # 文本报告
+            isp-split linecheck --json     # 给脚本 / 页面用
             ```
