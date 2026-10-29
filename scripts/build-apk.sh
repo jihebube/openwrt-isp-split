@@ -63,6 +63,9 @@ else
 	echo "下载 $FILE"
 	curl -fsSL -o "$WORK/sdk.tar" "$BASE/$FILE"
 	mkdir -p "$WORK/sdk"
+	# 这里是**构建主机**（CI / Linux x86_64，GNU tar）解 SDK 包，--strip-components
+	# 合法也必须用；路由器侧用户装源码包的姿势（busybox tar 不支持该参数）在
+	# release body 与 INSTALL.txt 里，两边各说各的场景，别互相抄。
 	case "$FILE" in
 	*.zst) tar --zstd -xf "$WORK/sdk.tar" -C "$WORK/sdk" --strip-components=1 ;;
 	*)     tar -xf "$WORK/sdk.tar" -C "$WORK/sdk" --strip-components=1 ;;

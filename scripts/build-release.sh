@@ -65,7 +65,13 @@ isp-split $VER-$REL
 
 OpenWrt 25.12 及以上（apk 系，无法手工打包，用脚本安装）：
 
-  sh scripts/install.sh --all
+  在路由器上解包（busybox tar 不支持 --strip-components，源码包自带一层 isp-split-${VER}/，
+  所以是「解包 + 进目录」，别抄 GNU 姿势）：
+
+    mkdir -p /tmp/isp && tar -xzf isp-split-${VER}.tar.gz -C /tmp/isp
+    sh /tmp/isp/isp-split-${VER}/scripts/install.sh --all
+
+  （已经在本目录里就直接跑 sh scripts/install.sh --all。）
 
 OpenWrt 24.10 及以下（opkg 系）：
 

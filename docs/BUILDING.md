@@ -8,7 +8,14 @@
 | OpenWrt ≤ 24.10（opkg） | `.ipk` | `scripts/build-ipk.sh` | 无（任何能跑 sh/tar/gzip 的机器） |
 | 自编译固件 | 镜像 | 见 [FIRMWARE.md](FIRMWARE.md) | buildroot 环境 |
 
-只想安装、不想构建：直接从 [Releases](../../releases) 下载 `isp-split-*.tar.gz`，解包后执行 `sh scripts/install.sh --all`。
+只想安装、不想构建：直接从 [Releases](../../releases) 下载 `isp-split-*.tar.gz`，在路由器上解包后进目录执行安装脚本。
+源码包自带一层 `isp-split-<版本>/`，而 busybox tar 不支持 `--strip-components`，所以是「解包 + 进目录」，不抄 GNU 姿势：
+
+```sh
+wget -O /tmp/isp.tgz <Releases 里 isp-split-*.tar.gz 的地址>
+mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
+sh /tmp/isp/isp-split-<版本>/scripts/install.sh --all
+```
 
 ---
 

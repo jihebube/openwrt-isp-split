@@ -60,8 +60,8 @@ make -j$(nproc) V=s
 ```sh
 BASE=https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
 wget "$BASE/openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst"
-mkdir -p ib && tar --zstd -xf openwrt-imagebuilder-*.tar.zst -C ib --strip-components=1
-cd ib
+mkdir -p ib && tar --zstd -xf openwrt-imagebuilder-*.tar.zst -C ib
+cd ib/openwrt-imagebuilder-*/   # 包内自带一层顶层目录，进目录即可（busybox tar 没有 --strip-components）
 
 # 把本项目的文件铺进 rootfs
 mkdir -p files

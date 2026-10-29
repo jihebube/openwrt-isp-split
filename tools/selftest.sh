@@ -4878,6 +4878,22 @@ else
 	ng "22.7b F-21 release.yml 没挂一致性断言"
 fi
 
+# 22.7c F-21 后缀先例兼容（E2）：vX.Y.Z-<小写字母数字> 是合法发布 tag。
+#   先例 v0.2.1-logo / v0.2.1-happy 早于门禁诞生，旧正则把它们拒死；
+#   放宽时不能顺手放宽到畸形：`-` 后为空、大写乱码都必须继续拒。
+sh "$ROOT/scripts/verify-release-version.sh" "v$_ver-logo" > "$F19/tag-suffix-ok.log" 2>&1
+_f21_suf=$?
+sh "$ROOT/scripts/verify-release-version.sh" "v$_ver-LINECHECK" > "$F19/tag-suffix-bad.log" 2>&1
+_f21_sufbad=$?
+sh "$ROOT/scripts/verify-release-version.sh" "v$_ver-" > "$F19/tag-suffix-empty.log" 2>&1
+_f21_sufempty=$?
+if [ "$_f21_suf" -eq 0 ] && [ "$_f21_sufbad" -eq 1 ] && [ "$_f21_sufempty" -eq 1 ] &&
+   grep -q '::error::' "$F19/tag-suffix-bad.log"; then
+	ok "22.7c F-21 后缀 tag：v$_ver-logo 过(rc=$_f21_suf)，v$_ver-LINECHECK 拒(rc=$_f21_sufbad)，v$_ver- 拒(rc=$_f21_sufempty)"
+else
+	ng "22.7c F-21 后缀 tag 判定异常（logo=$_f21_suf 大写乱码=$_f21_sufbad 空后缀=$_f21_sufempty）"
+fi
+
 # 22.8 F-21 通配符口径：apk 连字符、ipk 下划线+_all.ipk
 _bad_glob=$(grep -rn --include='*.md' --include='*.yml' --include='*.sh' \
 	'isp-split_[*][.]apk' "$ROOT" 2>/dev/null |
@@ -4890,6 +4906,28 @@ if [ "$_bad_glob" -eq 0 ] && [ "$_apk_ok" -ge 1 ] && [ "$_apk_ok2" -ge 1 ] && [ 
 	ok "22.8 F-21 全仓 apk 口径统一 isp-split-*.apk（下划线 glob 归零），ipk 仍为 isp-split_*_all.ipk"
 else
 	ng "22.8 F-21 口径不一致（残留下划线 apk=$_bad_glob，release=$_apk_ok，build-apk=$_apk_ok2，ipk 文档=$_ipk_ok）"
+fi
+
+# 22.8b busybox 安装姿势：路由器侧是「解包 + 进目录」，不许出现 GNU 的 strip 参数。
+#   历史 bug：release body 曾教用户 `tar -xzf ... --strip-components[=]1`，
+#   而 OpenWrt 的 busybox tar 不认识这个参数，照抄当场报错、装不上。
+#   白名单只有 scripts/build-apk.sh（CI / Linux 构建主机的 GNU tar 解 SDK，另一个场景）。
+#   （正则里的 [=] 是为了让这段断言代码本身不被算作命中。）
+_strip_gnu=$(grep -rn -- '--strip-components[=]1' "$ROOT" 2>/dev/null |
+	grep -v '/[.]sdk-build/' | grep -v '/[.]git/' | grep -v '/dist/' |
+	grep -v '/scripts/build-apk.sh:' | wc -l | tr -d ' ')
+_body_tar=$(grep -c 'mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp$' \
+	"$ROOT/.github/workflows/release.yml")
+_body_dir=$(grep -cF "sh /tmp/isp/isp-split-$_ver/scripts/install.sh --all" \
+	"$ROOT/.github/workflows/release.yml")
+_inst_dir=$(grep -cF 'isp-split-${VER}/scripts/install.sh --all' "$ROOT/scripts/build-release.sh")
+# body 标题版本号必须跟 PKG_VERSION 走：下次进位忘了换 body，这里直接红。
+_body_ver=$(grep -c "^[[:space:]]*## v$_ver" "$ROOT/.github/workflows/release.yml")
+if [ "$_strip_gnu" -eq 0 ] && [ "$_body_tar" -ge 1 ] && [ "$_body_dir" -ge 1 ] &&
+   [ "$_inst_dir" -ge 1 ] && [ "$_body_ver" -ge 1 ]; then
+	ok "22.8b 安装姿势 busybox 安全：release body/INSTALL.txt 走「解包+进目录」，body 标题 v$_ver 与 PKG_VERSION 同步"
+else
+	ng "22.8b 安装姿势/GNU strip 参数/body 版本异常（残留=$_strip_gnu body_tar=$_body_tar body_dir=$_body_dir install=$_inst_dir body_ver=$_body_ver）"
 fi
 
 # 22.9 F-22 release.yml 的 APK_BIN 必须与 build-apk.sh 的 WORK 规则同源。

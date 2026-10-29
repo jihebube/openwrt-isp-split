@@ -229,62 +229,46 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: rel/*
-          # 不自动生成 release notes：0.3.0 的对外口径要人工定稿（功能边界、隐私说明、
-          # 升级注意事项都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
+          # 不自动生成 release notes：0.3.1 的对外口径要人工定稿（换装清单、体检彩蛋、
+          # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
-            ## v0.3.0 望闻问切
+            ## v0.3.1-logo 换装更新
 
-            按目标 IP 归属运营商分流的 mwan3-nft 工具，这一版把**线路体检**正式发货：
-            逐条 WAN 判定出口类型（公网 / 锥形 / 对称或多出口 / CGNAT / 未知，五态）、
-            测 DNS / 建连 / TLS / 首字节四段延迟、双 STUN 探 NAT、给出可解释评分与一句话建议，
-            结果缓存 60 秒；LuCI 新增「线路体检」卡片页。全程只读探测，不改 mwan3 / nft 规则。
+            这个版本零逻辑变更，纯换装。分流照旧，改的是你打开仪表盘的心情。
 
-            **隐私口径**：归属地查询默认开启、可关闭（`LINE_CHECK_GEO=0`）。开启时只把每条
-            WAN 的**出口公网 IP** 发给归属地服务（默认百度，失败转 ip-api.com），不发送内网地址、
-            设备名、MAC 或流量内容。介意可关闭归属地，或把 `LINE_CHECK_GEO_PROVIDER` 固定为
-            `baidu`，避免走明文 HTTP 的 ip-api.com。
+            **换了什么**
+            - 三大运营商换上 44px 官方风徽记，卡片头像化：电信蓝牛角 / 联通中国结 / 移动上古互字圆标——扫一眼就知道这月钱是交给谁的
+            - 兜底流量卡带着地球图标升格进网格：所有不属于任何运营商的流浪流量，从此和正经线路平起平坐
+            - 教育网卡退出默认视图（纯 UI 退场，集合与策略原样健在）：教育网那点 IP 地址，确实不够一张卡呼吸的
 
-            ### 本版变化
+            **体检实战彩蛋（真实数据，非摆拍）**
+            本版开发期间生产线路跑了一次体检：联通，丢包 40%，评分 C，评语"建议检查光猫/线路质量"。重拨后原地复活满血。结论：北方联通的 PPPoE 会话是量子态——它坏没坏，取决于你看没看它；而体检功能第一次上线就抓着现行，这 40% 丢包它自己都不好意思。
+            至于移动：全国移动用户的公网地址挤在几条 CGNAT 段里隔墙喊话，我们移动卡上的条目数至今没凑满两百——不是我们不给镜头，是它家公网真的请不起座。
 
-            - 线路体检随包发货：`FEATURE_LINECHECK` 默认 `1`，含 `linecheck` 子命令、
-              后台探测引擎 `lc-run`、LuCI 卡片页与菜单节点，`socat` 进入 `Depends`
-            - 体检结果缓存 60 秒（`LINE_CHECK_MIN_INTERVAL`），Linux 侧脚本与页面共用同一份快照
-            - 归属地可关：只停第三方归属地查询，出口 IP 回显 / STUN / 延迟探测照常
-            - 其余不变：运营商网段每日更新、双源校验、与代理共存
-            - 小闪存 / 特殊渠道仍可自建剥离版：`FEATURE_LINECHECK=0 sh scripts/build-ipk.sh`
-
-            ## 安装
+            ### 安装
 
             **OpenWrt 25.12+（apk 系，含 Kwrt 25.12）** —— 下载源码包用脚本安装：
 
             ```sh
             wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
-            mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp --strip-components=1
-            sh /tmp/isp/scripts/install.sh --all
+            mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
+            sh /tmp/isp/isp-split-0.3.1/scripts/install.sh --all
             ```
 
-            若本页附带了 `.apk`（由 CI 用 SDK 编译），也可以直接装：
+            （注意：busybox tar 不支持 --strip-components，所以进目录跑，别抄 GNU 姿势。）
+
+            若本页附带 `.apk`（CI 用 SDK 编译）：
 
             ```sh
-            apk add --no-network --allow-untrusted ./isp-split-*.apk
+            apk add --no-network --allow-untrusted ./isp-split-*.apk ./luci-app-isp-split-*.apk
             ```
 
             **OpenWrt 24.10 及以下（opkg 系）**：
 
             ```sh
-            opkg install isp-split_*_all.ipk
+            opkg install isp-split_*_all.ipk luci-app-isp-split_*_all.ipk
             ```
 
-            装完先只读预演，确认无误再生效：
-
-            ```sh
-            isp-split plan && isp-split check && isp-split sync && isp-split verify
-            ```
-
-            体检单独跑：
-
-            ```sh
-            isp-split linecheck            # 文本报告
-            isp-split linecheck --json     # 给脚本 / 页面用
-            ```
+            opkg 用户务必重下本页 ipk——0.2.3 起容器格式已对齐官方 gzip-tar，旧版自产 ipk 装不上。
+            LuCI 更新后浏览器强刷一次（Ctrl+F5），旧 JS 缓存会让你以为换装失败。
