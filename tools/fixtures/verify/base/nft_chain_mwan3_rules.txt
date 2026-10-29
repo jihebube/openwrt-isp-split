@@ -1,0 +1,5 @@
+		ip daddr @isp_tel meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_wanb
+		ip daddr @isp_uni meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wanb_only
+		meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto != tcp meta l4proto != udp counter name "isp_fallback"
+		meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new meta l4proto { tcp, udp } th dport != 53 th sport != 53 counter name "isp_fallback"
+		ip daddr 0.0.0.0/0 meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_balanced

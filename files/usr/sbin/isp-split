@@ -1946,21 +1946,9 @@ _prune_orphan_ipsets() {
 	return 0
 }
 
-# 卸载：按 isp_split=1 标记删除所有本工具的 ipset 段。
-# 不能按"当前 ISP_TABLE 的名字"删：改名/删除的旧段会漏掉，永远清不掉。
-# 无标记的段一律不碰。
-_uninstall_ipsets() {
-	_ui_n=0
-	for _ui_sec in $(uci -q show mwan3 2>/dev/null |
-		sed -n 's/^mwan3\.\([^=]*\)=ipset$/\1/p'); do
-		[ "$(uci -q get "mwan3.$_ui_sec.isp_split" 2>/dev/null)" = "1" ] || continue
-		uci -q delete "mwan3.$_ui_sec" 2>/dev/null && _ui_n=$((_ui_n + 1))
-	done
-	uci -q commit mwan3 2>/dev/null
-	[ "$_ui_n" -gt 0 ] &&
-		log "已删除 $_ui_n 个带 isp_split 标记的 ipset 段（含改名/删除的孤儿段）"
-	return 0
-}
+# F-14：卸载时的 ipset 段清理已并入 usr/lib/isp-split/teardown.sh
+# （cmd_uninstall 调它）。这里不再保留第二份按标记删段的实现——两份实现
+# 就是 F-14 的成因：脚本路径与包 postrm 各自维护一份清单，最后谁都没删全。
 
 # ---- 策略/成员（BUG-25）----
 #
@@ -2331,39 +2319,7 @@ _prune_orphan_policies() {
 	return 0
 }
 
-# 卸载：按 isp_split=1 标记删除 init 生成的 policy/member。
-_uninstall_policies() {
-	_up_np=0
-	_up_nm=0
-	for _up_sec in $(uci -q show mwan3 2>/dev/null |
-		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
-		[ "$(uci -q get "mwan3.$_up_sec.isp_split" 2>/dev/null)" = "1" ] || continue
-		uci -q delete "mwan3.$_up_sec" 2>/dev/null && _up_np=$((_up_np + 1))
-	done
-	# 仍被任何策略引用的成员不能删（删了 mwan3 会渲染失败）
-	_up_refs=" "
-	for _up_psec in $(uci -q show mwan3 2>/dev/null |
-		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
-		for _up_x in $(uci -q get "mwan3.$_up_psec.use_member" 2>/dev/null); do
-			_up_refs="$_up_refs$_up_x "
-		done
-	done
-	for _up_sec in $(uci -q show mwan3 2>/dev/null |
-		sed -n 's/^mwan3\.\([^=]*\)=member$/\1/p'); do
-		[ "$(uci -q get "mwan3.$_up_sec.isp_split" 2>/dev/null)" = "1" ] || continue
-		case "$_up_refs" in
-		*" $_up_sec "*)
-			log "警告：成员段 $_up_sec 仍被其它策略引用，保留"
-			continue
-			;;
-		esac
-		uci -q delete "mwan3.$_up_sec" 2>/dev/null && _up_nm=$((_up_nm + 1))
-	done
-	uci -q commit mwan3 2>/dev/null
-	[ "$_up_np" -gt 0 ] || [ "$_up_nm" -gt 0 ] &&
-		log "已删除 $_up_np 个带 isp_split 标记的策略段、$_up_nm 个成员段"
-	return 0
-}
+# F-14：卸载时的 policy/member 清理同样在 teardown.sh，见上。
 
 # init：发现接口 -> 为 ISP_TABLE 的每个策略绑定成员 -> 跑一次 plan 摘要
 cmd_init() {
@@ -3661,31 +3617,23 @@ _dns_confdir_set() {
 	uci -q commit dhcp
 }
 
-_restore_dns_confdir() {
-	_state=$DNS_STATE/dnsmasq.confdir.orig
-
-	# 无论有没有状态文件，都按探测结果把所有可能被 dnsmasq 加载的目录
-	# 清一遍。探测路径（OpenClash）下 cmd_dns 不再写状态文件，不能因为
-	# 状态文件不存在就跳过清理。
-	_dns_confdir_detect >/dev/null 2>&1
-	for _d in $(_dns_confdir_candidates); do
-		rm -f "$_d/isp-split.conf" 2>/dev/null || true
-	done
-
-	# 只有真的改过 UCI 才有状态文件；没改过就不碰 UCI。
-	[ -f "$_state" ] || return 0
-	_orig=$(cat "$_state" 2>/dev/null || true)
-	_cur=$(_dns_confdir_get)
-	if [ -n "$_orig" ]; then
-		if [ "$_cur" != "$_orig" ]; then
-			_dns_confdir_set "$_orig" && log "已恢复 dnsmasq confdir=$_orig"
-		fi
+# B-5：升级兼容。旧状态文件名 dnsmasq.confdir.orig 里存的是"我们写进 UCI 的
+# 清理值"，名字却在说"原值"（PROPOSAL-0.2.2 §B-5）。新名 dnsmasq.confdir.migrated；
+# 旧名存在而新名不存在时读一次、迁到新名，之后只认新名。
+# 注意：confdir 的恢复与片段清理不在这里——它们在 teardown.sh（卸载清理的
+# 唯一实现），由 isp-split uninstall / install.sh --uninstall / 包 postrm 共用，
+# 本文件不再保留第二份实现（F-14）。
+_dns_state_adopt() {
+	_new=$DNS_STATE/dnsmasq.confdir.migrated
+	_old=$DNS_STATE/dnsmasq.confdir.orig
+	[ -f "$_new" ] && return 0
+	[ -f "$_old" ] || return 0
+	if mv -f "$_old" "$_new" 2>/dev/null; then
+		log "已把旧状态文件 dnsmasq.confdir.orig 迁移为 dnsmasq.confdir.migrated（B-5）"
 	else
-		if [ -n "$_cur" ]; then
-			_dns_confdir_set "" && log "已恢复 dnsmasq confdir（默认 $DNSMASQ_DEFAULT_DIR）"
-		fi
+		cp -f "$_old" "$_new" 2>/dev/null && rm -f "$_old"
 	fi
-	rm -f "$_state"
+	return 0
 }
 
 # 策略 -> 出接口设备名（策略取第一个成员）
@@ -4157,10 +4105,14 @@ cmd_dns() {
 	mkdir -p "$DNS_STATE" "$DOMAINDIR"
 
 	# 先探测 dnsmasq 真正加载的目录。runtime/ps 是权威源；只有落到 UCI
-	# 时才沿用"首次记录原值、迁移旧版 $DNSDIR"的现状逻辑。
+	# 时才沿用"迁移旧版 $DNSDIR"的现状逻辑。
 	_dns_confdir_detect >/dev/null
 	_cur=$(_dns_confdir_get)
-	_state=$DNS_STATE/dnsmasq.confdir.orig
+	# B-5：状态文件改名 dnsmasq.confdir.migrated。它记的不是"原值"，而是
+	# "我们写进 UCI 的清理值"（旧版 $DNSDIR 已随卸载消失，恢复原值反而错）。
+	# 旧名 dnsmasq.confdir.orig 只在升级兼容时读一次，见 _dns_state_adopt。
+	_state=$DNS_STATE/dnsmasq.confdir.migrated
+	_dns_state_adopt
 	_uci_note="未改写 UCI confdir"
 	case "$DNS_CONFDIR_SOURCE" in
 	uci)
@@ -5242,6 +5194,14 @@ cmd_install() {
 }
 
 cmd_uninstall() {
+	# F-14：卸载清理只有一份实现——usr/lib/isp-split/teardown.sh。
+	# 这里只做"必须由本脚本完成"的部分：mwan3 规则块要用 rules-splice.awk
+	# 原地摘除（teardown 不带 awk 依赖），其余（策略/成员/计数器/confdir/
+	# cron/文件/LuCI）全部交给它，与 install.sh --uninstall、包 postrm 同源。
+	if [ ! -f "$LIB/teardown.sh" ]; then
+		die "缺少 $LIB/teardown.sh，无法完整卸载（版本不匹配？改用同版本的 scripts/install.sh --uninstall）"
+	fi
+
 	_cron_rewrite "" 2>/dev/null || true
 	/etc/init.d/isp-split disable >/dev/null 2>&1 || true
 	/etc/init.d/isp-split stop >/dev/null 2>&1 || true
@@ -5256,16 +5216,15 @@ cmd_uninstall() {
 			_mwan3_atomic_install "$WORK/mwan3.new"
 	fi
 
-	# 按标记删，而不是按当前表名：改名/删除的孤儿段也要清掉（B-4）。
-	_uninstall_ipsets
-	# init 生成的 policy/member 同样按 isp_split 标记删；无标记段不碰。
-	_uninstall_policies
-	/etc/init.d/mwan3 reload >/dev/null 2>&1
-
-	# 恢复 dnsmasq confdir 原值（状态文件在 $BASE 里，必须先恢复再删目录）
-	_restore_dns_confdir
-
-	rm -rf "$BASE"
+	# mwan3 段（按 isp_split 标记，含改名/删除的孤儿段）+ runtime 残留 + 文件。
+	# 顺序不能反：状态文件在 $BASE 里，先恢复 confdir 再删目录。
+	ISP_SPLIT_BASE=$BASE ISP_SPLIT_CONF=$CONF ISP_SPLIT_CRONTAB=$CRONTAB \
+		ISP_SPLIT_LIB=$LIB MWAN3_SERVICE=$MWAN3_SERVICE \
+		DNSDIR=$DNSDIR DNSMASQ_DEFAULT_DIR=$DNSMASQ_DEFAULT_DIR \
+		DNSMASQ_CONF_GLOB=$DNSMASQ_CONF_GLOB \
+		sh "$LIB/teardown.sh" all || {
+		die "teardown.sh 执行失败，卸载不完整（见上方输出）"
+	}
 	log "已卸载（nft 集合随 mwan3 reload 一并消失）"
 }
 

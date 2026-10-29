@@ -1,0 +1,2 @@
+		meta mark & 0x00003f00 == 0x00000000 meta mark set meta mark & 0xffffc6ff | 0x00000700
+		meta mark & 0x00003f00 == 0x00000000 meta mark set meta mark & 0xfffffeff | 0x00003e00

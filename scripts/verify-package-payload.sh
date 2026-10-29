@@ -173,6 +173,12 @@ assert_clean() { # <pkg> <payload-dir>
 		printf '%s\n' "$_cssleak" | sed 's/^/  /' >&2
 		return 1
 	fi
+	# F-14：卸载清理的唯一实现必须进包（0 版也要能完整卸载；
+	# 它里面唯一与体检相关的行已被 lc 标记剥离）
+	if [ ! -f "$_payload/usr/lib/isp-split/teardown.sh" ]; then
+		echo "::error::$_pkg：缺少 /usr/lib/isp-split/teardown.sh（卸载清理无实现可用）" >&2
+		return 1
+	fi
 	return 0
 }
 
@@ -261,6 +267,14 @@ assert_feature1() { # <pkg> <payload-dir>
 			_bad=1
 		elif ! sh -n "$_payload/usr/lib/isp-split/lc-run" 2>/dev/null; then
 			echo "::error::$_pkg：usr/lib/isp-split/lc-run 语法错误" >&2
+			_bad=1
+		fi
+		# 3b) F-14：卸载清理的唯一实现（isp-split uninstall 靠它）
+		if [ ! -f "$_payload/usr/lib/isp-split/teardown.sh" ]; then
+			echo "::error::$_pkg：缺少 /usr/lib/isp-split/teardown.sh（卸载清理无实现可用）" >&2
+			_bad=1
+		elif ! sh -n "$_payload/usr/lib/isp-split/teardown.sh" 2>/dev/null; then
+			echo "::error::$_pkg：usr/lib/isp-split/teardown.sh 语法错误" >&2
 			_bad=1
 		fi
 		# 4) conf 必须有 LINE_CHECK_* 键（四项核心键，缺一项就说明标记区没进包）

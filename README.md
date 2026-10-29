@@ -64,7 +64,7 @@ isp-split status    # 各集合命中计数与流量
 
 安装后每日 04:17 自动更新数据（可用 `ISP_CRON` 修改）；以上命令纯命令行即可完成全部操作，LuCI 仅是可选便利。
 
-卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`，会还原 mwan3/dnsmasq 相关改动（配置与数据文件默认保留，可手动删除）。
+卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`。三条卸载路径（脚本 / 包 postrm / install.sh）走同一份清理实现 `usr/lib/isp-split/teardown.sh`：还原 mwan3 与 dnsmasq 改动、删 `isp_fallback` 计数器、删 crontab 行、删 `/etc/isp-split*` 与 LuCI 页面，卸载后不留残留。`/etc/isp-split.conf.bak.*` 历史备份默认一并删除（删除前逐条打印路径；想留档先 `cp` 走，或加 `--keep-conf-bak`：`sh scripts/install.sh --uninstall --keep-conf-bak`）。
 
 ## 界面
 

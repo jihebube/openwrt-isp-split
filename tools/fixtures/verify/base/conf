@@ -1,0 +1,6 @@
+# verify-domains.sh 夹具：ISP_TABLE 与真机同格式（第 4 列 0/1 = 启用）
+ISP_TABLE="
+telecom:isp_tel:wan_wanb:1
+unicom:isp_uni:wanb_only:1
+cmcc:isp_cmcc:wanb_only:0
+"

@@ -29,6 +29,7 @@ sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$V/" feed/op-packages/isp-split/Makefile
 # 逐字节校验：feed 里的运行时代码必须与主源码完全相同（版本号在 Makefile 里单独对齐）。
 _bad=0
 for f in usr/sbin/isp-split etc/isp-split.conf etc/init.d/isp-split \
+         usr/lib/isp-split/teardown.sh \
          usr/lib/isp-split/lc-run usr/lib/isp-split/build.sh \
          usr/lib/isp-split/cidr2range.awk usr/lib/isp-split/merge.awk \
          usr/lib/isp-split/exclude.awk usr/lib/isp-split/range2cidr.awk \

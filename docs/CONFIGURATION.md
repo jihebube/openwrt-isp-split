@@ -92,6 +92,22 @@ config member 'isp_split_wan_only_m1'
 
 `isp-split status` 会检测后一种情况并给出提示。
 
+### 端到端验证（tools/verify-domains.sh）
+
+`sh tools/verify-domains.sh [域名|IP ...]` 逐条核对「集合 → 策略 → conntrack mark」。
+它的判定按上面这套语义来（F-24/F-25 重写）：
+
+- **多成员策略**（`numgen random mod N vmap`）的期望 mark 是**所有成员 mark 的集合**，
+  命中其中任意一个都算对——按权重落点本来就不固定；
+- **未命中任何启用集合**的流量，期望 mark 由**兜底规则的策略**决定
+  （`default_rule_v4` 启用时是默认策略的 mark）。只有没有兜底规则时，才要求 mark=0；
+- 策略 `last_resort`（成员全部下线时回落 default/unreachable/blackhole）单独报
+  「策略无可用成员」，不当成 mark 不符——那是线路问题，不是分流映射错；
+- 还会校验顺序：本工具的 `@isp_*` 规则必须排在第一条 catch-all 之前。
+
+`tools/fixtures/verify/base/` 是它的夹具（固定 nft 链/集合/conntrack 文本），
+`tools/selftest.sh` 第 23 节用它跑正/反七种场景，离线可复现。
+
 ---
 
 ## 多线路 DNS
@@ -137,10 +153,14 @@ DNS_MODE="bind"
    （无运行配置）时才沿用原来的 confdir 处理与状态记录逻辑。
 
 2. 在 `inet mwan3 mwan3_output` 链顶部插入 DNS 出线规则（随 mwan3 重启丢失，`/etc/init.d/isp-split` 会在启动时自动重放）
-3. 重启 dnsmasq；卸载时按同一套探测结果清理所有可能目录里的
-   `isp-split.conf`。只有确实改过 UCI 时才有
-   `dnsmasq.confdir.orig` 状态文件，没改过就不动 UCI（旧版本写入的
-   `/etc/isp-split/dnsmasq.d` 仍会被自动摘除）
+3. 重启 dnsmasq；卸载时清理所有可能目录里的 `isp-split.conf`（探测目录 +
+   默认目录 + 旧版目录的并集，实现在 `usr/lib/isp-split/teardown.sh`）。
+   只有确实改过 UCI 时才有状态文件
+   `/etc/isp-split/state/dnsmasq.confdir.migrated`，没改过就不动 UCI（旧版本
+   写入的 `/etc/isp-split/dnsmasq.d` 仍会被自动摘除）。该文件记的是**迁移后
+   写进 UCI 的清理值**，不是"原值"：旧版目录已随卸载消失，恢复原值反而错。
+   B-5 之前它叫 `dnsmasq.confdir.orig`（名实不符），升级上来的设备由
+   `_dns_state_adopt` / teardown.sh 读一次并改名迁移
 
 ### DNS_MODE：bind 与 mark
 

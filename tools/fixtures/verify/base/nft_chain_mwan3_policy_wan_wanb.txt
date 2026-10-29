@@ -1,0 +1,2 @@
+		meta mark & 0x00003f00 == 0x00000000 numgen random mod 5 vmap { 0-2 : jump mwan3_or_meta_0x500, 3-4 : jump mwan3_or_meta_0x600 }
+		meta mark & 0x00003f00 == 0x00000000 meta mark set meta mark & 0xfffffeff | 0x00003e00

@@ -510,12 +510,15 @@ else
 fi
 
 # 卸载：探测路径下没有状态文件，也必须按探测结果删片段，且不碰 UCI。
+# F-14 起这段逻辑在 teardown.sh（卸载清理的唯一实现）里，这里直接调它，
+# 顺带保证"install 路径"也覆盖同一份实现。
 for _d in cfg01411c.d other.d default.d legacy.d; do
 	: > "$TMP/bug6/run/$_d/isp-split.conf"
 done
 rm -f "$TMP/bug6/uci.log"
 (
 	PATH="$TMP/bug6/fakebin:$TMP/fakebin:$PATH"
+	ISP_SPLIT_DESTDIR="$TMP/bug6/dest"
 	ISP_SPLIT_CONF="$TMP/bug6/conf"
 	ISP_SPLIT_BASE="$TMP/bug6/base"
 	DNSMASQ_CONF_GLOB="$TMP/bug6/var/etc/dnsmasq.conf.*"
@@ -523,10 +526,10 @@ rm -f "$TMP/bug6/uci.log"
 	DNSDIR="$TMP/bug6/run/legacy.d"
 	FAKE_UCI_CONFDIR=""
 	FAKE_UCI_LOG="$TMP/bug6/uci.log"
-	export PATH ISP_SPLIT_CONF ISP_SPLIT_BASE DNSMASQ_CONF_GLOB \
-		DNSMASQ_DEFAULT_DIR DNSDIR FAKE_UCI_CONFDIR FAKE_UCI_LOG
-	. "$TMP/isp-lib.sh"
-	_restore_dns_confdir
+	export PATH ISP_SPLIT_DESTDIR ISP_SPLIT_CONF ISP_SPLIT_BASE \
+		DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR DNSDIR FAKE_UCI_CONFDIR \
+		FAKE_UCI_LOG
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" runtime
 )
 _bug6_left=""
 for _d in cfg01411c.d other.d default.d legacy.d; do
@@ -2282,7 +2285,18 @@ else
 	sed 's/^/    /' "$B4/prune.log"
 fi
 
-b4_run "$B4/s1" _uninstall_ipsets > "$B4/uninstall.log" 2>&1
+# F-14：ipset 段清理已并入 teardown.sh（唯一实现），这里直接调它，
+# 与 `isp-split uninstall`、`install.sh --uninstall` 走同一条路径。
+b4_teardown() { # <state dir> <scope>
+	(
+		PATH="$B4/bin:$PATH"
+		FAKE_UCI_STATE="$1"
+		ISP_SPLIT_DESTDIR="$B4/dest"
+		export PATH FAKE_UCI_STATE ISP_SPLIT_DESTDIR
+		sh "$ROOT/files/usr/lib/isp-split/teardown.sh" "$2"
+	)
+}
+b4_teardown "$B4/s1" mwan3 > "$B4/uninstall.log" 2>&1
 _b4_left=$(grep '=ipset$' "$B4/s1/show" | sed 's/^mwan3\.//; s/=ipset$//' | tr '\n' ' ')
 if [ "$_b4_left" = "ipset_isp_legacy mywg " ]; then
 	ok "B-4 uninstall 按 isp_split 标记全删，无标记段保持不动"
@@ -3051,7 +3065,14 @@ fi
 
 # ---- 17.9 uninstall 按标记删 policy/member，无标记段不动 ----
 b25_policy "$B25/s4" keep_pol keep_m1 wan2
-b25_lib "$B25/s4" "$B25/conf" _uninstall_policies > "$B25/uninstall-pol.log" 2>&1
+# F-14：policy/member 清理已并入 teardown.sh（唯一实现）
+(
+	PATH="$B25/bin:$PATH"
+	FAKE_UCI_STATE="$B25/s4"
+	ISP_SPLIT_DESTDIR="$B25/dest"
+	export PATH FAKE_UCI_STATE ISP_SPLIT_DESTDIR
+	sh "$ROOT/files/usr/lib/isp-split/teardown.sh" mwan3
+) > "$B25/uninstall-pol.log" 2>&1
 _b25_left=$(grep '=policy$' "$B25/s4/show" | sed 's/^mwan3\.//; s/=policy$//' | tr '\n' ' ')
 if [ "$_b25_left" = "user_pol keep_pol " ] &&
    ! grep -q '^mwan3.isp_split_' "$B25/s4/show" &&
@@ -3675,9 +3696,20 @@ if command -v tar >/dev/null 2>&1; then
 		"$ROOT"/dist/sdk-*/luci-app-isp-split-"${ISPVER}"-*.apk; do
 		[ -f "$_a" ] && set -- "$@" "$_a"
 	done
-	if [ "$#" -gt 0 ]; then
-		if sh "$ROOT/scripts/verify-package-payload.sh" verify --feature=1 "$@" \
-			>"$F31/apk.log" 2>&1; then
+	# apk 容器只能用 apk-tools 3 解包。没装就显式 skip，而不是把
+	# "本机没有解包器"记成失败；SDK 构建机（CI 与本机跑过 build-apk.sh 的）
+	# 会自动用上 staging_dir/host/bin/apk。
+	_apkbin=${APK_BIN:-}
+	if [ -z "$_apkbin" ]; then
+		for _c in "$ROOT"/.sdk-build/*/sdk/staging_dir/host/bin/apk; do
+			[ -x "$_c" ] && { _apkbin=$_c; break; }
+		done
+	fi
+	if [ "$#" -gt 0 ] && [ -z "$_apkbin" ]; then
+		skip "19.13 apk 断言（本机无 apk-tools 3 解包器；设 APK_BIN 或先跑 scripts/build-apk.sh）"
+	elif [ "$#" -gt 0 ]; then
+		if APK_BIN="$_apkbin" sh "$ROOT/scripts/verify-package-payload.sh" verify \
+			--feature=1 "$@" >"$F31/apk.log" 2>&1; then
 			ok "19.13 apk×$#（SDK 产物，${ISPVER}）：ADB 容器解包 + feature=1 期望面全中"
 		else
 			ng "19.13 apk 未通过 feature=1 断言"
@@ -4413,6 +4445,557 @@ else
 	ng "20.6 TMPDIR 不可用时 plan 仍崩在半截（rc=$_b6_rc）（B-6）: $(tail -3 "$F32/b6.log" | tr '\n' ' ')"
 fi
 
+
+echo "== 21. 卸载三分叉收口（F-14）与 confdir 状态文件名（B-5）"
+F14=$TMP/f14
+mkdir -p "$F14/bin"
+
+# 有状态的 nft stub：只关心 isp_fallback 计数器的"在/不在"。
+cat > "$F14/bin/nft" <<'FAKE_NFT_F14'
+#!/bin/sh
+S=${FAKE_NFT_STATE:?}
+echo "nft $*" >> "$S/nft.log"
+case "$1" in
+list)
+	case "$*" in
+	*"counter inet mwan3 isp_fallback")
+		[ -f "$S/counter" ] && { echo "counter isp_fallback { packets 1 bytes 2 }"; exit 0; }
+		exit 1
+		;;
+	*"table inet mwan3") exit 0 ;;
+	esac
+	exit 1
+	;;
+delete)
+	case "$*" in
+	*"counter inet mwan3 isp_fallback") rm -f "$S/counter"; exit 0 ;;
+	esac
+	exit 1
+	;;
+esac
+exit 1
+FAKE_NFT_F14
+chmod +x "$F14/bin/nft"
+
+# uci stub：confdir 的读/写/删/commit 都要能看见。
+cat > "$F14/bin/uci" <<'FAKE_UCI_F14'
+#!/bin/sh
+S=${FAKE_UCI_STATE:?}
+[ "$1" = "-q" ] && shift
+cmd=$1
+shift
+echo "uci $cmd $*" >> "$S/uci.log"
+case "$cmd" in
+get)
+	case "$1" in
+	"dhcp.@dnsmasq[0].confdir")
+		[ -f "$S/confdir" ] && cat "$S/confdir" || exit 1
+		;;
+	*) exit 1 ;;
+	esac
+	;;
+set)
+	printf '%s\n' "${1#*=}" > "$S/confdir"
+	;;
+delete)
+	case "$1" in
+	"dhcp.@dnsmasq[0].confdir") rm -f "$S/confdir" ;;
+	*) exit 1 ;;
+	esac
+	;;
+commit) : ;;
+show) exit 1 ;;
+*) exit 1 ;;
+esac
+exit 0
+FAKE_UCI_F14
+chmod +x "$F14/bin/uci"
+
+# 沙箱里造出"装完之后"的全部残留：文件 + 目录 + cron 行 + 计数器
+# + confdir 状态 + dnsmasq 片段（运行配置目录 / 默认目录 / 旧版目录）。
+f14_seed() { # <root> <state>
+	rm -rf "$1" "$2"
+	mkdir -p "$2"
+	_r=$1
+	mkdir -p "$_r/usr/sbin" "$_r/etc/init.d" "$_r/usr/lib/isp-split" \
+		"$_r/etc/isp-split/state" "$_r/etc/isp-split/data" "$_r/etc/uci-defaults" \
+		"$_r/www/luci-static/resources/view/isp-split" \
+		"$_r/www/luci-static/resources/isp-split/logos" \
+		"$_r/usr/share/luci/menu.d" "$_r/usr/share/rpcd/acl.d" "$_r/etc/crontabs" \
+		"$_r/etc/isp-split/dnsmasq.d" "$_r/run/cfg.d" "$_r/run/default.d" \
+		"$_r/run/legacy.d"
+	: > "$_r/usr/sbin/isp-split"
+	: > "$_r/etc/init.d/isp-split"
+	: > "$_r/usr/lib/isp-split/build.sh"
+	: > "$_r/usr/lib/isp-split/rules-splice.awk"
+	: > "$_r/etc/isp-split.conf"
+	: > "$_r/etc/isp-split.conf.bak.20260101-000000"
+	: > "$_r/etc/uci-defaults/99-isp-split"
+	: > "$_r/www/luci-static/resources/view/isp-split/overview.js"
+	: > "$_r/www/luci-static/resources/isp-split/isp-split.css"
+	: > "$_r/usr/share/luci/menu.d/luci-app-isp-split.json"
+	: > "$_r/usr/share/rpcd/acl.d/luci-app-isp-split.json"
+	echo '17 4 * * * /usr/sbin/isp-split refresh >/dev/null 2>&1 # isp-split' \
+		> "$_r/etc/crontabs/root"
+	# B-5 新名状态文件：记的是"迁移进 UCI 的清理值"
+	printf '%s\n' "$_r/run/keep.d" > "$_r/etc/isp-split/state/dnsmasq.confdir.migrated"
+	# 运行中 dnsmasq 的 conf-dir= 指向 cfg.d（OpenClash 场景）
+	printf 'conf-dir=%s\n' "$_r/run/cfg.d/" > "$_r/run/dnsmasq.conf.cfg01411c"
+	: > "$_r/etc/isp-split/dnsmasq.d/isp-split.conf"
+	: > "$_r/run/cfg.d/isp-split.conf"
+	: > "$_r/run/default.d/isp-split.conf"
+	: > "$_r/run/legacy.d/isp-split.conf"
+	: > "$2/counter"
+	: > "$2/nft.log"
+	: > "$2/uci.log"
+	printf '%s\n' "$_r/run/current.d" > "$2/confdir"
+}
+
+f14_run() { # <root> <state> <teardown 参数...>
+	_r=$1
+	_s=$2
+	shift 2
+	(
+		PATH="$F14/bin:$PATH"
+		FAKE_NFT_STATE="$_s"
+		FAKE_UCI_STATE="$_s"
+		ISP_SPLIT_DESTDIR="$_r"
+		ISP_SPLIT_CONF="$_r/etc/isp-split.conf"
+		ISP_SPLIT_CRONTAB="$_r/etc/crontabs/root"
+		DNSDIR="$_r/run/legacy.d"
+		DNSMASQ_DEFAULT_DIR="$_r/run/default.d"
+		DNSMASQ_CONF_GLOB="$_r/run/dnsmasq.conf.*"
+		export PATH FAKE_NFT_STATE FAKE_UCI_STATE ISP_SPLIT_DESTDIR \
+			ISP_SPLIT_CONF ISP_SPLIT_CRONTAB DNSDIR DNSMASQ_DEFAULT_DIR \
+			DNSMASQ_CONF_GLOB
+		sh "$ROOT/files/usr/lib/isp-split/teardown.sh" "$@"
+	)
+}
+
+_f14_list=$(sh "$ROOT/files/usr/lib/isp-split/teardown.sh" --list 2>/dev/null)
+_teardown_missing=""
+for _p in usr/sbin/isp-split etc/init.d/isp-split usr/lib/isp-split \
+	etc/isp-split.conf etc/isp-split etc/uci-defaults/99-isp-split \
+	www/luci-static/resources/view/isp-split; do
+	case "$_f14_list" in
+	*"$_p"*) ;;
+	*) _teardown_missing="$_teardown_missing $_p" ;;
+	esac
+done
+case "$_f14_list" in
+*"nft delete counter inet mwan3 isp_fallback"*) ;;
+*) _teardown_missing="$_teardown_missing 计数器锚点" ;;
+esac
+case "$_f14_list" in
+*dnsmasq.confdir.migrated*) ;;
+*) _teardown_missing="$_teardown_missing 状态文件名" ;;
+esac
+if [ -z "$_teardown_missing" ]; then
+	ok "21.1 teardown.sh 清单覆盖审计点名的 6 类残留（脚本/init/库/配置/数据/计数器）"
+else
+	ng "21.1 teardown.sh 清单缺项:$_teardown_missing"
+fi
+
+# 21.2 沙箱全量演练：清单里每一项都必须消失
+f14_seed "$F14/r1" "$F14/s1"
+f14_run "$F14/r1" "$F14/s1" all > "$F14/r1.log" 2>&1
+_f14_rc=$?
+_r=$F14/r1
+_left=""
+for _p in usr/sbin/isp-split etc/init.d/isp-split usr/lib/isp-split \
+	etc/isp-split.conf etc/isp-split etc/uci-defaults/99-isp-split \
+	www/luci-static/resources/view/isp-split www/luci-static/resources/isp-split \
+	usr/share/luci/menu.d/luci-app-isp-split.json \
+	usr/share/rpcd/acl.d/luci-app-isp-split.json; do
+	[ -e "$_r/$_p" ] && _left="$_left $_p"
+done
+ls "$_r"/etc/isp-split.conf.bak.* >/dev/null 2>&1 && _left="$_left .conf.bak.*"
+[ -f "$F14/s1/counter" ] && _left="$_left 计数器"
+grep -q 'isp-split' "$_r/etc/crontabs/root" 2>/dev/null && _left="$_left cron行"
+for _d in etc/isp-split/dnsmasq.d run/cfg.d run/default.d run/legacy.d; do
+	[ -e "$_r/$_d/isp-split.conf" ] && _left="$_left 片段($_d)"
+done
+[ -e "$_r/etc/isp-split/state/dnsmasq.confdir.migrated" ] && _left="$_left 状态文件"
+if [ "$_f14_rc" -eq 0 ] && [ -z "$_left" ]; then
+	ok "21.2 沙箱 install 残留 → teardown.sh all：清单为空（rc=0）"
+else
+	ng "21.2 teardown.sh all 后仍有残留（rc=$_f14_rc）:$_left"
+	sed 's/^/    /' "$F14/r1.log"
+fi
+if grep -q 'delete counter inet mwan3 isp_fallback' "$F14/s1/nft.log" 2>/dev/null; then
+	ok "21.2b 计数器删除逻辑在 install 路径（teardown.sh）里也有（F-14 关键缺口）"
+else
+	ng "21.2b teardown.sh 没删 isp_fallback 计数器: $(tr '\n' ';' < "$F14/s1/nft.log" 2>/dev/null)"
+fi
+if grep -q "set dhcp.@dnsmasq\[0\].confdir=$_r/run/keep.d" "$F14/s1/uci.log" 2>/dev/null; then
+	ok "21.2c dnsmasq confdir 按状态文件恢复（写回记录值，不是拍脑袋删）"
+else
+	ng "21.2c confdir 未恢复: $(tr '\n' ';' < "$F14/s1/uci.log" 2>/dev/null)"
+fi
+
+# 21.3 幂等：再跑一次不报错
+f14_run "$F14/r1" "$F14/s1" all > "$F14/r1b.log" 2>&1
+_f14_rc2=$?
+if [ "$_f14_rc2" -eq 0 ] && grep -q '没有需要删除的文件' "$F14/r1b.log"; then
+	ok "21.3 teardown.sh 重复执行幂等（rc=0，无动作）"
+else
+	ng "21.3 重复执行不幂等（rc=$_f14_rc2）: $(tail -3 "$F14/r1b.log" | tr '\n' ' ')"
+fi
+
+# 21.4 --keep-conf-bak：备份留档，其余照删
+f14_seed "$F14/r2" "$F14/s2"
+f14_run "$F14/r2" "$F14/s2" files --keep-conf-bak > "$F14/r2.log" 2>&1
+_f14_rc3=$?
+if [ "$_f14_rc3" -eq 0 ] &&
+   ls "$F14/r2"/etc/isp-split.conf.bak.* >/dev/null 2>&1 &&
+   [ ! -e "$F14/r2/usr/sbin/isp-split" ] &&
+   grep -q '保留历史配置备份' "$F14/r2.log"; then
+	ok "21.4 --keep-conf-bak 只保留 .conf.bak.*，其余照删（策略可选且可见）"
+else
+	ng "21.4 --keep-conf-bak 行为异常（rc=$_f14_rc3）: $(tail -3 "$F14/r2.log" | tr '\n' ' ')"
+fi
+
+# 21.5 三分叉同源：isp-split / install.sh 都调 teardown.sh
+if grep -q 'sh "$LIB/teardown.sh" all' "$ROOT/files/usr/sbin/isp-split" &&
+   grep -q '"$TEARDOWN" all' "$ROOT/scripts/install.sh" &&
+   grep -q 'teardown.sh' "$ROOT/scripts/install.sh"; then
+	ok "21.5 isp-split uninstall 与 scripts/install.sh --uninstall 都调同一份 teardown.sh"
+else
+	ng "21.5 卸载路径没有收敛到 teardown.sh（又分叉了）"
+fi
+# install.sh 必须把 teardown.sh 也装进设备，否则 `isp-split uninstall` 找不到
+# 唯一实现（安装路径漏装 = F-14 的同型 bug，VM 第一轮就实锤）。
+if grep -q 'cp -f "$SRC/usr/lib/isp-split/teardown.sh"' "$ROOT/scripts/install.sh"; then
+	ok "21.5c install.sh 把 teardown.sh 一并装进 /usr/lib/isp-split（卸载才有实现可用）"
+else
+	ng "21.5c install.sh 没装 teardown.sh：设备上 isp-split uninstall 会直接拒绝卸载"
+fi
+# 旧的两份实现必须消失（否则迟早再漂移）
+if ! grep -q '^_uninstall_ipsets()' "$ROOT/files/usr/sbin/isp-split" &&
+   ! grep -q '^_uninstall_policies()' "$ROOT/files/usr/sbin/isp-split" &&
+   ! grep -q '^_restore_dns_confdir()' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "21.5b isp-split 内不再保留第二份清理实现（_uninstall_ipsets/_uninstall_policies/_restore_dns_confdir 已删）"
+else
+	ng "21.5b isp-split 里还留着重复的清理实现"
+fi
+
+# 21.6 postrm 兜底清单锚点双向核对（唯一允许的镜像处）
+sed -n '/^define Package\/isp-split\/postrm$/,/^endef$/p' "$ROOT/Makefile" > "$F14/postrm.txt"
+_miss=""
+for _a in $(printf '%s\n' "$_f14_list" | awk '$1 == "anchor" { $1 = ""; sub(/^ /, ""); print }'); do
+	grep -Fq -- "$_a" "$F14/postrm.txt" || _miss="$_miss [$_a]"
+done
+if [ -z "$_miss" ]; then
+	ok "21.6 postrm 兜底清单覆盖 teardown.sh 的全部 runtime 锚点（正向）"
+else
+	ng "21.6 postrm 缺锚点:$_miss"
+fi
+# 反向：postrm 里的删除目标不许出现清单外的路径
+printf '%s\n' "$_f14_list" |
+	awk '$1 == "path" || $1 == "dir" || $1 == "glob" { print $2 }
+	     $1 == "anchor" { $1 = ""; sub(/^ /, ""); print }' |
+	awk '{ print; print "/" $0 }' > "$F14/allow.txt"
+_extra=""
+# 注意：读文件而不是 for $(...)，否则 postrm 里的 `*.bak.*` 会在本机展开，
+# 把"清单外的真实文件名"当成新目标（VM 上真有 66 个历史备份，第一版就栽在这）。
+grep -E '^[[:space:]]*(rm -[rf]+|nft delete)' "$F14/postrm.txt" |
+	sed 's/^[[:space:]]*//' |
+	awk '{ for (i = 2; i <= NF; i++) print $i }' |
+	grep '^/' | sed 's/[;|].*$//' > "$F14/targets.txt"
+while IFS= read -r _t; do
+	case "$_t" in *'$'*) continue ;; esac
+	_hit=0
+	while IFS= read -r _pat; do
+		# 用 case 做通配匹配：清单里既有精确路径，也有 `*.bak.*` 这类 glob
+		case "$_t" in $_pat) _hit=1; break ;; esac
+	done < "$F14/allow.txt"
+	[ "$_hit" = "1" ] || _extra="$_extra [$_t]"
+done < "$F14/targets.txt"
+if [ -z "$_extra" ]; then
+	ok "21.6b postrm 的删除目标都在清单内（反向，防夹带）"
+else
+	ng "21.6b postrm 删了清单外的路径:$_extra"
+fi
+
+# 21.7 B-5：旧名状态文件读一次、迁成新名
+f14_seed "$F14/r3" "$F14/s3"
+rm -f "$F14/r3/etc/isp-split/state/dnsmasq.confdir.migrated"
+printf '%s\n' "$F14/r3/run/keep.d" > "$F14/r3/etc/isp-split/state/dnsmasq.confdir.orig"
+f14_run "$F14/r3" "$F14/s3" runtime > "$F14/r3.log" 2>&1
+_f14_rc4=$?
+if [ "$_f14_rc4" -eq 0 ] &&
+   grep -q '旧状态文件 dnsmasq.confdir.orig 已迁移为 dnsmasq.confdir.migrated' "$F14/r3.log" &&
+   [ ! -e "$F14/r3/etc/isp-split/state/dnsmasq.confdir.orig" ] &&
+   grep -q "confdir=$F14/r3/run/keep.d" "$F14/s3/uci.log"; then
+	ok "21.7 B-5 旧状态文件 .orig 读一次并迁移为 .migrated，confdir 照常恢复"
+else
+	ng "21.7 B-5 旧名迁移异常（rc=$_f14_rc4）: $(tail -3 "$F14/r3.log" | tr '\n' ' ')"
+fi
+
+# 21.8 B-5：写侧口径。cmd_dns 只写新名；旧名只作为兼容读入存在。
+_dns_writes=$(grep -c '> "\$_state"' "$ROOT/files/usr/sbin/isp-split")
+_dns_state_line=$(grep -n '_state=\$DNS_STATE/dnsmasq.confdir' "$ROOT/files/usr/sbin/isp-split" |
+	head -1)
+case "$_dns_state_line" in
+*'.migrated'*)
+	if [ "$_dns_writes" -ge 1 ]; then
+		ok "21.8 B-5 cmd_dns 的状态文件写的是 .migrated（名实一致）"
+	else
+		ng "21.8 B-5 cmd_dns 找不到状态文件写入点"
+	fi
+	;;
+*)
+	ng "21.8 B-5 cmd_dns 仍在用旧名: $_dns_state_line"
+	;;
+esac
+# 注释与实现口径一致：不许再出现"首次记录原值"这种说辞
+if ! grep -q '首次记录原值' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "21.8b B-5 旧注释（首次记录原值）已清除，注释与写入值口径一致"
+else
+	ng "21.8b B-5 注释仍称「原值」，与实现不符"
+fi
+
+# 21.9 B-5：isp-split 自身的 _dns_state_adopt 也要认旧名（升级兼容读一次）
+rm -rf "$F14/b5base"
+mkdir -p "$F14/b5base/state"
+printf '%s\n' '/tmp/keep.d' > "$F14/b5base/state/dnsmasq.confdir.orig"
+(
+	ISP_SPLIT_CONF="$TMP/bug6/conf"
+	ISP_SPLIT_BASE="$F14/b5base"
+	export ISP_SPLIT_CONF ISP_SPLIT_BASE
+	. "$TMP/isp-lib.sh"
+	# DNS_STATE 由 BASE 派生（DNS_STATE=$BASE/state），这里跟着 BASE 走
+	_dns_state_adopt
+) > "$F14/b5adopt.log" 2>&1
+if [ -f "$F14/b5base/state/dnsmasq.confdir.migrated" ] &&
+   [ ! -e "$F14/b5base/state/dnsmasq.confdir.orig" ] &&
+   grep -qx '/tmp/keep.d' "$F14/b5base/state/dnsmasq.confdir.migrated" &&
+   grep -q '迁移为 dnsmasq.confdir.migrated' "$F14/b5adopt.log"; then
+	ok "21.9 B-5 isp-split 侧 _dns_state_adopt 把旧名读一次并迁移（内容不丢）"
+else
+	ng "21.9 B-5 isp-split 侧旧名迁移异常: $(tail -2 "$F14/b5adopt.log" | tr '\n' ' ')"
+fi
+
+echo "== 22. 工具链：SDK 版本分桶（F-19）/ Docker 平台（F-20）/ tag 一致性（F-21）"
+F19=$TMP/f19
+mkdir -p "$F19/scripts"
+cp "$ROOT/scripts/build-apk.sh" "$F19/scripts/"
+
+# 22.1 版本标记不匹配 -> 硬失败（旧的"staging_dir 在就复用"正是 F-19）
+mkdir -p "$F19/.sdk-build/1.2.3/sdk"
+printf '9.9.9 x86/64\n' > "$F19/.sdk-build/1.2.3/sdk/.isp-split-sdk-version"
+sh "$F19/scripts/build-apk.sh" 1.2.3 x86/64 > "$F19/wrong.log" 2>&1
+_f19_rc=$?
+if [ "$_f19_rc" -ne 0 ] && grep -q '不能混编' "$F19/wrong.log"; then
+	ok "22.1 F-19 复用前校验版本标记：目录里的 SDK 是 9.9.9，编 1.2.3 直接失败（rc=$_f19_rc）"
+else
+	ng "22.1 F-19 错版 SDK 仍被复用（rc=$_f19_rc）: $(tail -2 "$F19/wrong.log" | tr '\n' ' ')"
+fi
+
+# 22.2 标记缺失 -> 硬失败（来路不明的 SDK 目录不许赌）
+rm -f "$F19/.sdk-build/1.2.3/sdk/.isp-split-sdk-version"
+	: > "$F19/.sdk-build/1.2.3/sdk/README"	# 目录非空但无标记（旧脚本遗留的典型现场）
+sh "$F19/scripts/build-apk.sh" 1.2.3 x86/64 > "$F19/nomark.log" 2>&1
+_f19_rc2=$?
+if [ "$_f19_rc2" -ne 0 ] && grep -q '没有版本标记' "$F19/nomark.log"; then
+	ok "22.2 F-19 目录里没有版本标记时硬失败，不复用未知 SDK（rc=$_f19_rc2）"
+else
+	ng "22.2 F-19 无标记目录被静默复用（rc=$_f19_rc2）: $(tail -2 "$F19/nomark.log" | tr '\n' ' ')"
+fi
+
+# 22.3 标记匹配 -> 走复用分支（随后因假 SDK 没有 Makefile 失败，属预期）
+printf '1.2.3 x86/64\n' > "$F19/.sdk-build/1.2.3/sdk/.isp-split-sdk-version"
+sh "$F19/scripts/build-apk.sh" 1.2.3 x86/64 > "$F19/reuse.log" 2>&1
+if grep -q '复用 .*sdk（1.2.3 x86/64）' "$F19/reuse.log" &&
+   ! grep -q '不能混编' "$F19/reuse.log"; then
+	ok "22.3 F-19 标记匹配时才复用（复用的是同版本同架构的 SDK）"
+else
+	ng "22.3 F-19 复用分支未按标记放行: $(head -3 "$F19/reuse.log" | tr '\n' ' ')"
+fi
+
+# 22.4 默认工作目录带版本（不再共用 .sdk-build/sdk）
+mkdir -p "$F19/.sdk-build/7.7.7/sdk"
+printf '7.7.7 x86/64\n' > "$F19/.sdk-build/7.7.7/sdk/.isp-split-sdk-version"
+sh "$F19/scripts/build-apk.sh" 7.7.7 x86/64 > "$F19/default.log" 2>&1
+if grep -q '复用 .*\.sdk-build/7.7.7/sdk（7.7.7 x86/64）' "$F19/default.log"; then
+	ok "22.4 F-19 默认 WORK 按版本分桶（.sdk-build/<VER>/sdk）"
+else
+	ng "22.4 F-19 默认 WORK 未按版本分桶: $(head -3 "$F19/default.log" | tr '\n' ' ')"
+fi
+
+# 22.5 F-20 Docker 构建必须钉 linux/amd64（用 stub 抓 argv）
+F20=$TMP/f20
+mkdir -p "$F20/bin"
+cat > "$F20/bin/docker" <<'FAKE_DOCKER_F20'
+#!/bin/sh
+printf '%s\n' "$@" > "${FAKE_DOCKER_ARGS:?}"
+exit 0
+FAKE_DOCKER_F20
+chmod +x "$F20/bin/docker"
+(
+	PATH="$F20/bin:$PATH"
+	FAKE_DOCKER_ARGS="$F20/args"
+	export PATH FAKE_DOCKER_ARGS
+	sh "$ROOT/scripts/build-apk-docker.sh" 25.12.6 > "$F20/run.log" 2>&1
+)
+_f20_rc=$?
+if [ "$_f20_rc" -eq 0 ] &&
+   grep -Fxq -- '--platform' "$F20/args" &&
+   grep -Fxq -- 'linux/amd64' "$F20/args" &&
+   grep -Fxq -- 'debian:bookworm-slim' "$F20/args"; then
+	ok "22.5 F-20 docker run 带 --platform linux/amd64（argv 实测）"
+else
+	ng "22.5 F-20 docker 未钉平台（rc=$_f20_rc）: $(tr '\n' ' ' < "$F20/args" 2>/dev/null | cut -c1-160)"
+fi
+if grep -q 'Apple Silicon' "$ROOT/docs/BUILDING.md" &&
+   grep -q 'linux/amd64' "$ROOT/docs/BUILDING.md"; then
+	ok "22.6 F-20 docs/BUILDING.md 补了 Apple Silicon / linux-amd64 说明"
+else
+	ng "22.6 F-20 文档缺 Apple Silicon 说明"
+fi
+
+# 22.7 F-21 tag 与版本一致（正例 / 错 tag / 非法 tag / 非 tag 触发）
+_ver=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1)
+sh "$ROOT/scripts/verify-release-version.sh" "v$_ver" > "$F19/tag-ok.log" 2>&1
+_f21_ok=$?
+sh "$ROOT/scripts/verify-release-version.sh" "v0.0.1" > "$F19/tag-bad.log" 2>&1
+_f21_bad=$?
+sh "$ROOT/scripts/verify-release-version.sh" "$_ver" > "$F19/tag-fmt.log" 2>&1
+_f21_fmt=$?
+sh "$ROOT/scripts/verify-release-version.sh" > "$F19/tag-none.log" 2>&1
+_f21_none=$?
+if [ "$_f21_ok" -eq 0 ] && [ "$_f21_bad" -ne 0 ] && [ "$_f21_fmt" -ne 0 ] &&
+   [ "$_f21_none" -eq 0 ] &&
+   grep -q '::error::' "$F19/tag-bad.log"; then
+	ok "22.7 F-21 错 tag 版本号必须失败（ok=$_f21_ok bad=$_f21_bad fmt=$_f21_fmt 非tag=$_f21_none）"
+else
+	ng "22.7 F-21 tag 一致性判定异常（ok=$_f21_ok bad=$_f21_bad fmt=$_f21_fmt 非tag=$_f21_none）"
+fi
+if grep -q 'scripts/verify-release-version.sh' "$ROOT/.github/workflows/release.yml" &&
+   grep -q 'needs: \[ version \]' "$ROOT/.github/workflows/release.yml"; then
+	ok "22.7b F-21 release.yml 在编译前跑一致性断言（version job 门住 build）"
+else
+	ng "22.7b F-21 release.yml 没挂一致性断言"
+fi
+
+# 22.8 F-21 通配符口径：apk 连字符、ipk 下划线+_all.ipk
+_bad_glob=$(grep -rn --include='*.md' --include='*.yml' --include='*.sh' \
+	'isp-split_[*][.]apk' "$ROOT" 2>/dev/null |
+	grep -v '/[.]sdk-build/' | grep -v '/dist/' | wc -l | tr -d ' ')
+_apk_ok=$(grep -c 'isp-split-[*][.]apk' "$ROOT/.github/workflows/release.yml")
+_apk_ok2=$(grep -c 'isp-split-[*][.]apk' "$ROOT/scripts/build-apk.sh")
+_ipk_ok=$(grep -rc 'isp-split_[*]_all[.]ipk' "$ROOT/README.md" "$ROOT/docs/BUILDING.md" |
+	awk -F: '{ s += $2 } END { print s + 0 }')
+if [ "$_bad_glob" -eq 0 ] && [ "$_apk_ok" -ge 1 ] && [ "$_apk_ok2" -ge 1 ] && [ "$_ipk_ok" -ge 1 ]; then
+	ok "22.8 F-21 全仓 apk 口径统一 isp-split-*.apk（下划线 glob 归零），ipk 仍为 isp-split_*_all.ipk"
+else
+	ng "22.8 F-21 口径不一致（残留下划线 apk=$_bad_glob，release=$_apk_ok，build-apk=$_apk_ok2，ipk 文档=$_ipk_ok）"
+fi
+
+echo "== 23. verify-domains.sh 按 wire 语义重写（F-24 / F-25）"
+V23=$TMP/v23
+mkdir -p "$V23"
+V23BASE="$ROOT/tools/fixtures/verify/base"
+
+v23_run() { # <fixture dir> <域名...>
+	_f=$1
+	shift
+	(
+		ISP_VERIFY_FIXTURES="$_f"
+		ISP_SPLIT_CONF="$_f/conf"
+		VERIFY_PING=0
+		export ISP_VERIFY_FIXTURES ISP_SPLIT_CONF VERIFY_PING
+		sh "$ROOT/tools/verify-domains.sh" "$@"
+	)
+}
+
+# 23.1 基线夹具：多成员策略取任一成员 mark 都算对；未命中集合按兜底打标
+v23_run "$V23BASE" tel.example.com uni.example.com other.example.com telrange.example.com \
+	> "$V23/base.log" 2>&1
+_v23_rc=$?
+if [ "$_v23_rc" -eq 0 ] &&
+   grep -q '命中集合且 mark 一致: 3' "$V23/base.log" &&
+   grep -q '未命中集合、mark 与兜底一致: 1' "$V23/base.log" &&
+   grep -q '异常: 0' "$V23/base.log"; then
+	ok "23.1 F-24/F-25 基线：多成员 mark(1536)+兜底 mark(2048) 都判对（rc=0）"
+else
+	ng "23.1 基线夹具判定异常（rc=$_v23_rc）: $(tail -4 "$V23/base.log" | tr '\n' ' ')"
+fi
+if grep -q 'mark 期望 {1280,1536}' "$V23/base.log" &&
+   grep -q '未命中集合（按兜底打标）' "$V23/base.log"; then
+	ok "23.2 F-25 期望面取全成员集合（不再是单值），F-24 未命中按兜底期望（不再是恒 0）"
+else
+	ng "23.2 期望面仍是旧的单值/恒 0 口径: $(grep -E 'mark 期望|兜底' "$V23/base.log" | head -3 | tr '\n' ' ')"
+fi
+
+# 23.3 mark 不符必须报异常（禁止恒真）
+cp -r "$V23BASE" "$V23/bad"
+sed -i 's/mark=1792/mark=1793/' "$V23/bad/conntrack.txt"
+v23_run "$V23/bad" uni.example.com > "$V23/bad.log" 2>&1
+_v23_bad=$?
+if [ "$_v23_bad" -ne 0 ] && grep -q '异常: 1' "$V23/bad.log"; then
+	ok "23.3 mark 不符 → rc=$_v23_bad 且异常计数为 1（判定不是恒真）"
+else
+	ng "23.3 mark 不符未被判异常（rc=$_v23_bad）: $(grep '结论' "$V23/bad.log" | tr '\n' ' ')"
+fi
+
+# 23.4 规则排在兜底之后 -> 报"规则不会命中"，不拿 mark 差异去猜
+cp -r "$V23BASE" "$V23/order"
+sed -n '3,5p' "$V23BASE/nft_chain_mwan3_rules.txt" > "$V23/order/rules.new"
+sed -n '1,2p' "$V23BASE/nft_chain_mwan3_rules.txt" >> "$V23/order/rules.new"
+mv "$V23/order/rules.new" "$V23/order/nft_chain_mwan3_rules.txt"
+v23_run "$V23/order" tel.example.com > "$V23/order.log" 2>&1
+_v23_ord=$?
+if [ "$_v23_ord" -ne 0 ] && grep -q '规则在兜底之后' "$V23/order.log"; then
+	ok "23.4 规则排在 catch-all 之后 → 明确报顺序错误（rc=$_v23_ord）"
+else
+	ng "23.4 顺序错误未被识别（rc=$_v23_ord）: $(tail -3 "$V23/order.log" | tr '\n' ' ')"
+fi
+
+# 23.5 default_rule 关闭：未命中集合的期望 mark 回到 0
+cp -r "$V23BASE" "$V23/nodflt"
+sed -i '/0.0.0.0\/0/d' "$V23/nodflt/nft_chain_mwan3_rules.txt"
+sed -i 's/mark=2048/mark=0/' "$V23/nodflt/conntrack.txt"
+v23_run "$V23/nodflt" other.example.com > "$V23/nodflt.log" 2>&1
+_v23_nd=$?
+if [ "$_v23_nd" -eq 0 ] && grep -q '未打标' "$V23/nodflt.log"; then
+	ok "23.5 无兜底规则时未命中流量期望 mark=0（rc=$_v23_nd）"
+else
+	ng "23.5 无兜底场景判定异常（rc=$_v23_nd）: $(tail -3 "$V23/nodflt.log" | tr '\n' ' ')"
+fi
+
+# 23.6 无兜底却有 mark -> 异常
+cp -r "$V23/nodflt" "$V23/nodflt-mark"
+sed -i 's/mark=0/mark=2048/' "$V23/nodflt-mark/conntrack.txt"
+v23_run "$V23/nodflt-mark" other.example.com > "$V23/nodflt-mark.log" 2>&1
+_v23_nd2=$?
+if [ "$_v23_nd2" -ne 0 ] && grep -q '无兜底规则却有 mark' "$V23/nodflt-mark.log"; then
+	ok "23.6 无兜底规则却被打了标 → 异常（rc=$_v23_nd2）"
+else
+	ng "23.6 无兜底却有 mark 未被判异常（rc=$_v23_nd2）"
+fi
+
+# 23.7 策略无成员在线（last_resort）要单独说清楚，不是普通 mark 不符
+cp -r "$V23BASE" "$V23/lastresort"
+sed -i 's/mark=1536/mark=15872/' "$V23/lastresort/conntrack.txt"
+v23_run "$V23/lastresort" tel.example.com > "$V23/lastresort.log" 2>&1
+_v23_lr=$?
+if [ "$_v23_lr" -ne 0 ] && grep -q '策略无可用成员' "$V23/lastresort.log"; then
+	ok "23.7 last_resort(15872) 单独报「策略无可用成员」（rc=$_v23_lr）"
+else
+	ng "23.7 last_resort 未被单独识别（rc=$_v23_lr）: $(tail -3 "$V23/lastresort.log" | tr '\n' ' ')"
+fi
+
+# 23.8 集合不在 nft 里：不能静默当"未命中"
+cp -r "$V23BASE" "$V23/noset"
+rm -f "$V23/noset/nft_set_isp_uni.txt"
+v23_run "$V23/noset" uni.example.com > "$V23/noset.log" 2>&1
+_v23_ns=$?
+if grep -q '集合不在 nft 里' "$V23/noset.log" && [ "$_v23_ns" -ne 0 ]; then
+	ok "23.8 启用集合缺失时如实标注并判失败（rc=$_v23_ns）"
+else
+	ng "23.8 集合缺失被当成普通未命中（rc=$_v23_ns）"
+fi
 
 echo
 echo "通过 $pass 项，失败 $fail 项，跳过 $skipn 项"

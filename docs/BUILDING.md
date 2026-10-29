@@ -18,8 +18,9 @@
 sh scripts/build-ipk.sh
 ```
 
-不需要 OpenWrt 环境，产物为 `dist/isp-split_<版本>_all.ipk`（另有可选的
-`luci-app-isp-split_<版本>_all.ipk`）。脚本对产物做容器嗅探式冒烟校验：
+不需要 OpenWrt 环境，产物为 `dist/isp-split_<版本>-<发布号>_all.ipk`（另有可选的
+`luci-app-isp-split_<版本>-<发布号>_all.ipk`，例如 0.3.0 的产物是
+`isp-split_0.3.0-1_all.ipk`）。脚本对产物做容器嗅探式冒烟校验：
 必须是 gzip 包裹的 tar（magic `1f 8b`），且成员恰好为
 `./debian-binary`、`./control.tar.gz`、`./data.tar.gz`。
 
@@ -62,6 +63,8 @@ sh scripts/build-apk-docker.sh 24.10.4    # 24.10 SDK，产出 ipk
 
 首次运行会拉取 debian 镜像、安装编译依赖、下载 SDK（约 273 MB），全程 5-15 分钟。产物在 `dist/sdk-<版本>/`。
 
+**Apple Silicon（M 系列 Mac）**：脚本已用 `--platform linux/amd64` 钉住容器架构。OpenWrt SDK 只有 Linux x86_64 版本，不钉平台时 docker 会拉 `linux/arm64` 的 debian，容器里的 x86_64 工具链直接 `Exec format error`，报错埋在几百行编译日志里。钉住后由 Docker Desktop 的 Rosetta / QEMU 模拟执行，能编但比 x86 主机慢；建议 Docker Desktop ≥ 4.20 并在设置里打开 "Rosetta for x86/amd64 emulation"。容器启动后脚本先核对 `uname -m`，不是 `x86_64` 立刻报错退出，不会把平台问题拖到编译中途。
+
 已验证的宿主依赖（脚本内置）：`perl`（基础镜像的 perl-base 缺少 feeds 脚本所需模块）、`python3-distutils`（prereq 检查需要）。
 
 ---
@@ -74,7 +77,7 @@ sh scripts/build-apk.sh 24.10.4 x86/64   # 指定版本与架构
 OWRT_WORK=/tmp/sdkbuild sh scripts/build-apk.sh
 ```
 
-脚本流程：动态解析并下载 SDK → 解压到 `.sdk-build/sdk/` → 拷入软件包 → `feeds update/install` → `make defconfig` → `make package/*/compile` → 收集产物到 `dist/sdk-<版本>/`。
+脚本流程：动态解析并下载 SDK → 解压到 `.sdk-build/<SDK 版本>/sdk/`（F-19：按版本分桶，25.12 与 24.10 各自一份，复用前校验目录里的版本标记 `.isp-split-sdk-version`）→ 拷入软件包 → `feeds update/install` → `make defconfig` → `make package/*/compile` → 收集产物到 `dist/sdk-<版本>/`。
 
 宿主要求：Linux x86_64，`build-essential`、`zstd`、`curl`、`git`、`file`、`perl`、`python3-distutils`（Debian 系）。
 

@@ -20,8 +20,28 @@ permissions:
   contents: write
 
 jobs:
+  # F-21：tag 与版本号必须在编译前对上。打 tag 忘了改 Makefile（或改了版本号
+  # 没打 tag）以前不会有任何报错，Release 页写着 v0.3.0、包内自报 0.2.3 也能
+  # 一路发出去。这里编译前硬拦；判定实现放在脚本里，本地可以原样复跑。
+  version:
+    name: tag ↔ 版本一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 断言 tag 的 vX.Y.Z 与 PKG_VERSION / ISP_VERSION 一致
+        env:
+          TAG_REF: ${{ github.ref }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$TAG_REF" in
+            refs/tags/*) sh scripts/verify-release-version.sh "$TAG_NAME" ;;
+            *) echo "非 tag 触发（$TAG_REF），跳过 tag↔版本一致性断言（F-21）" ;;
+          esac
+
   build:
     name: build (${{ matrix.branch }})
+    needs: [ version ]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -182,7 +202,7 @@ jobs:
             若本页附带了 `.apk`（由 CI 用 SDK 编译），也可以直接装：
 
             ```sh
-            apk add --no-network --allow-untrusted ./isp-split_*.apk
+            apk add --no-network --allow-untrusted ./isp-split-*.apk
             ```
 
             **OpenWrt 24.10 及以下（opkg 系）**：

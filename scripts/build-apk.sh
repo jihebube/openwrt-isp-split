@@ -19,8 +19,19 @@ ARCH=${2:-x86/64}
 FEATURE_LINECHECK=${FEATURE_LINECHECK:-1}
 case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=${OWRT_WORK:-$ROOT/.sdk-build}
+# F-19：工作目录必须按 SDK 版本分桶。
+# 旧实现是固定的 $ROOT/.sdk-build，25.12 与 24.10 共用同一个 sdk/ 目录，
+# 而复用条件是"staging_dir/toolchain 在就跳过下载"——先编 25.12 再编 24.10
+# 时，24.10 会拿 25.12 的 toolchain/feeds 编译，产出看着成功、实际是错版包
+# （CI 每次干净环境，本地才会踩）。
+# 现在默认目录带 $VER，并且复用前校验版本标记文件；显式 OWRT_WORK 指向
+# 别的版本时硬失败，绝不静默复用。
+WORK=${OWRT_WORK:-$ROOT/.sdk-build/$VER}
 OUT=$ROOT/dist/sdk-$VER
+# 标记文件记录"这个 sdk/ 是哪一版、哪个架构解出来的"。
+SDK_MARK_NAME=.isp-split-sdk-version
+SDK_MARK=$WORK/sdk/$SDK_MARK_NAME
+SDK_ID="$VER $ARCH"
 
 BASE=https://downloads.openwrt.org/releases/$VER/targets/$ARCH
 
@@ -28,8 +39,25 @@ echo "== SDK 构建: $VER / $ARCH =="
 
 mkdir -p "$WORK" "$OUT"
 
-# 1) 下载并解压 SDK（只做一次）
-if [ ! -x "$WORK/sdk/staging_dir" ] && [ ! -d "$WORK/sdk/toolchain" ]; then
+# 1) 下载并解压 SDK（每个版本目录只做一次）
+# F-19：复用条件从"staging_dir/toolchain 存在"改成"版本标记匹配"。
+# 标记缺失说明这个目录是旧脚本留下的、或者不是本脚本解出来的——无法
+# 确认版本就硬失败，让用户删掉目录重来，而不是赌一把编出错版包。
+if [ -d "$WORK/sdk" ] && [ -n "$(ls -A "$WORK/sdk" 2>/dev/null)" ]; then
+	if [ ! -f "$SDK_MARK" ]; then
+		echo "错误：$WORK/sdk 已存在但没有版本标记 $SDK_MARK_NAME，无法确认是哪一版 SDK。" >&2
+		echo "      删除 $WORK 后重跑，或改用 OWRT_WORK=<空目录>。不要复用来路不明的 SDK 目录。" >&2
+		exit 1
+	fi
+	_mark=$(cat "$SDK_MARK" 2>/dev/null | tr -d '\r')
+	if [ "$_mark" != "$SDK_ID" ]; then
+		echo "错误：$WORK 里的 SDK 是 '$_mark'，本次要编 '$SDK_ID'。" >&2
+		echo "      同一工作目录不能混编两个版本/架构（F-19）。默认目录已按版本分桶：" >&2
+		echo "      去掉 OWRT_WORK 直接跑，或指向另一个空目录。" >&2
+		exit 1
+	fi
+	echo "复用 $WORK/sdk（$_mark）"
+else
 	FILE=$(curl -fsSL "$BASE/" | grep -oE 'openwrt-sdk-[^"<]*Linux-x86_64\.tar\.(zst|xz)' | head -1)
 	[ -n "$FILE" ] || { echo "在 $BASE 找不到 SDK，确认版本号与架构" >&2; exit 1; }
 	echo "下载 $FILE"
@@ -39,8 +67,11 @@ if [ ! -x "$WORK/sdk/staging_dir" ] && [ ! -d "$WORK/sdk/toolchain" ]; then
 	*.zst) tar --zstd -xf "$WORK/sdk.tar" -C "$WORK/sdk" --strip-components=1 ;;
 	*)     tar -xf "$WORK/sdk.tar" -C "$WORK/sdk" --strip-components=1 ;;
 	esac
-	echo "SDK 已解压到 $WORK/sdk"
+	# 标记写在解压完成之后：中途失败不会留下"看起来可用"的半套 SDK。
+	printf '%s\n' "$SDK_ID" > "$SDK_MARK" || { echo "无法写入 $SDK_MARK" >&2; exit 1; }
+	echo "SDK 已解压到 $WORK/sdk（$SDK_ID）"
 fi
+echo "工作目录: $WORK"
 cd "$WORK/sdk"
 
 # 2) 放入软件包（仓库根目录即包目录）
@@ -78,5 +109,15 @@ echo
 echo "== 产物 =="
 ls -lh "$OUT"
 echo
-echo "安装（25.12/apk 系）："
-echo "  apk add --no-network --allow-untrusted $OUT/isp-split_*.apk"
+# F-21：两种包名的通配符口径不同，照抄会 glob 不到文件：
+#   apk = isp-split-<版本>-r<发布号>.apk（连字符，apk 3 的命名规则）
+#   ipk = isp-split_<版本>-<发布号>_all.ipk（下划线）
+# 按实际产物给命令：24.10 SDK 只产 ipk，不该提示 apk add。
+if ls "$OUT"/*.apk >/dev/null 2>&1; then
+	echo "安装（25.12/apk 系）："
+	echo "  apk add --no-network --allow-untrusted $OUT/isp-split-*.apk"
+fi
+if ls "$OUT"/*.ipk >/dev/null 2>&1; then
+	echo "安装（≤24.10/opkg 系）："
+	echo "  opkg install $OUT/isp-split_*_all.ipk"
+fi

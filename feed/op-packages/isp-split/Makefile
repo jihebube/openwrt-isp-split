@@ -74,16 +74,25 @@ fi
 exit 0
 endef
 
-# 卸载后的兜底清理：cron、命名计数器、dnsmasq confdir、数据目录。
-# 正常路径由 prerm 的 isp-split uninstall 完成，这里防止二进制先被删掉。
+# 卸载后的兜底清理。正常路径是 prerm 里的 `isp-split uninstall`（它调
+# /usr/lib/isp-split/teardown.sh，与 scripts/install.sh --uninstall 同一份实现）。
+# 但 opkg/apk 会先删包文件再跑 postrm，那时 teardown.sh 已经不在盘上，
+# 所以这里必须自带一份等价的内联清单 —— 这是"三条路径同源"的唯一例外，
+# 由 tools/selftest.sh 第 21 节做锚点双向核对：teardown.sh 的 runtime 锚点
+# 必须逐条出现在本块里，本块也不许出现清单外的清理动作。
 define Package/isp-split/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 case "$${1:-}" in
 	upgrade|pre-upgrade|*upgrade*) exit 0 ;;
 esac
+# 共享实现在盘上就用它（少数包管理器/强制删除会在删文件前跑 postrm）。
+if [ -f /usr/lib/isp-split/teardown.sh ]; then
+	sh /usr/lib/isp-split/teardown.sh all
+	exit $$?
+fi
 if [ -f /etc/crontabs/root ]; then
-	# mktemp 而不是 /tmp/.ispcron.$$：PID 可预测，符号链接能抢占（SEC-1）
+	# mktemp 而不是固定 /tmp 名：PID 可预测，符号链接能抢占（SEC-1）
 	_cron_tmp=$$(mktemp /etc/.isp-split-cron.XXXXXX) || _cron_tmp=""
 	if [ -n "$$_cron_tmp" ]; then
 		grep -v 'isp-split' /etc/crontabs/root > "$$_cron_tmp" 2>/dev/null || true
@@ -92,16 +101,20 @@ if [ -f /etc/crontabs/root ]; then
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 fi
 nft delete counter inet mwan3 isp_fallback >/dev/null 2>&1 || true
-_state=/etc/isp-split/state/dnsmasq.confdir.orig
+# B-5：状态文件已改名 dnsmasq.confdir.migrated（记的是迁移后的清理值）。
+# 旧名 dnsmasq.confdir.orig 兼容读一次。
+_state=/etc/isp-split/state/dnsmasq.confdir.migrated
+[ -f "$$_state" ] || _state=/etc/isp-split/state/dnsmasq.confdir.orig
 if [ -f "$$_state" ]; then
-	_orig=$$(cat "$$_state" 2>/dev/null)
+	_orig=$$(head -1 "$$_state" 2>/dev/null)
 	if [ -n "$$_orig" ]; then
 		uci -q set "dhcp.@dnsmasq[0].confdir=$$_orig" 2>/dev/null || true
 	else
 		uci -q delete dhcp.@dnsmasq[0].confdir 2>/dev/null || true
 	fi
 	uci -q commit dhcp 2>/dev/null || true
-	rm -f "$$_state"
+	rm -f /etc/isp-split/state/dnsmasq.confdir.migrated \
+		/etc/isp-split/state/dnsmasq.confdir.orig 2>/dev/null || true
 fi
 # BUG-6：OpenClash 接管时 dnsmasq 实际加载的是 /var/etc/dnsmasq.conf.*
 # 里 conf-dir= 指向的目录，必须按同一来源清理，不能只删 /tmp/dnsmasq.d。
@@ -119,6 +132,9 @@ for _f in /var/etc/dnsmasq.conf.*; do
 	done
 done
 rm -f /tmp/dnsmasq.d/isp-split.conf /etc/isp-split/dnsmasq.d/isp-split.conf 2>/dev/null || true
+# F-14：install.sh 留下的 /etc/isp-split.conf.bak.* 与主配置一并清掉（与 teardown.sh
+# 同策略：默认删，逐条打印由 teardown.sh 负责；这里只兜底）。
+rm -f /etc/isp-split.conf /etc/isp-split.conf.bak.* 2>/dev/null || true
 rm -rf /etc/isp-split 2>/dev/null || true
 exit 0
 endef
@@ -135,6 +151,10 @@ define Package/isp-split/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/isp-split $(1)/etc/init.d/isp-split
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/build.sh $(1)/usr/lib/isp-split/build.sh
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/uci-defaults/99-isp-split $(1)/etc/uci-defaults/99-isp-split
+	# F-14：卸载清理的唯一实现。prerm（isp-split uninstall）与
+	# scripts/install.sh --uninstall 都调它；postrm 在二进制先被删掉时
+	# 用内联等价清单兜底（锚点由 selftest 第 21 节双向核对）。
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/teardown.sh $(1)/usr/lib/isp-split/teardown.sh
 
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/cidr2range.awk $(1)/usr/lib/isp-split/cidr2range.awk
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/merge.awk $(1)/usr/lib/isp-split/merge.awk

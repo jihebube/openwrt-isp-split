@@ -1,0 +1,4 @@
+ipv4 2 tcp 6 431996 ESTABLISHED src=192.168.12.100 dst=1.2.3.4 sport=51234 dport=443 packets=3 bytes=180 src=1.2.3.4 dst=192.168.12.100 sport=443 dport=51234 packets=2 bytes=120 mark=1536 use=1
+ipv4 2 tcp 6 431996 ESTABLISHED src=192.168.12.100 dst=5.6.7.8 sport=51235 dport=443 packets=3 bytes=180 src=5.6.7.8 dst=192.168.12.100 sport=443 dport=51235 packets=2 bytes=120 mark=1792 use=1
+ipv4 2 tcp 6 431996 ESTABLISHED src=192.168.12.100 dst=9.9.9.9 sport=51236 dport=443 packets=3 bytes=180 src=9.9.9.9 dst=192.168.12.100 sport=443 dport=51236 packets=2 bytes=120 mark=2048 use=1
+ipv4 2 icmp 1 29 src=192.168.12.100 dst=10.0.0.2 type=8 code=0 id=1234 packets=1 bytes=84 src=10.0.0.2 dst=192.168.12.100 type=0 code=0 id=1234 packets=1 bytes=84 mark=1280 use=1

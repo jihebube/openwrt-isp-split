@@ -23,7 +23,14 @@ echo
 
 # debian:bookworm 里装齐 OpenWrt SDK 的宿主依赖后，复用同一个构建脚本。
 # 这保证了"本地 Linux 构建"与"Docker 构建"走的是完全相同的代码路径。
+#
+# F-20：显式钉住 linux/amd64。OpenWrt SDK 只有 Linux x86_64 版本，SDK 里的
+# toolchain 也是 x86_64 二进制。Apple Silicon（arm64）上 docker 默认拉
+# linux/arm64 镜像，容器里跑的是 arm64 的 debian，SDK 的 gcc/make 全部
+# "cannot execute binary file"，报错埋在几百行编译日志里；即使靠 QEMU
+# 兜住，构建也会慢到不可用。钉住平台后走 Rosetta/QEMU 模拟，行为与 x86 主机一致。
 docker run --rm \
+	--platform linux/amd64 \
 	-e SDK_VER="$VER" \
 	-v "$REPO":/repo \
 	-w /repo \
@@ -35,6 +42,14 @@ docker run --rm \
 		libncurses-dev libssl-dev python3 rsync unzip \
 		zlib1g-dev file wget curl zstd ca-certificates xz-utils \
 		perl python3-distutils >/dev/null
+	# 平台没钉住时这里会以 "Exec format error" 炸掉：先把结论说清楚。
+	case "$(uname -m)" in
+	x86_64 | amd64) ;;
+	*)
+		echo "错误：容器架构是 $(uname -m)，OpenWrt SDK 需要 linux/amd64（F-20）" >&2
+		exit 1
+		;;
+	esac
 	echo "== 依赖就绪，开始 SDK 构建 =="
 	sh scripts/build-apk.sh "$SDK_VER" x86/64
 	'

@@ -33,22 +33,36 @@ trap cleanup_stage EXIT
 [ -d "$SRC" ] || die "找不到 $SRC，请在仓库根目录运行"
 
 if [ "${1:-}" = "--uninstall" ]; then
+	# F-14：卸载清理只有一份实现——files/usr/lib/isp-split/teardown.sh
+	# （与 `isp-split uninstall`、包 postrm 同源）。旧版本这里只删 LuCI 资源，
+	# 于是 rc=0 而 /usr/sbin/isp-split、/etc/init.d/isp-split、/usr/lib/isp-split/、
+	# /etc/isp-split.conf、isp_fallback 计数器、.conf.bak.* 全留着。
+	shift
+	KEEP_BAK=0
+	for arg in "$@"; do
+		case "$arg" in
+		--keep-conf-bak) KEEP_BAK=1 ;;
+		*) say "卸载时忽略未知参数: $arg" ;;
+		esac
+	done
+	# 先走已装版本的卸载（它内部也调 teardown.sh，且会用 rules-splice 摘掉
+	# mwan3 规则块——那一步需要 /usr/lib/isp-split/rules-splice.awk）。
 	if [ -x /usr/sbin/isp-split ]; then
-		/usr/sbin/isp-split uninstall || true
+		/usr/sbin/isp-split uninstall ||
+			say "警告：isp-split uninstall 非零退出，继续用 teardown.sh 兜底清理"
 	else
-		say "isp-split 未安装"
+		say "isp-split 未安装或不可执行，直接用 teardown.sh 清理"
 	fi
-	# 同时移除 LuCI 页面
-	rm -f /www/luci-static/resources/view/isp-split/*.js
-	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
-	rm -rf /www/luci-static/resources/isp-split/logos
-	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
-	rm -f /usr/share/luci/menu.d/luci-app-isp-split-linecheck.json
-	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
-	rm -f /usr/lib/isp-split/lc-run
-	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
-	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
-	say "已卸载（含 LuCI 页面）"
+	# 再无条件跑一遍：幂等，且二进制缺失/损坏/版本不符时也能清干净。
+	TEARDOWN=$SRC/usr/lib/isp-split/teardown.sh
+	[ -f "$TEARDOWN" ] || TEARDOWN=/usr/lib/isp-split/teardown.sh
+	[ -f "$TEARDOWN" ] || die "找不到 teardown.sh（仓库树不完整？）"
+	if [ "$KEEP_BAK" = "1" ]; then
+		sh "$TEARDOWN" all --keep-conf-bak || die "teardown.sh 执行失败，卸载不完整"
+	else
+		sh "$TEARDOWN" all || die "teardown.sh 执行失败，卸载不完整"
+	fi
+	say "已卸载（脚本、配置、LuCI 页面、计数器、dnsmasq confdir 状态全部清理）"
 	exit 0
 fi
 
@@ -111,11 +125,15 @@ fi
 mkdir -p /usr/sbin /usr/lib/isp-split /etc/init.d /etc/isp-split/data
 cp -f "$SRC/usr/sbin/isp-split" /usr/sbin/isp-split
 cp -f "$SRC/usr/lib/isp-split/"*.awk "$SRC/usr/lib/isp-split/build.sh" /usr/lib/isp-split/
+# F-14：卸载清理的唯一实现必须跟着装进设备——`isp-split uninstall` 靠它，
+# 缺了这一份就只能退回"各写一份清单"的老路（install 路径当时正是漏装它）。
+cp -f "$SRC/usr/lib/isp-split/teardown.sh" /usr/lib/isp-split/teardown.sh
 if [ -f "$SRC/usr/lib/isp-split/lc-run" ]; then
 	cp -f "$SRC/usr/lib/isp-split/lc-run" /usr/lib/isp-split/
 fi
 cp -f "$SRC/etc/init.d/isp-split" /etc/init.d/isp-split
-chmod 755 /usr/sbin/isp-split /etc/init.d/isp-split /usr/lib/isp-split/build.sh
+chmod 755 /usr/sbin/isp-split /etc/init.d/isp-split /usr/lib/isp-split/build.sh \
+	/usr/lib/isp-split/teardown.sh
 if [ "$FEATURE_LINECHECK" != "1" ]; then
 	# 升级残留：旧功能版留下的引擎入口与缓存目录不能留在 0 版设备上。
 	rm -f /usr/lib/isp-split/lc-run
