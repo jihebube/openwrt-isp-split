@@ -44,13 +44,16 @@
 sh scripts/install.sh --all                       # 从源码目录安装
 apk add --allow-untrusted ./isp-split-*.apk       # 或安装 Release 中的 apk 包
 
-# 2. 预检与生效（前两步只读）
+# 2. 首次安装：给 ISP_TABLE 的策略绑定 WAN 接口
+isp-split init      # 交互选择；脚本用法：--bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes
+
+# 3. 预检与生效（前两步只读）
 isp-split plan      # 预演：将要做哪些改动
 isp-split check     # nft 干跑校验
 isp-split sync      # 拉取数据并生效
 isp-split verify    # 核对规则渲染
 
-# 3. 查看分流效果
+# 4. 查看分流效果
 isp-split status    # 各集合命中计数与流量
 ```
 
@@ -93,7 +96,8 @@ isp-split status    # 各集合命中计数与流量
 |---|---|---|
 | `plan` / `check` / `selftest` | 三级预检（预演 / 干跑 / 独立表实弹） | 无 |
 | `fetch` / `rollback` | 拉取 / 回滚数据 | 数据 |
-| `wire` | 把集合与规则写入 mwan3 配置 | mwan3 |
+| `init [--bind <策略>=<接口>]... [--assume-yes]` | 首次安装：发现 mwan3 接口，为 ISP_TABLE 的每个策略创建 policy/member（带 `isp_split=1` 标记） | mwan3 |
+| `wire` | 把集合与规则写入 mwan3 配置（策略缺失/空成员硬失败） | mwan3 |
 | `apply` | 把数据原子刷入 nftables 集合 | nft |
 | `refresh` | fetch + apply（日常定时任务） | nft |
 | `sync` | fetch + wire + apply（首次部署） | 全部 |
@@ -101,6 +105,7 @@ isp-split status    # 各集合命中计数与流量
 | `status` / `health` | 集合统计 / 数据源健康度 + 双线状态 | 无 |
 | `diff` | 用存档重算主源 vs 校验源的分歧（超阈值退出码 3） | 无 |
 | `verify` / `probe` | 渲染核对 / 分线测速 | 无 |
+| `policy-check [--json]` | 检查 ISP_TABLE 启用行的策略是否都有成员（LuCI 提示条数据源） | 无 |
 | `dnstest <策略>` | 测一条线路的 DNS 是否可用 | 无 |
 | `linecheck [--json] [--wan <接口>] [--force] [--background]` | 线路体检：出口类型 / 四段延迟 / NAT / 归属地 / 评分 | 无（只读探测） |
 | `conf check` / `conf preview` | 只校验配置 / 预演未保存的改动 | 无 |

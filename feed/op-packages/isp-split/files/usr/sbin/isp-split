@@ -1710,12 +1710,599 @@ _uninstall_ipsets() {
 	return 0
 }
 
+# ---- 策略/成员（BUG-25）----
+#
+# mwan3 的 policy 只是"成员列表"，member 才是"接口 + metric/weight"。
+# 首次安装的用户往往没有 wan_only/wanb_only 策略（或接口名不同），
+# wire 生成 `option use_policy 'wan_only'` 后 mwan3 渲染时整条规则消失，
+# 而旧版 wire 只做了 `uci get mwan3.<policy>` 的"段存在"检查——策略存在但
+# 成员为空时照样通过，最后表现为"装好了、分流不生效、零提示"。
+#
+# 这里把"策略存在且有可用成员"抽成一个判定，wire/plan 在动任何配置之前
+# 硬失败；init 负责按 ISP_TABLE 创建带 isp_split=1 标记的 policy/member。
+
+# wire 实际会渲染的策略名（去重，保持表内顺序）。
+# 只看第 4 列=1 的行：disabled 行不会生成任何 mwan3 rule，它的策略不必
+# 存在；init 也不去碰（否则用户 disabled 行里引用的 mwan3 内建策略
+# balanced 会因为"无标记"被拦下，首装直接走不下去）。
+_isp_policies() {
+	_ip_seen=" "
+	for _ip_row in $ISP_TABLE; do
+		case "$_ip_row" in \#*) continue ;; esac
+		_ip_old_ifs=$IFS
+		IFS=':'
+		set -- $_ip_row
+		IFS=$_ip_old_ifs
+		[ $# -ge 4 ] || continue
+		[ "$4" = "1" ] || continue
+		case "$_ip_seen" in *" $3 "*) continue ;; esac
+		_ip_seen="$_ip_seen$3 "
+		printf '%s\n' "$3"
+	done
+}
+
+# 策略问题描述：正常时输出空行，否则输出一句人话。
+# 返回 0 表示无问题，1 表示有问题（调用方按需使用）。
+_policy_problem() {
+	_pp_pol=$1
+	_pp_type=$(uci -q get "mwan3.$_pp_pol" 2>/dev/null)
+	if [ -z "$_pp_type" ]; then
+		printf '%s\n' "不存在于 mwan3"
+		return 1
+	fi
+	if [ "$_pp_type" != "policy" ]; then
+		printf '%s\n' "同名段存在但不是 policy（类型 $_pp_type）"
+		return 1
+	fi
+	_pp_members=$(uci -q get "mwan3.$_pp_pol.use_member" 2>/dev/null)
+	if [ -z "$_pp_members" ]; then
+		printf '%s\n' "策略存在但成员为空"
+		return 1
+	fi
+	for _pp_m in $_pp_members; do
+		_pp_mtype=$(uci -q get "mwan3.$_pp_m" 2>/dev/null)
+		if [ "$_pp_mtype" != "member" ]; then
+			printf '%s\n' "引用的成员 '$_pp_m' 不存在"
+			return 1
+		fi
+		_pp_if=$(uci -q get "mwan3.$_pp_m.interface" 2>/dev/null)
+		if [ -z "$_pp_if" ]; then
+			printf '%s\n' "成员 '$_pp_m' 未绑定接口"
+			return 1
+		fi
+		if [ "$(uci -q get "mwan3.$_pp_if" 2>/dev/null)" != "interface" ]; then
+			printf '%s\n' "成员 '$_pp_m' 绑定的接口 '$_pp_if' 在 mwan3 中不存在"
+			return 1
+		fi
+	done
+	printf '\n'
+	return 0
+}
+
+# 一行描述策略成员，供 verify 展示
+_policy_desc() {
+	_pd_members=$(uci -q get "mwan3.$1.use_member" 2>/dev/null)
+	if [ -z "$_pd_members" ]; then
+		printf '%s\n' "（无成员）"
+		return 0
+	fi
+	_pd_out=""
+	for _pd_m in $_pd_members; do
+		_pd_if=$(uci -q get "mwan3.$_pd_m.interface" 2>/dev/null)
+		_pd_out="${_pd_out}${_pd_out:+, }$_pd_m(${_pd_if:-?})"
+	done
+	printf '%s\n' "$_pd_out"
+}
+
+# wire/plan 的公共预检：任何一个被引用的策略缺失/空成员都返回 1。
+# 只打印问题，不退出——调用方决定是 die 还是继续（目前两者都 die）。
+_precheck_policies() {
+	_pc_bad=0
+	for _pc_pol in $(_isp_policies); do
+		_pc_msg=$(_policy_problem "$_pc_pol")
+		[ -n "$_pc_msg" ] || continue
+		log "错误: 策略 '$_pc_pol' $_pc_msg"
+		_pc_bad=$((_pc_bad + 1))
+	done
+	[ "$_pc_bad" -eq 0 ]
+}
+
+# ---------- 接口发现（init） ----------
+
+_mwan3_iface_sections() {
+	uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=interface$/\1/p'
+}
+
+# 运行中的 L3 设备（PPPoE 时与配置里的 device 不同）。只做尽力探测：
+# ubus 不可用时返回空，不影响 init。
+_iface_l3_device() {
+	_l3_ubus=""
+	command -v ubus >/dev/null 2>&1 || return 0
+	_l3_raw=$(ubus call "network.interface.$1" status 2>/dev/null) || return 0
+	if command -v jsonfilter >/dev/null 2>&1; then
+		_l3_ubus=$(printf '%s' "$_l3_raw" | jsonfilter -e '@.l3_device' 2>/dev/null)
+		[ -n "$_l3_ubus" ] ||
+			_l3_ubus=$(printf '%s' "$_l3_raw" | jsonfilter -e '@.device' 2>/dev/null)
+	fi
+	if [ -z "$_l3_ubus" ]; then
+		_l3_ubus=$(printf '%s' "$_l3_raw" |
+			sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+	fi
+	printf '%s\n' "$_l3_ubus"
+}
+
+_iface_runtime_state() {
+	_rs=""
+	command -v ubus >/dev/null 2>&1 || {
+		printf '%s\n' "-"
+		return 0
+	}
+	_rs_raw=$(ubus call "network.interface.$1" status 2>/dev/null) || {
+		printf '%s\n' "down"
+		return 0
+	}
+	if command -v jsonfilter >/dev/null 2>&1; then
+		_rs=$(printf '%s' "$_rs_raw" | jsonfilter -e '@.up' 2>/dev/null)
+	fi
+	case "$_rs" in
+	true | 1) printf '%s\n' "up" ;;
+	false | 0) printf '%s\n' "down" ;;
+	*) printf '%s\n' "-" ;;
+	esac
+}
+
+# 发现并打印接口清单；可绑定接口（enabled=1 且 family=ipv4）放在
+# ISP_INIT_AVAIL（空格分隔，按 mwan3 配置顺序）。
+_discover_ifaces() {
+	ISP_INIT_AVAIL=""
+	echo "== mwan3 接口发现（mwan3 接口 -> network 接口 -> pppoe/静态 设备）"
+	printf '  %-9s %-10s %-7s %-12s %-12s %s\n' \
+		"接口" "network" "类型" "配置设备" "运行设备" "状态"
+	_di_any=0
+	for _di_sec in $(_mwan3_iface_sections); do
+		_di_any=1
+		_di_en=$(uci -q get "mwan3.$_di_sec.enabled" 2>/dev/null)
+		[ -n "$_di_en" ] || _di_en=1
+		_di_fam=$(uci -q get "mwan3.$_di_sec.family" 2>/dev/null)
+		[ -n "$_di_fam" ] || _di_fam=ipv4
+		if [ -n "$(uci -q get "network.$_di_sec" 2>/dev/null)" ]; then
+			_di_net=$_di_sec
+		else
+			_di_net="(未关联)"
+		fi
+		_di_proto=$(uci -q get "network.$_di_sec.proto" 2>/dev/null)
+		_di_dev=$(uci -q get "network.$_di_sec.device" 2>/dev/null)
+		[ -n "$_di_dev" ] ||
+			_di_dev=$(uci -q get "network.$_di_sec.ifname" 2>/dev/null)
+		_di_l3=$(_iface_l3_device "$_di_sec")
+		[ -n "$_di_net" ] || _di_net="(未关联)"
+		[ -n "$_di_proto" ] || _di_proto="-"
+		[ -n "$_di_dev" ] || _di_dev="-"
+		[ -n "$_di_l3" ] || _di_l3="-"
+		_di_st=$(_iface_runtime_state "$_di_sec")
+		if [ "$_di_en" != "1" ]; then
+			_di_st="disabled"
+		fi
+		[ "$_di_fam" = "ipv4" ] || _di_st="$_di_st/$_di_fam"
+		printf '  %-9s %-10s %-7s %-12s %-12s %s\n' \
+			"$_di_sec" "$_di_net" "$_di_proto" "$_di_dev" "$_di_l3" "$_di_st"
+		if [ "$_di_fam" = "ipv4" ] && [ "$_di_en" = "1" ]; then
+			ISP_INIT_AVAIL="${ISP_INIT_AVAIL:+$ISP_INIT_AVAIL }$_di_sec"
+		fi
+	done
+	[ "$_di_any" = "1" ] ||
+		echo "  （mwan3 中没有 config interface 段）"
+
+	echo
+	echo "当前策略绑定:"
+	_dp_any=0
+	for _dp_pol in $(_isp_policies); do
+		_dp_any=1
+		printf '  %-14s -> %s\n' "$_dp_pol" "$(_policy_desc "$_dp_pol")"
+	done
+	[ "$_dp_any" = "1" ] || echo "  （ISP_TABLE 没有引用任何策略）"
+}
+
+_iface_in_avail() {
+	case " $ISP_INIT_AVAIL " in
+	*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+# 第 N 个可绑定接口（超出数量时循环）。--assume-yes 的默认绑定用这个：
+# 策略按 ISP_TABLE 出现顺序与接口按 mwan3 配置顺序一一对应。
+_nth_iface() {
+	_ni_n=0
+	for _ni_x in $ISP_INIT_AVAIL; do
+		_ni_n=$((_ni_n + 1))
+	done
+	[ "$_ni_n" -gt 0 ] || return 1
+	_ni_want=$((($1 - 1) % _ni_n + 1))
+	_ni_i=0
+	for _ni_x in $ISP_INIT_AVAIL; do
+		_ni_i=$((_ni_i + 1))
+		[ "$_ni_i" -eq "$_ni_want" ] && {
+			printf '%s\n' "$_ni_x"
+			return 0
+		}
+	done
+	return 1
+}
+
+# 交互选择：提示写 stderr，结果写 stdout（便于 $(...) 捕获）
+_prompt_iface() {
+	_pi_pol=$1
+	_pi_def=$2
+	_pi_try=0
+	while [ "$_pi_try" -lt 5 ]; do
+		printf '  策略 %s 绑定到哪条线路？[%s] ' "$_pi_pol" "$_pi_def" >&2
+		IFS= read -r _pi_ans || _pi_ans=""
+		[ -n "$_pi_ans" ] || _pi_ans=$_pi_def
+		_pi_sel=""
+		case "$_pi_ans" in
+		[0-9]*)
+			_pi_i=0
+			for _pi_x in $ISP_INIT_AVAIL; do
+				_pi_i=$((_pi_i + 1))
+				[ "$_pi_i" -eq "$_pi_ans" ] 2>/dev/null && _pi_sel=$_pi_x
+			done
+			;;
+		*) _pi_sel=$_pi_ans ;;
+		esac
+		if _iface_in_avail "$_pi_sel"; then
+			printf '%s\n' "$_pi_sel"
+			return 0
+		fi
+		echo "  无效选择: '$_pi_ans'（可用: $ISP_INIT_AVAIL）" >&2
+		_pi_try=$((_pi_try + 1))
+	done
+	die "策略 '$_pi_pol' 的接口选择失败"
+}
+
+_init_member_name() {
+	printf 'isp_split_%s_m1\n' "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9_]/_/g')"
+}
+
+# 写入/更新一个策略的绑定。幂等：同名带标记段只更新成员，不追加。
+_init_apply_bind() {
+	_ab_pol=$1
+	_ab_if=$2
+	_ab_type=$(uci -q get "mwan3.$_ab_pol" 2>/dev/null)
+	if [ -n "$_ab_type" ]; then
+		if [ "$_ab_type" != "policy" ]; then
+			die "mwan3 中已存在同名段 '$_ab_pol'（类型 $_ab_type，不是 policy），init 不做改动"
+		fi
+		if [ "$(uci -q get "mwan3.$_ab_pol.isp_split" 2>/dev/null)" != "1" ]; then
+			die "mwan3 中已存在同名策略 '$_ab_pol' 且没有 isp_split 标记；为保护现有配置，init 不做改动（请先在 mwan3 中删除/改名，或改用其它策略名）"
+		fi
+	else
+		uci set "mwan3.$_ab_pol=policy" ||
+			die "无法创建 mwan3 策略段 '$_ab_pol'"
+	fi
+
+	_ab_mem=$(_init_member_name "$_ab_pol")
+	_ab_mtype=$(uci -q get "mwan3.$_ab_mem" 2>/dev/null)
+	if [ -n "$_ab_mtype" ]; then
+		if [ "$_ab_mtype" != "member" ]; then
+			die "mwan3 中已存在同名段 '$_ab_mem'（类型 $_ab_mtype，不是 member），init 不做改动"
+		fi
+		if [ "$(uci -q get "mwan3.$_ab_mem.isp_split" 2>/dev/null)" != "1" ]; then
+			die "mwan3 中已存在同名成员段 '$_ab_mem' 且没有 isp_split 标记；为保护现有配置，init 不做改动"
+		fi
+	else
+		uci set "mwan3.$_ab_mem=member" ||
+			die "无法创建 mwan3 成员段 '$_ab_mem'"
+	fi
+
+	uci set "mwan3.$_ab_pol.isp_split=1"
+	uci set "mwan3.$_ab_mem.interface=$_ab_if"
+	uci set "mwan3.$_ab_mem.metric=1"
+	uci set "mwan3.$_ab_mem.weight=1"
+	uci set "mwan3.$_ab_mem.isp_split=1"
+	uci -q delete "mwan3.$_ab_pol.use_member"
+	uci add_list "mwan3.$_ab_pol.use_member=$_ab_mem" ||
+		die "无法把成员 '$_ab_mem' 写入策略 '$_ab_pol'"
+
+	# 上一版 init 可能生成过别的成员名（例如策略改名后的残留）：
+	# 只删本策略命名空间内、带标记且不是当前成员的段。
+	_ab_san=$(printf '%s' "$_ab_pol" | sed 's/[^A-Za-z0-9_]/_/g')
+	for _ab_old in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=member$/\1/p'); do
+		# 必须精确到 _m<数字>：否则策略 wan 会误删策略 wan_only 的成员
+		# （isp_split_wan_only_m1 也以 isp_split_wan_ 开头）。
+		case "$_ab_old" in
+		isp_split_"$_ab_san"_m[0-9]*) ;;
+		*) continue ;;
+		esac
+		[ "$_ab_old" = "$_ab_mem" ] && continue
+		[ "$(uci -q get "mwan3.$_ab_old.isp_split" 2>/dev/null)" = "1" ] || continue
+		uci -q delete "mwan3.$_ab_old" &&
+			log "已移除策略 $_ab_pol 的旧成员段 $_ab_old"
+	done
+	return 0
+}
+
+# 清理带标记但已不在 ISP_TABLE 里的策略/成员（与 B-4 的 ipset 孤儿清理
+# 同一标记体系）。规则仍在引用 / 策略仍在引用的段一律保留并告警。
+_prune_orphan_policies() {
+	[ -f "$CFG_MWAN3" ] || return 0
+	_pop_keep=" $(_isp_policies | tr '\n' ' ') "
+	_pop_rule_refs=" "
+	for _pop_rsec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=rule$/\1/p'); do
+		for _pop_x in $(uci -q get "mwan3.$_pop_rsec.use_policy" 2>/dev/null); do
+			_pop_rule_refs="$_pop_rule_refs$_pop_x "
+		done
+	done
+
+	_pop_changed=0
+	for _pop_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
+		[ "$(uci -q get "mwan3.$_pop_sec.isp_split" 2>/dev/null)" = "1" ] || continue
+		case "$_pop_keep" in *" $_pop_sec "*) continue ;; esac
+		case "$_pop_rule_refs" in
+		*" $_pop_sec "*)
+			log "警告：孤儿策略段 $_pop_sec 仍被 mwan3 规则引用，保留"
+			continue
+			;;
+		esac
+		if uci -q delete "mwan3.$_pop_sec" 2>/dev/null; then
+			log "已清理孤儿策略段 $_pop_sec"
+			_pop_changed=1
+		else
+			log "警告：清理策略段 $_pop_sec 失败，保留"
+		fi
+	done
+
+	# 重新统计仍被任何策略引用的成员（包括用户自建的无标记策略）
+	_pop_refs=" "
+	for _pop_psec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
+		for _pop_x in $(uci -q get "mwan3.$_pop_psec.use_member" 2>/dev/null); do
+			_pop_refs="$_pop_refs$_pop_x "
+		done
+	done
+	for _pop_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=member$/\1/p'); do
+		[ "$(uci -q get "mwan3.$_pop_sec.isp_split" 2>/dev/null)" = "1" ] || continue
+		case "$_pop_refs" in *" $_pop_sec "*) continue ;; esac
+		if uci -q delete "mwan3.$_pop_sec" 2>/dev/null; then
+			log "已清理孤儿成员段 $_pop_sec"
+			_pop_changed=1
+		else
+			log "警告：清理成员段 $_pop_sec 失败，保留"
+		fi
+	done
+	[ "$_pop_changed" = "1" ] && uci -q commit mwan3 2>/dev/null
+	return 0
+}
+
+# 卸载：按 isp_split=1 标记删除 init 生成的 policy/member。
+_uninstall_policies() {
+	_up_np=0
+	_up_nm=0
+	for _up_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
+		[ "$(uci -q get "mwan3.$_up_sec.isp_split" 2>/dev/null)" = "1" ] || continue
+		uci -q delete "mwan3.$_up_sec" 2>/dev/null && _up_np=$((_up_np + 1))
+	done
+	# 仍被任何策略引用的成员不能删（删了 mwan3 会渲染失败）
+	_up_refs=" "
+	for _up_psec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=policy$/\1/p'); do
+		for _up_x in $(uci -q get "mwan3.$_up_psec.use_member" 2>/dev/null); do
+			_up_refs="$_up_refs$_up_x "
+		done
+	done
+	for _up_sec in $(uci -q show mwan3 2>/dev/null |
+		sed -n 's/^mwan3\.\([^=]*\)=member$/\1/p'); do
+		[ "$(uci -q get "mwan3.$_up_sec.isp_split" 2>/dev/null)" = "1" ] || continue
+		case "$_up_refs" in
+		*" $_up_sec "*)
+			log "警告：成员段 $_up_sec 仍被其它策略引用，保留"
+			continue
+			;;
+		esac
+		uci -q delete "mwan3.$_up_sec" 2>/dev/null && _up_nm=$((_up_nm + 1))
+	done
+	uci -q commit mwan3 2>/dev/null
+	[ "$_up_np" -gt 0 ] || [ "$_up_nm" -gt 0 ] &&
+		log "已删除 $_up_np 个带 isp_split 标记的策略段、$_up_nm 个成员段"
+	return 0
+}
+
+# init：发现接口 -> 为 ISP_TABLE 的每个策略绑定成员 -> 跑一次 plan 摘要
+cmd_init() {
+	INIT_ASSUME=0
+	INIT_BINDS=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--bind)
+			[ $# -ge 2 ] || die "--bind 需要参数 <策略>=<接口>"
+			_init_add_bind "$2"
+			shift 2
+			;;
+		--bind=*)
+			_init_add_bind "${1#--bind=}"
+			shift
+			;;
+		--assume-yes | -y)
+			INIT_ASSUME=1
+			shift
+			;;
+		-h | --help)
+			echo "用法: isp-split init [--bind <策略>=<接口>]... [--assume-yes]"
+			echo "  交互模式：逐个策略选择 mwan3 接口"
+			echo "  非交互：--bind 可重复；未绑定的策略在 --assume-yes 下按顺序自动分配"
+			return 0
+			;;
+		*)
+			die "未知参数: '$1'（用法: isp-split init [--bind <策略>=<接口>]... [--assume-yes]）"
+			;;
+		esac
+	done
+
+	command -v uci >/dev/null 2>&1 || die "未找到 uci 命令"
+	[ -f "$CFG_MWAN3" ] ||
+		die "找不到 $CFG_MWAN3：请先安装并启用 mwan3"
+
+	[ -n "$(_isp_policies)" ] ||
+		die "ISP_TABLE 没有引用任何策略，无需 init（请先配置 $CONF）"
+
+	_discover_ifaces
+	echo
+	if [ -z "$ISP_INIT_AVAIL" ]; then
+		die "没有可用的 mwan3 IPv4 接口（需要 enabled=1 且 family=ipv4）；请先在 MultiWAN 管理器里创建并启用 WAN 接口"
+	fi
+	echo "可绑定接口: $ISP_INIT_AVAIL"
+
+	# --bind 的策略必须真的在 ISP_TABLE 里，否则写入的段永远不会被 wire 使用
+	for _in_b in $INIT_BINDS; do
+		_in_pol=${_in_b%%=*}
+		_in_found=0
+		for _in_p in $(_isp_policies); do
+			[ "$_in_p" = "$_in_pol" ] && _in_found=1
+		done
+		[ "$_in_found" = "1" ] ||
+			die "--bind 的策略 '$_in_pol' 不在 ISP_TABLE 中（可用: $(_isp_policies | tr '\n' ' ')）"
+	done
+
+	# 没有 --bind 覆盖全部策略且不是 --assume-yes 时，必须有终端可交互
+	_need_prompt=0
+	_idx=0
+	for _in_pol in $(_isp_policies); do
+		_idx=$((_idx + 1))
+		_init_bound_iface "$_in_pol" >/dev/null 2>&1 || _need_prompt=1
+	done
+	if [ "$_need_prompt" = "1" ] && [ "$INIT_ASSUME" != "1" ] && [ ! -t 0 ]; then
+		die "当前不是交互终端：请用 --bind <策略>=<接口>（可重复）或 --assume-yes"
+	fi
+
+	# 成员段名由策略名派生（非 [A-Za-z0-9_] 统一换成 _）。策略名允许
+	# 连字符，所以 wan-only 与 wan_only 会撞成同一个成员段名——提前拦住。
+	_in_members=" "
+	for _in_pol in $(_isp_policies); do
+		_in_m=$(_init_member_name "$_in_pol")
+		case "$_in_members" in
+		*" $_in_m "*)
+			die "策略名冲突：多个策略会生成同名成员段 '$_in_m'，请改名后重试"
+			;;
+		esac
+		_in_members="$_in_members$_in_m "
+	done
+
+	echo
+	echo "== 将写入的绑定"
+	# uci set 只写暂存区，commit 才落盘。中途 die 必须把暂存区撤掉，
+	# 否则半套策略会留在 /tmp/.uci/mwan3，被下一次无关的 uci commit 带进配置。
+	INIT_DIRTY=0
+	_init_cleanup() {
+		[ "${INIT_DIRTY:-0}" = "1" ] && uci -q revert mwan3 2>/dev/null
+	}
+	trap _init_cleanup EXIT INT TERM
+	INIT_DIRTY=1
+	_idx=0
+	for _in_pol in $(_isp_policies); do
+		_idx=$((_idx + 1))
+		if _in_if=$(_init_bound_iface "$_in_pol"); then
+			:
+		elif [ "$INIT_ASSUME" = "1" ]; then
+			_in_if=$(_nth_iface "$_idx") ||
+				die "没有可用接口可分配给策略 '$_in_pol'"
+		else
+			_in_def=$(_nth_iface "$_idx") || _in_def=""
+			_in_if=$(_prompt_iface "$_in_pol" "$_in_def")
+		fi
+		_iface_in_avail "$_in_if" ||
+			die "接口 '$_in_if' 不在可绑定列表内（可用: $ISP_INIT_AVAIL）"
+		printf '  %-14s -> %-10s [成员 %s]\n' \
+			"$_in_pol" "$_in_if" "$(_init_member_name "$_in_pol")"
+		_init_apply_bind "$_in_pol" "$_in_if"
+	done
+
+	uci commit mwan3 || die "写入 mwan3 配置失败（暂存区已回滚）"
+	INIT_DIRTY=0
+	trap - EXIT INT TERM
+	log "已写入 mwan3 策略/成员（isp_split=1 标记）"
+
+	_prune_orphan_policies
+
+	echo
+	echo "== init 完成，以下为 plan 摘要"
+	cmd_plan
+}
+
+# 把 --bind 参数追加到 INIT_BINDS；策略不允许重复绑定
+_init_add_bind() {
+	case "$1" in
+	*=*) ;;
+	*) die "--bind 参数格式应为 <策略>=<接口>（当前: '$1'）" ;;
+	esac
+	_ib_pol=${1%%=*}
+	_ib_if=${1#*=}
+	[ -n "$_ib_pol" ] && [ -n "$_ib_if" ] ||
+		die "--bind 的策略和接口都不能为空（当前: '$1'）"
+	case " $INIT_BINDS " in
+	*" $_ib_pol="*) die "策略 '$_ib_pol' 重复绑定（每次 init 每个策略只能绑定一条线路）" ;;
+	esac
+	INIT_BINDS="${INIT_BINDS:+$INIT_BINDS }$_ib_pol=$_ib_if"
+}
+
+_init_bound_iface() {
+	for _ib_b in $INIT_BINDS; do
+		[ "${_ib_b%%=*}" = "$1" ] || continue
+		printf '%s\n' "${_ib_b#*=}"
+		return 0
+	done
+	return 1
+}
+
+# 机器可读的策略状态（LuCI 首装提示条用）
+cmd_policy_check() {
+	_pk_json=0
+	[ "${1:-}" = "--json" ] && _pk_json=1
+	_pk_ok=1
+	_pk_rows=""
+	_pk_json_rows=""
+	for _pk_pol in $(_isp_policies); do
+		_pk_msg=$(_policy_problem "$_pk_pol")
+		if [ -n "$_pk_msg" ]; then
+			_pk_ok=0
+			_pk_rows="${_pk_rows}  ✗ $_pk_pol: $_pk_msg
+"
+			_pk_json_rows="${_pk_json_rows}${_pk_json_rows:+,}{\"name\":\"$(_lc_json_esc "$_pk_pol")\",\"ok\":false,\"detail\":\"$(_lc_json_esc "$_pk_msg")\"}"
+		else
+			_pk_rows="${_pk_rows}  ✓ $_pk_pol: $(_policy_desc "$_pk_pol")
+"
+			_pk_json_rows="${_pk_json_rows}${_pk_json_rows:+,}{\"name\":\"$(_lc_json_esc "$_pk_pol")\",\"ok\":true,\"detail\":\"$(_lc_json_esc "$(_policy_desc "$_pk_pol")")\"}"
+		fi
+	done
+	if [ "$_pk_json" = "1" ]; then
+		printf '{"ok":%s,"policies":[%s]}\n' \
+			"$([ "$_pk_ok" = "1" ] && printf true || printf false)" "$_pk_json_rows"
+	else
+		echo "== 策略存在且有成员（wire 渲染前置条件）"
+		printf '%s' "$_pk_rows"
+		[ "$_pk_ok" = "1" ] ||
+			echo "  运行 isp-split init 绑定线路"
+	fi
+	return 0
+}
+
 cmd_wire() {
 	_openclash_fakeip_warn
 	need_nft
 	# 先确认 work 目录可写再动 UCI：否则可能 commit 了 ipset 段之后才发现
 	# 写不了规则片段，留下半套配置。
 	_work_writable || die "work 目录不可写（$WORK）：无法写入规则片段，配置未改动"
+
+	# 0. 策略预检（BUG-25）：必须在动 UCI/nft 之前。mwan3 对"策略不存在"
+	# 和"策略成员为空"都是静默跳过整条规则，事后 verify 只看到规则没渲染，
+	# 根因看不出来。这里硬失败，并给出唯一正确的下一步。
+	_precheck_policies ||
+		die "策略预检失败：上面的策略在 mwan3 中缺失或没有可用成员，规则无法正确渲染（本次未改动任何配置）。运行 isp-split init 绑定线路后重试"
 
 	# 1. 集合声明
 	_wire_all() { _wire_ipset "$1" "$2"; }
@@ -1732,13 +2319,6 @@ cmd_wire() {
 	# "规则已注入" 让人以为一切正常。
 	[ -s "$WORK/rules.txt" ] ||
 		log "警告：ISP_TABLE 中没有启用的运营商，本次规则块为空（已有 isp-split 规则将被移除）"
-
-	# 校验策略是否存在，避免生成指向不存在策略的规则
-	_pol_exists() {
-		uci -q get "mwan3.$3" >/dev/null 2>&1 ||
-			die "mwan3 中不存在策略 '$3'，请先在 MultiWAN 管理器里创建，或修改 $CONF"
-	}
-	foreach_enabled _pol_exists
 
 	# 4. 插入到正确位置
 	cp "$CFG_MWAN3" "$WORK/mwan3.bak" ||
@@ -1765,9 +2345,11 @@ cmd_wire() {
 
 	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
 	log "规则已注入（备份: $WORK/mwan3.bak）"
-	# 5. 收敛孤儿 ipset 段：必须放在规则块重写之后 —— 改名时旧规则
-	# 这一刻才消失；若在注入前做，旧规则仍引用旧段，会被误判成"保留"。
+	# 5. 收敛孤儿 ipset / policy / member 段：必须放在规则块重写之后 ——
+	# 改名时旧规则这一刻才消失；若在注入前做，旧规则仍引用旧段，会被
+	# 误判成"保留"。
 	_prune_orphan_ipsets
+	_prune_orphan_policies
 	/etc/init.d/mwan3 reload
 	_fallback_counter ||
 		log "警告：兜底计数规则未安装成功（status 的兜底行会缺失或为旧值），可稍后重跑 isp-split apply"
@@ -1860,6 +2442,20 @@ cmd_verify() {
 	foreach_enabled _vf
 
 	echo
+	echo "== 策略存在且有成员（wire 渲染前置条件，BUG-25）"
+	_vp_any=0
+	for _vp_pol in $(_isp_policies); do
+		_vp_any=1
+		_vp_msg=$(_policy_problem "$_vp_pol")
+		if [ -n "$_vp_msg" ]; then
+			echo "  ✗ $_vp_pol: $_vp_msg"
+		else
+			echo "  ✓ $_vp_pol: $(_policy_desc "$_vp_pol")"
+		fi
+	done
+	[ "$_vp_any" = "1" ] || echo "  （ISP_TABLE 没有引用任何策略）"
+
+	echo
 	# 运行时规则自检：mwan3 重启会清掉 apply/dns 运行时插入的规则
 	if ! _dns_chain_ok && [ -n "${DNS_TABLE:-}" ]; then
 		echo "⚠ DNS 旁路规则缺失（mwan3 重启会清掉运行时插入的规则）"
@@ -1899,6 +2495,10 @@ _dnsmasq_nftset() {
 # 只读预演：不写任何文件、不发任何 uci/nft 改动。
 cmd_plan() {
 	_openclash_fakeip_warn
+	# 预检放在最前面：策略缺失时后面的"预演"全是假的（mwan3 会把整条
+	# 规则静默丢掉），必须先让用户看到根因（BUG-25）。
+	_precheck_policies ||
+		die "策略预检失败：上面的策略在 mwan3 中缺失或没有可用成员，预演结果不可信。运行 isp-split init 绑定线路后重试"
 	echo "== openwrt-isp-split 预演（不做任何改动）"
 	echo
 	printf '%-14s %-14s %-12s %8s %10s\n' "集合" "来源" "策略" "条目" "状态"
@@ -3893,6 +4493,8 @@ cmd_uninstall() {
 
 	# 按标记删，而不是按当前表名：改名/删除的孤儿段也要清掉（B-4）。
 	_uninstall_ipsets
+	# init 生成的 policy/member 同样按 isp_split 标记删；无标记段不碰。
+	_uninstall_policies
 	/etc/init.d/mwan3 reload >/dev/null 2>&1
 
 	# 恢复 dnsmasq confdir 原值（状态文件在 $BASE 里，必须先恢复再删目录）
@@ -5906,6 +6508,7 @@ fetch) cmd_fetch ;;
 diff) shift; cmd_diff "$@" ;;
 dnstest) shift; cmd_dnstest "$@" ;;
 apply) cmd_apply ;;
+init) shift; cmd_init "$@" ;;
 wire) cmd_wire ;;
 sync) cmd_sync ;;
 plan) cmd_plan ;;
@@ -5914,6 +6517,7 @@ selftest) cmd_selftest ;;
 stage) cmd_stage ;;
 enable) cmd_enable ;;
 verify) cmd_verify ;;
+policy-check) shift; cmd_policy_check "$@" ;;
 status) shift; cmd_status "$@" ;;
 health) shift; cmd_health "$@" ;;
 probe) cmd_probe ;;
@@ -5939,14 +6543,17 @@ uninstall) cmd_uninstall ;;
   diff       重新计算"主源 vs 校验源"的分歧（基于存档，不联网；超阈值返回 3）
   rollback   回滚到上一份数据
 
-  —— 上线（建议分两步）——
+  —— 首次安装 / 上线（建议分两步）——
+  init       发现 mwan3 接口，为 ISP_TABLE 的每个策略创建 policy/member
+             交互选择接口；或 --bind <策略>=<接口>（可重复）--assume-yes
   stage      注入规则但保持 enabled=0，验证 mwan3 未被搞坏
   enable     确认无误后真正启用
-  verify     检查规则链渲染结果与命中情况
+  verify     检查规则链渲染结果、策略成员与命中情况
+  policy-check  检查 ISP_TABLE 引用的策略是否都有成员（--json 给 LuCI 用）
 
   —— 其他 ——
   apply      原子刷入 nftables 集合（不断流、不重启 mwan3）
-  wire       建立 mwan3 集合与规则并插到正确位置
+  wire       建立 mwan3 集合与规则并插到正确位置（策略缺失会硬失败）
   conf       读写配置：conf get | conf set <项> <值>
              conf check <项> <值>（只校验）| conf preview <项> <值> ...（预演未保存的改动）
   dnstest    测一条线路的 DNS 是否可用：dnstest <策略名>

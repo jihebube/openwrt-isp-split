@@ -634,7 +634,7 @@ _bug78_user="$FIX/mwan3_rules.user-policy.nft"
 # BUG-7：链首用户 saddr 规则不是 catch-all，4 条 @isp 规则必须全 ✓。
 _bug78_out=$(_bug78_run "$_bug78_prod" "$_bug78_child" present cmd_verify)
 _bug78_yes=$(printf '%s\n' "$_bug78_out" | grep -c '✓ @isp_')
-_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗')
+_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗ @isp_')
 if [ "$_bug78_yes" -eq 4 ] && [ "$_bug78_no" -eq 0 ]; then
 	ok "真实链形状下 verify 4 条 @isp 规则全部 ✓"
 else
@@ -646,7 +646,7 @@ fi
 # 误判到它之后（“纯 mark 条件”才属于无条件兜底）。
 _bug78_out=$(_bug78_run "$_bug78_user" "$_bug78_child" present cmd_verify)
 _bug78_yes=$(printf '%s\n' "$_bug78_out" | grep -c '✓ @isp_')
-_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗')
+_bug78_no=$(printf '%s\n' "$_bug78_out" | grep -c '✗ @isp_')
 if [ "$_bug78_yes" -eq 4 ] && [ "$_bug78_no" -eq 0 ]; then
 	ok "用户 tcp dport policy 规则不被误判为 catch-all"
 else
@@ -1243,6 +1243,22 @@ echo "== 12. 多数据源管线（0.2.1 默认双源）"
 
 MS=$TMP/ms
 mkdir -p "$MS/bin" "$MS/mirror/ispip.clang.cn" "$MS/mirror/china-operator-ip.yfgao.com"
+# BUG-25 起 plan 会预检策略成员；section 12 只关心数据源部分，给一组
+# 最小可用的假 uci，避免把“VM 上有没有 mwan3 策略”混进数据管线用例。
+cat > "$MS/bin/uci" <<'MS_UCI'
+#!/bin/sh
+case "$*" in
+*"get mwan3.wan_only.use_member"*) echo ms_wan; exit 0 ;;
+*"get mwan3.wanb_only.use_member"*) echo ms_wanb; exit 0 ;;
+*"get mwan3.ms_wan.interface"*) echo wan1; exit 0 ;;
+*"get mwan3.ms_wanb.interface"*) echo wan2; exit 0 ;;
+*"get mwan3.ms_wan"* | *"get mwan3.ms_wanb"*) echo member; exit 0 ;;
+*"get mwan3.wan1"* | *"get mwan3.wan2"*) echo interface; exit 0 ;;
+*"get mwan3.wan_only"* | *"get mwan3.wanb_only"*) echo policy; exit 0 ;;
+esac
+exit 1
+MS_UCI
+chmod +x "$MS/bin/uci"
 cat > "$MS/bin/uclient-fetch" <<'MS_FETCH'
 #!/bin/sh
 out=""; url=""
@@ -1828,8 +1844,11 @@ if [ "$(id -u)" -eq 0 ] && [ -n "$_nft_bin" ] && command -v nslookup >/dev/null 
 		_fb_r=$(_fb_pkt r)
 		_fb_re=$(_fb_pkt re)
 		"$_nft_bin" delete table inet "$FB_T" >/dev/null 2>&1 || true
-		if [ "${_fb_q:-0}" -eq 0 ] && [ "${_fb_r:-0}" -eq 0 ]; then
-			echo "  - 跳过真 nft 语义测试：127.0.0.1:53 无 DNS 响应"
+		# 只有"查询和响应都真实发生"时才能验证排除语义。VM 上 dnsmasq
+		# 未监听 127.0.0.1:53、或响应被防火墙丢掉时 r=0，这是环境不可用，
+		# 不是排除规则错误——跳过，不要误报失败。
+		if [ "${_fb_q:-0}" -eq 0 ] || [ "${_fb_r:-0}" -eq 0 ]; then
+			echo "  - 跳过真 nft 语义测试：127.0.0.1:53 无完整 DNS 查询/响应（q=$_fb_q r=$_fb_r）"
 		elif [ "${_fb_q:-0}" -gt 0 ] && [ "${_fb_r:-0}" -gt 0 ] &&
 		     [ "${_fb_qe:-0}" -eq 0 ] && [ "${_fb_re:-0}" -eq 0 ]; then
 			ok "真 nft：DNS 查询(q=$_fb_q)与响应(r=$_fb_r)均被双侧排除计数(${_fb_qe}/${_fb_re})"
@@ -2012,7 +2031,15 @@ exit 0
 FAKE_NFT_B123
 cat > "$B123/bin/uci" <<'FAKE_UCI_B123'
 #!/bin/sh
+# BUG-25 起 plan 会预检策略成员：这里提供一组最小可用的 policy/member。
 case "$*" in
+*"get mwan3.wan_only.use_member"*) echo wan_m1_w3; exit 0 ;;
+*"get mwan3.wanb_only.use_member"*) echo wanb_m1_w2; exit 0 ;;
+*"get mwan3.wan_m1_w3.interface"*) echo wan1; exit 0 ;;
+*"get mwan3.wanb_m1_w2.interface"*) echo wan2; exit 0 ;;
+*"get mwan3.wan_m1_w3"* | *"get mwan3.wanb_m1_w2"*) echo member; exit 0 ;;
+*"get mwan3.wan1"* | *"get mwan3.wan2"*) echo interface; exit 0 ;;
+*"get mwan3.wan_only"* | *"get mwan3.wanb_only"*) echo policy; exit 0 ;;
 *"show mwan3"*)
 	printf 'mwan3.wan_only=policy\nmwan3.wanb_only=policy\n'
 	exit 0
@@ -2636,6 +2663,409 @@ if [ -z "$(ls -d "$LCBASE"/state/linecheck.tmp.* 2>/dev/null)" ]; then
 	ok "state 目录干净：没有任何 linecheck.tmp.* 残留"
 else
 	ng "state 目录仍有 tmp 残留：$(ls -d "$LCBASE"/state/linecheck.tmp.* 2>/dev/null | tr '\n' ' ')"
+fi
+
+echo "== 17. BUG-25 首装绑定策略（init / wire 预检 / verify / uninstall）"
+B25=$TMP/b25
+mkdir -p "$B25/bin" "$B25/tmp"
+cat > "$B25/bin/uci" <<'FAKE_UCI_B25'
+#!/bin/sh
+S=${FAKE_UCI_STATE:?}
+[ "$1" = "-q" ] && shift
+[ "$1" = "-c" ] && shift 2
+cmd=$1
+shift
+split_path() {
+	P=$1
+	CFG=${P%%.*}
+	REST=${P#*.}
+	SEC=${REST%%.*}
+	OPT=""
+	[ "$REST" != "$SEC" ] && OPT=${REST#*.}
+}
+case "$cmd" in
+show)
+	[ "${1:-}" = "mwan3" ] || exit 1
+	cat "$S/show" 2>/dev/null
+	exit 0
+	;;
+get)
+	split_path "$1"
+	if [ "$CFG" = "mwan3" ]; then
+		if [ -z "$OPT" ]; then
+			grep -q "^mwan3\.$SEC=" "$S/show" 2>/dev/null || exit 1
+			sed -n "s/^mwan3\.$SEC=//p" "$S/show" | head -1
+			exit 0
+		fi
+		[ -f "$S/data/$SEC.$OPT" ] || exit 1
+		tr '\n' ' ' < "$S/data/$SEC.$OPT" | sed 's/ $//'
+		exit 0
+	fi
+	if [ "$CFG" = "network" ]; then
+		if [ -z "$OPT" ]; then
+			[ -f "$S/net/$SEC.type" ] || exit 1
+			cat "$S/net/$SEC.type"
+			exit 0
+		fi
+		[ -f "$S/net/$SEC.$OPT" ] || exit 1
+		cat "$S/net/$SEC.$OPT"
+		exit 0
+	fi
+	exit 1
+	;;
+set)
+	split_path "${1%%=*}"
+	VAL=${1#*=}
+	[ "$CFG" = "mwan3" ] || exit 1
+	if [ -z "$OPT" ]; then
+		grep -q "^mwan3\.$SEC=" "$S/show" 2>/dev/null ||
+			echo "mwan3.$SEC=$VAL" >> "$S/show"
+	else
+		printf '%s\n' "$VAL" > "$S/data/$SEC.$OPT"
+	fi
+	exit 0
+	;;
+add_list)
+	split_path "${1%%=*}"
+	VAL=${1#*=}
+	[ "$CFG" = "mwan3" ] || exit 1
+	[ -n "$OPT" ] || exit 1
+	printf '%s\n' "$VAL" >> "$S/data/$SEC.$OPT"
+	exit 0
+	;;
+delete)
+	split_path "$1"
+	[ "$CFG" = "mwan3" ] || exit 1
+	if [ -z "$OPT" ]; then
+		rm -f "$S/data/$SEC".*
+		grep -v "^mwan3\.$SEC=" "$S/show" > "$S/show.new" 2>/dev/null
+		mv "$S/show.new" "$S/show"
+	else
+		rm -f "$S/data/$SEC.$OPT"
+	fi
+	exit 0
+	;;
+commit)
+	echo commit >> "$S/commit.log"
+	exit 0
+	;;
+revert)
+	echo revert >> "$S/revert.log"
+	exit 0
+	;;
+esac
+exit 1
+FAKE_UCI_B25
+cat > "$B25/bin/nft" <<'FAKE_NFT_B25'
+#!/bin/sh
+[ "$1" = "-a" ] && shift
+cmd=$1
+shift
+case "$cmd" in
+list)
+	case "$*" in
+	"table inet mwan3") exit 0 ;;
+	"chain inet mwan3 mwan3_rules")
+		echo "table inet mwan3 {"
+		echo "	chain mwan3_rules {"
+		echo "		ip daddr @isp_tel meta mark & 0x00003f00 == 0x00000000 jump mwan3_policy_wan_only"
+		echo "	}"
+		echo "}"
+		exit 0
+		;;
+	"chain inet mwan3 mwan3_output") exit 0 ;;
+	"counter inet mwan3 isp_fallback")
+		echo 'counter isp_fallback { packets 0 bytes 0 }'
+		exit 0
+		;;
+	*) exit 1 ;;
+	esac
+	;;
+esac
+exit 0
+FAKE_NFT_B25
+chmod +x "$B25/bin/uci" "$B25/bin/nft"
+
+cat > "$B25/conf" <<'B25_CONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+cmcc:isp_cmcc:wanb_only:0
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+B25_CONF
+cat > "$B25/conf-protect" <<'B25_CONF2'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+cmcc:isp_cmcc:isp_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+B25_CONF2
+cp "$FIX/mwan3" "$B25/mwan3"
+
+b25_iface() { # <state> <name> <enabled> <proto> <device>
+	echo "mwan3.$2=interface" >> "$1/show"
+	printf '%s\n' "$3" > "$1/data/$2.enabled"
+	printf 'ipv4\n' > "$1/data/$2.family"
+	printf 'interface\n' > "$1/net/$2.type"
+	printf '%s\n' "$4" > "$1/net/$2.proto"
+	printf '%s\n' "$5" > "$1/net/$2.device"
+}
+
+b25_reset() { # <state> [with-disabled-defaults]
+	rm -rf "$1"
+	mkdir -p "$1/data" "$1/net"
+	: > "$1/show"
+	: > "$1/commit.log"
+	b25_iface "$1" wan1 1 static wan1
+	b25_iface "$1" wan2 1 pppoe eth2
+	if [ "${2:-}" = "defaults" ]; then
+		b25_iface "$1" wan 0 dhcp eth0
+		b25_iface "$1" wanb 0 dhcp eth1
+	fi
+}
+
+b25_policy() { # <state> <policy> <member> <iface> [marked]
+	echo "mwan3.$2=policy" >> "$1/show"
+	echo "mwan3.$2.use_member=$3" >> "$1/show"
+	echo "mwan3.$3=member" >> "$1/show"
+	echo "$3" > "$1/data/$2.use_member"
+	printf '%s\n' "$4" > "$1/data/$3.interface"
+	if [ "${5:-}" = "marked" ]; then
+		echo 1 > "$1/data/$2.isp_split"
+		echo 1 > "$1/data/$3.isp_split"
+	fi
+	return 0
+}
+
+b25_run() { # <state> <conf> <args...>
+	_b25_st=$1
+	_b25_cf=$2
+	shift 2
+	(
+		PATH="$B25/bin:$PATH"
+		TMPDIR="$B25/tmp"
+		FAKE_UCI_STATE="$_b25_st"
+		ISP_SPLIT_CONF="$_b25_cf"
+		ISP_SPLIT_BASE="$B25/base"
+		ISP_SPLIT_LIB="$LIB"
+		ISP_SPLIT_MWAN3="$B25/mwan3"
+		DNSMASQ_CONF_GLOB="$B25/no-such-dnsmasq.conf.*"
+		DNSMASQ_DEFAULT_DIR="$B25/dnsmasq.d"
+		export PATH TMPDIR FAKE_UCI_STATE ISP_SPLIT_CONF ISP_SPLIT_BASE \
+			ISP_SPLIT_LIB ISP_SPLIT_MWAN3 DNSMASQ_CONF_GLOB DNSMASQ_DEFAULT_DIR
+		sh "$ROOT/files/usr/sbin/isp-split" "$@"
+	)
+}
+
+b25_lib() { # <state> <conf> <function> [args]
+	_b25_st=$1
+	_b25_cf=$2
+	shift 2
+	(
+		PATH="$B25/bin:$PATH"
+		TMPDIR="$B25/tmp"
+		FAKE_UCI_STATE="$_b25_st"
+		ISP_SPLIT_CONF="$_b25_cf"
+		ISP_SPLIT_BASE="$B25/base"
+		ISP_SPLIT_LIB="$LIB"
+		ISP_SPLIT_MWAN3="$B25/mwan3"
+		export PATH TMPDIR FAKE_UCI_STATE ISP_SPLIT_CONF ISP_SPLIT_BASE \
+			ISP_SPLIT_LIB ISP_SPLIT_MWAN3
+		. "$TMP/isp-lib.sh"
+		"$@"
+	)
+}
+
+# ---- 17.1 干净环境：wire/plan 必须硬失败并提示 init ----
+b25_reset "$B25/s1" defaults
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_run "$B25/s1" "$B25/conf" wire > "$B25/wire-missing.log" 2>&1
+_b25_rc=$?
+if [ "$_b25_rc" -ne 0 ] &&
+   grep -q "策略 'wan_only' 不存在于 mwan3" "$B25/wire-missing.log" &&
+   grep -q '运行 isp-split init 绑定线路' "$B25/wire-missing.log"; then
+	ok "17.1 策略缺失时 wire 硬失败并提示 isp-split init（rc=$_b25_rc）"
+else
+	ng "17.1 wire 未按预期硬失败/提示（rc=$_b25_rc）"
+	sed 's/^/    /' "$B25/wire-missing.log"
+fi
+if ! grep -q '^mwan3.wan_only=' "$B25/s1/show"; then
+	ok "17.1 预检失败发生在写 UCI 之前（未产生半套策略段）"
+else
+	ng "17.1 预检失败后仍写入了策略段"
+fi
+
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_run "$B25/s1" "$B25/conf" plan > "$B25/plan-missing.log" 2>&1
+_b25_rc=$?
+if [ "$_b25_rc" -ne 0 ] && grep -q '运行 isp-split init 绑定线路' "$B25/plan-missing.log"; then
+	ok "17.2 策略缺失时 plan 硬失败并提示 init（rc=$_b25_rc）"
+else
+	ng "17.2 plan 未按预期硬失败/提示（rc=$_b25_rc）"
+	sed 's/^/    /' "$B25/plan-missing.log"
+fi
+
+# ---- 17.3 init 非交互绑定：接口发现 + policy/member 标记 ----
+b25_reset "$B25/s2" defaults
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_run "$B25/s2" "$B25/conf" init \
+	--bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes \
+	> "$B25/init.log" 2>&1
+_b25_rc=$?
+_b25_disc_ok=0
+grep -q 'mwan3 接口发现' "$B25/init.log" &&
+	grep -q 'wan2.*pppoe.*eth2' "$B25/init.log" &&
+	grep -q 'wan1.*static.*wan1' "$B25/init.log" && _b25_disc_ok=1
+if [ "$_b25_rc" -eq 0 ] && [ "$_b25_disc_ok" = "1" ] &&
+   grep -q '^mwan3.wan_only=policy$' "$B25/s2/show" &&
+   grep -q '^mwan3.isp_split_wan_only_m1=member$' "$B25/s2/show" &&
+   [ "$(cat "$B25/s2/data/isp_split_wan_only_m1.interface")" = "wan1" ] &&
+   [ "$(cat "$B25/s2/data/isp_split_wanb_only_m1.interface")" = "wan2" ] &&
+   [ "$(cat "$B25/s2/data/wan_only.isp_split")" = "1" ] &&
+   [ "$(cat "$B25/s2/data/isp_split_wan_only_m1.isp_split")" = "1" ] &&
+   [ "$(cat "$B25/s2/data/wan_only.use_member")" = "isp_split_wan_only_m1" ]; then
+	ok "17.3 init 发现接口并生成带 isp_split 标记的 policy/member（接口对应正确）"
+else
+	ng "17.3 init 生成结果异常（rc=$_b25_rc，发现清单=$_b25_disc_ok）"
+	sed 's/^/    /' "$B25/init.log" | head -30
+fi
+if grep -q '== init 完成，以下为 plan 摘要' "$B25/init.log" &&
+   grep -q '^isp_tel' "$B25/init.log"; then
+	ok "17.4 init 结束后自动输出 plan 摘要"
+else
+	ng "17.4 init 未自动输出 plan 摘要"
+fi
+
+# ---- 17.5 init 后 wire 通过、verify 有策略检查行 ----
+b25_run "$B25/s2" "$B25/conf" wire > "$B25/wire-ok.log" 2>&1
+_b25_rc=$?
+if [ "$_b25_rc" -eq 0 ] && grep -q '规则已注入' "$B25/wire-ok.log"; then
+	ok "17.5 init 后 wire 通过（rc=0）"
+else
+	ng "17.5 init 后 wire 仍失败（rc=$_b25_rc）"
+	sed 's/^/    /' "$B25/wire-ok.log"
+fi
+b25_run "$B25/s2" "$B25/conf" verify > "$B25/verify.log" 2>&1
+if grep -q '== 策略存在且有成员' "$B25/verify.log" &&
+   grep -q '✓ wan_only: isp_split_wan_only_m1(wan1)' "$B25/verify.log" &&
+   grep -q '✓ wanb_only: isp_split_wanb_only_m1(wan2)' "$B25/verify.log"; then
+	ok "17.5 verify 新增策略检查行并显示 ✓（策略存在且有成员）"
+else
+	ng "17.5 verify 策略检查行缺失或未显示 ✓"
+	sed 's/^/    /' "$B25/verify.log" | sed -n '/策略存在且有成员/,/策略成员状态/p'
+fi
+
+# ---- 17.6 幂等：复跑 init 不产生重复 policy/member ----
+cp "$B25/s2/show" "$B25/show.before"
+b25_run "$B25/s2" "$B25/conf" init \
+	--bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes \
+	> "$B25/init-again.log" 2>&1
+_b25_rc=$?
+_b25_pol=$(grep -c '=policy$' "$B25/s2/show")
+_b25_mem=$(grep -c '=member$' "$B25/s2/show")
+if [ "$_b25_rc" -eq 0 ] && [ "$_b25_pol" -eq 2 ] && [ "$_b25_mem" -eq 2 ] &&
+   cmp -s "$B25/show.before" "$B25/s2/show" &&
+   [ "$(wc -l < "$B25/s2/data/wan_only.use_member" | tr -d ' ')" = "1" ]; then
+	ok "17.6 复跑 init 幂等（policy=$_b25_pol member=$_b25_mem，无重复段）"
+else
+	ng "17.6 复跑 init 产生重复段/差异（rc=$_b25_rc policy=$_b25_pol member=$_b25_mem）"
+	diff "$B25/show.before" "$B25/s2/show" | sed 's/^/    /'
+fi
+
+# ---- 17.7 无标记同名段保护：报错且不覆盖 ----
+b25_reset "$B25/s3"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s3" isp_only isp_only_m1 wan1
+b25_run "$B25/s3" "$B25/conf-protect" init \
+	--bind wan_only=wan1 --bind wanb_only=wan2 --bind isp_only=wan1 --assume-yes \
+	> "$B25/init-protect.log" 2>&1
+_b25_rc=$?
+if [ "$_b25_rc" -ne 0 ] &&
+   grep -q "已存在同名策略 'isp_only' 且没有 isp_split 标记" "$B25/init-protect.log" &&
+   [ ! -f "$B25/s3/data/isp_only.isp_split" ] &&
+   [ "$(cat "$B25/s3/data/isp_only.use_member")" = "isp_only_m1" ] &&
+   [ "$(cat "$B25/s3/data/isp_only_m1.interface")" = "wan1" ]; then
+	ok "17.7 无标记同名策略报错且未被覆盖（isp_only 保持原成员）"
+else
+	ng "17.7 无标记同名策略保护失败（rc=$_b25_rc）"
+	sed 's/^/    /' "$B25/init-protect.log" | tail -8
+fi
+
+# ---- 17.8 孤儿策略/成员清理：带标记且不再被 ISP_TABLE 引用才删 ----
+b25_reset "$B25/s4"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s4" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s4" old_pol old_m1 wan1 marked
+b25_policy "$B25/s4" used_pol used_m1 wan1 marked
+b25_policy "$B25/s4" user_pol user_m1 wan2
+echo "mwan3.rule_keep=rule" >> "$B25/s4/show"
+echo "used_pol" > "$B25/s4/data/rule_keep.use_policy"
+b25_lib "$B25/s4" "$B25/conf" _prune_orphan_policies > "$B25/prune-pol.log" 2>&1
+_b25_left=$(grep '=policy$' "$B25/s4/show" | sed 's/^mwan3\.//; s/=policy$//' | tr '\n' ' ')
+if [ "$_b25_left" = "wan_only used_pol user_pol " ] &&
+   grep -q '已清理孤儿策略段 old_pol' "$B25/prune-pol.log" &&
+   grep -q '仍被 mwan3 规则引用，保留' "$B25/prune-pol.log" &&
+   ! grep -q '^mwan3.old_m1=' "$B25/s4/show" &&
+   grep -q '^mwan3.user_pol=' "$B25/s4/show"; then
+	ok "17.8 只清理带标记且无引用的孤儿策略/成员（保留被规则引用与无标记段）"
+else
+	ng "17.8 孤儿策略清理结果异常: [$_b25_left]"
+	sed 's/^/    /' "$B25/prune-pol.log"
+fi
+
+# ---- 17.9 uninstall 按标记删 policy/member，无标记段不动 ----
+b25_policy "$B25/s4" keep_pol keep_m1 wan2
+b25_lib "$B25/s4" "$B25/conf" _uninstall_policies > "$B25/uninstall-pol.log" 2>&1
+_b25_left=$(grep '=policy$' "$B25/s4/show" | sed 's/^mwan3\.//; s/=policy$//' | tr '\n' ' ')
+if [ "$_b25_left" = "user_pol keep_pol " ] &&
+   ! grep -q '^mwan3.isp_split_' "$B25/s4/show" &&
+   grep -q '^mwan3.keep_m1=' "$B25/s4/show"; then
+	ok "17.9 uninstall 按 isp_split 标记删除 init 段，无标记策略/成员保持不动"
+else
+	ng "17.9 uninstall 后残留异常: [$_b25_left]"
+	sed 's/^/    /' "$B25/uninstall-pol.log"
+fi
+
+# ---- 17.10 policy-check --json：LuCI 首装提示条的数据源 ----
+b25_reset "$B25/s5"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_run "$B25/s5" "$B25/conf" policy-check --json > "$B25/pc-missing.json" 2>&1
+_b25_missing=$(cat "$B25/pc-missing.json")
+b25_run "$B25/s5" "$B25/conf" init \
+	--bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes >/dev/null 2>&1
+b25_run "$B25/s5" "$B25/conf" policy-check --json > "$B25/pc-ok.json" 2>&1
+_b25_ok=$(cat "$B25/pc-ok.json")
+if printf '%s' "$_b25_missing" | grep -q '"ok":false' &&
+   printf '%s' "$_b25_missing" | grep -q '"name":"wan_only"' &&
+   printf '%s' "$_b25_ok" | grep -q '"ok":true'; then
+	ok "17.10 policy-check --json 正确报告缺失/已绑定（供 LuCI 提示条）"
+else
+	ng "17.10 policy-check --json 输出异常"
+	printf '%s\n' "$_b25_missing" "$_b25_ok" | sed 's/^/    /'
+fi
+
+# ---- 17.11 --assume-yes 无 --bind：LuCI 一键初始化的默认映射 ----
+b25_reset "$B25/s6"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_run "$B25/s6" "$B25/conf" init --assume-yes > "$B25/init-auto.log" 2>&1
+_b25_rc=$?
+if [ "$_b25_rc" -eq 0 ] &&
+   [ "$(cat "$B25/s6/data/isp_split_wan_only_m1.interface")" = "wan1" ] &&
+   [ "$(cat "$B25/s6/data/isp_split_wanb_only_m1.interface")" = "wan2" ] &&
+   grep -q 'wan_only.*-> wan1' "$B25/init-auto.log" &&
+   grep -q 'wanb_only.*-> wan2' "$B25/init-auto.log"; then
+	ok "17.11 --assume-yes 无 --bind 时按顺序默认绑定（LuCI 一键初始化）"
+else
+	ng "17.11 --assume-yes 默认绑定异常（rc=$_b25_rc）"
+	sed 's/^/    /' "$B25/init-auto.log" | head -25
 fi
 
 echo

@@ -103,10 +103,11 @@ function isSetName(s) {
 return view.extend({
 	load: function() {
 		/* 配置字段走 conf get；数据源健康度走 health --json。
-		   health 失败不能拖垮整个配置页：捕获后渲染成“读取失败”。 */
+		   health/policy-check 失败不能拖垮整个配置页：捕获后渲染成“读取失败”。 */
 		return Promise.all([
 			run(['conf', 'get']),
-			fs.exec(CMD, ['health', '--json']).catch(function() { return null; })
+			fs.exec(CMD, ['health', '--json']).catch(function() { return null; }),
+			fs.exec(CMD, ['policy-check', '--json']).catch(function() { return null; })
 		]);
 	},
 
@@ -118,6 +119,14 @@ return view.extend({
 			health = JSON.parse(((res[1] && res[1].stdout) || '').trim() || 'null');
 		} catch (e) {
 			health = null;
+		}
+		/* BUG-25：首装用户 mwan3 里没有 wan_only/wanb_only 策略时，
+		   wire 会静默失效。这里在页面顶部给一条醒目提示 + 一键 init。 */
+		var pcheck = null;
+		try {
+			pcheck = JSON.parse(((res[2] && res[2].stdout) || '').trim() || 'null');
+		} catch (e) {
+			pcheck = null;
 		}
 
 		var model = {
@@ -823,6 +832,48 @@ return view.extend({
 				});
 		}
 
+		/* BUG-25：策略缺失/空成员时页面顶部的醒目提示条。
+		   只有 policy-check 明确返回 ok=false 才显示；读不到（旧版脚本/命令失败）
+		   时保持安静，不用一个误报吓用户。 */
+		var policyBanner = E('div', { 'class': 'isp-banner-wrap' });
+		if (pcheck && pcheck.ok === false) {
+			var bad = (pcheck.policies || []).filter(function(p) { return !p.ok; });
+			var badText = bad.map(function(p) {
+				return p.name + '（' + (p.detail || _('不可用')) + '）';
+			}).join('、');
+			var bannerErr = E('div', { 'class': 'isp-banner-err' });
+			var bannerBtn;
+			bannerBtn = E('button', {
+				'class': 'cbi-button cbi-button-action isp-banner-btn',
+				'click': function() {
+					bannerBtn.disabled = true;
+					bannerBtn.textContent = _('正在初始化…');
+					bannerErr.textContent = '';
+					return run(['init', '--assume-yes']).then(function() {
+						ui.addNotification(null, E('p', {}, [ _('已绑定线路，页面将刷新') ]), 'info');
+						window.location.reload();
+					}).catch(function(e) {
+						bannerBtn.disabled = false;
+						bannerBtn.textContent = _('重新尝试初始化');
+						bannerErr.textContent = String(e).replace(/^.*失败（[^）]*）：/, '');
+					});
+				}
+			}, [ _('运行初始化绑定线路') ]);
+			policyBanner = E('div', { 'class': 'isp-banner is-warn' }, [
+				E('div', { 'class': 'isp-banner-msg' }, [
+					E('strong', {}, [ _('mwan3 策略缺失或没有成员：分流规则不会生效') ]),
+					E('div', {}, [ _('需要绑定的策略：') + badText ]),
+					E('div', { 'class': 'isp-banner-hint' }, [
+						_('按钮会按 ISP 表顺序自动绑定（wan_only→wan1、wanb_only→wan2…）；也可以 SSH 执行 '),
+						E('code', {}, [ 'isp-split init' ]),
+						_(' 逐个选择接口。')
+					]),
+					bannerErr
+				]),
+				bannerBtn
+			]);
+		}
+
 		/* ============================================================ 页面 */
 
 		return E('div', { 'class': 'isp-app cbi-map' }, [
@@ -834,6 +885,8 @@ return view.extend({
 					_('改动写入 /etc/isp-split.conf：写入前校验、写入后回读，语法不合法自动回滚。')
 				])
 			]),
+
+			policyBanner,
 
 			/* ---- 策略映射 ---- */
 			E('section', { 'class': 'isp-section' }, [

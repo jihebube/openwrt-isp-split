@@ -35,7 +35,7 @@ tw:isp_tw:wanb_only:0
 |---|---|---|
 | 1 | 数据来源（`/etc/isp-split/data/<名称>.txt`） | 运营商源名（经 `ISP_SOURCE_FILES` 映射到各源的远端文件名） |
 | 2 | nftables 集合名 | `isp_` 前缀，任意 |
-| 3 | mwan3 策略 | `wan_only` / `wanb_only` / `balanced`（必须在 mwan3 中已存在） |
+| 3 | mwan3 策略 | `wan_only` / `wanb_only` / `balanced`（由 `isp-split init` 创建并绑定成员） |
 | 4 | 启用 | `1` / `0` |
 
 要点：
@@ -43,6 +43,44 @@ tw:isp_tw:wanb_only:0
 - **顺序即优先级**。上游数据存在重叠（如电信与联通之间有数百处），靠前的运营商先占用网段，因此每个 IP 只归属一个集合
 - 第三列是 mwan3 的策略名，也可以用自定义策略
 - 被完全覆盖的集合（如本例中 unicom_cnc 被 chinatelecom 抢走大量网段后）条目数会显著减少，属正常现象
+
+### 首次安装：`isp-split init` 绑定线路
+
+mwan3 的 **policy** 只是成员列表，真正决定走哪条线的是 **member**（接口 + metric/weight）。首次安装时 mwan3 里通常没有 `wan_only` / `wanb_only`，或策略存在但成员为空；这种状态下 `wire` 生成 `option use_policy '...'` 后，mwan3 会静默丢掉整条规则。因此 0.3.0 起：
+
+- `wire` / `plan` 在动任何配置之前预检 `ISP_TABLE` 中**已启用行**引用的每个策略，缺失或空成员直接报错退出，并提示运行 `isp-split init`；`init` 同样只处理启用行（disabled 行不生成规则，也不去动它的策略）
+- `verify` 增加「策略存在且有成员」检查行；`uninstall` 按 `isp_split=1` 标记删除 init 生成的 policy/member
+
+用法：
+
+```sh
+# 交互：列出 mwan3 接口 → network 接口 → pppoe/静态设备，逐个策略选择
+isp-split init
+
+# 脚本/无人值守：可重复的 --bind + --assume-yes（未绑定的策略按顺序自动分配）
+isp-split init --bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes
+```
+
+生成的段形如：
+
+```sh
+config policy 'wan_only'
+	list use_member 'isp_split_wan_only_m1'
+	option isp_split '1'
+
+config member 'isp_split_wan_only_m1'
+	option interface 'wan1'
+	option metric '1'
+	option weight '1'
+	option isp_split '1'
+```
+
+约束与幂等：
+
+- 同名**带 `isp_split=1` 标记**的策略/成员段只更新接口，不会重复追加
+- 同名但**没有标记**的策略段一律报错、不做改动（保护用户自建配置）；需要接管时请先在 mwan3 中删除或改名
+- 从 `ISP_TABLE` 移除的策略，其带标记段会在下次 `init` / `wire` 时作为孤儿清理；仍被 mwan3 规则或其它策略引用的段会保留并告警
+- `init` 结束后自动跑一次 `plan` 摘要
 
 ### 未命中集合的流量
 
