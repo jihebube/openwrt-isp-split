@@ -4892,6 +4892,36 @@ else
 	ng "22.8 F-21 口径不一致（残留下划线 apk=$_bad_glob，release=$_apk_ok，build-apk=$_apk_ok2，ipk 文档=$_ipk_ok）"
 fi
 
+# 22.9 F-22 release.yml 的 APK_BIN 必须与 build-apk.sh 的 WORK 规则同源。
+#      动态：把 release.yml 里那段规则（F22-RULE-BEGIN/END 之间）原样抽出来跑，
+#            推出的 APK_BIN 必须落在 build-apk.sh **自己算出来**的 WORK 下。
+#            断言的是"同一表达式"，不是"同一个字面量"——所以两边都现场求值。
+F22=$TMP/f22
+mkdir -p "$F22/scripts"
+cp "$ROOT/scripts/build-apk.sh" "$F22/scripts/"
+mkdir -p "$F22/.sdk-build/25.12.6/sdk"
+printf '25.12.6 x86/64\n' > "$F22/.sdk-build/25.12.6/sdk/.isp-split-sdk-version"
+	: > "$F22/.sdk-build/25.12.6/sdk/README"	# 目录非空才走复用分支（之后因没有 Makefile 失败，属预期）
+sh "$F22/scripts/build-apk.sh" 25.12.6 x86/64 > "$F22/build.log" 2>&1
+_f22_work=$(sed -n 's/^工作目录: //p' "$F22/build.log" | head -1)
+sed -n '/F22-RULE-BEGIN/,/F22-RULE-END/p' "$ROOT/.github/workflows/release.yml" > "$F22/rule.sh"
+_f22_apk=$(cd "$F22" && VER=25.12.6 ROOT=$F22 sh -c '. ./rule.sh; printf "%s\n" "$APK_BIN"' 2>/dev/null)
+if [ -n "$_f22_work" ] && [ "$_f22_apk" = "$_f22_work/sdk/staging_dir/host/bin/apk" ]; then
+	ok "22.9 F-22 release.yml 抽出的规则算出的 APK_BIN = build-apk.sh 的 WORK + /sdk/staging_dir/host/bin/apk（$_f22_apk）"
+else
+	ng "22.9 F-22 APK_BIN 与 build-apk.sh 的 WORK 分叉（work='$_f22_work' apk='$_f22_apk'）"
+fi
+# 静态：不许再出现手抄的字面量路径；verify 与 parity 必须共用同一处注入的 APK_BIN
+_f22_lit=$(grep -c 'sdk-build' "$ROOT/.github/workflows/release.yml")
+_f22_inject=$(grep -cF 'APK_BIN=$APK_BIN" >> "$GITHUB_ENV"' "$ROOT/.github/workflows/release.yml")
+_f22_verify=$(grep -cF '用 APK_BIN=$APK_BIN 解 apk' "$ROOT/.github/workflows/release.yml")
+_f22_parity=$(grep -cF 'parity 用 APK_BIN=' "$ROOT/.github/workflows/release.yml")
+if [ "$_f22_lit" -eq 0 ] && [ "$_f22_inject" -ge 1 ] && [ "$_f22_verify" -ge 1 ] && [ "$_f22_parity" -ge 1 ]; then
+	ok "22.9b F-22 release.yml 无手抄路径字面量，APK_BIN 单点注入后 verify/parity 共用"
+else
+	ng "22.9b F-22 release.yml 定义分叉（字面量=$_f22_lit 注入=$_f22_inject verify=$_f22_verify parity=$_f22_parity）"
+fi
+
 echo "== 23. verify-domains.sh 按 wire 语义重写（F-24 / F-25）"
 V23=$TMP/v23
 mkdir -p "$V23"

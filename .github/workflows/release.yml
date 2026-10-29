@@ -64,6 +64,49 @@ jobs:
           find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
           ls -lh out
 
+      # F-22：发货面断言要解 apk（0.3.0 起 apk 进了断言 glob），但 ubuntu runner
+      # 上没有 apk-tools 3.x，于是「找不到解包器」直接失败（run 40857244457）。
+      # 本地一直是绿的，因为 DSH 直接调 SDK 里的那份 apk；CI 里这份也在——只是
+      # 没人告诉断言脚本去哪找。这里把路径算出来注入，verify 与 parity 共用。
+      # 路径不许手抄字面量（F7）：build-apk.sh 的 WORK 规则 F-19 起带 $VER 分桶，
+      # 手抄的旧路径正好指空。做法是把它那行 WORK 赋值当场抠出来求值。
+      - name: 解析 APK_BIN（解包器路径与 build-apk.sh 的 WORK 规则同源）
+        run: |
+          set -eu
+          VER="${{ matrix.branch }}"
+          ROOT=$PWD
+          # >>> F22-RULE-BEGIN（tools/selftest.sh 22.9 抽这段原样跑，防再次分叉）
+          if [ -n "${OWRT_WORK:-}" ]; then
+            WORK=$OWRT_WORK
+            RULE="OWRT_WORK（显式指定，与 build-apk.sh 同优先级）"
+          else
+            WORK_RULE=$(sed -n 's/^WORK=${OWRT_WORK:-\(.*\)}$/\1/p' scripts/build-apk.sh | head -1)
+            if [ -z "$WORK_RULE" ]; then
+              echo "::error::scripts/build-apk.sh 里找不到 WORK=\${OWRT_WORK:-...} 规则，无法同源推导解包器路径"
+              exit 1
+            fi
+            WORK=$(eval "printf '%s' \"$WORK_RULE\"")
+            RULE="$WORK_RULE"
+          fi
+          APK_BIN=$WORK/sdk/staging_dir/host/bin/apk
+          # <<< F22-RULE-END
+          echo "WORK 规则（取自 scripts/build-apk.sh）: $RULE"
+          echo "WORK=$WORK（VER=$VER）"
+          echo "APK_BIN=$APK_BIN"
+          case "$VER" in
+            25.12*)
+              # 25.12 job 必须能解 apk：缺失就硬失败，绝不"跳过断言"糊过去。
+              [ -x "$APK_BIN" ] || {
+                echo "::error::$VER 要解 apk，但 $APK_BIN 不存在或不可执行（WORK 规则漂移？）；拒绝降级为跳过"
+                exit 1
+              }
+              echo "APK_BIN=$APK_BIN" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "$VER 产出 ipk，断言不解 apk：不注入 APK_BIN（避免指向不存在的文件）"
+              ;;
+          esac
+
       - name: 发货面断言（完整版 feature=1；未知格式显式失败）
         run: |
           set -eu
@@ -84,6 +127,17 @@ jobs:
             echo "::error::${{ matrix.branch }} 没有产出 luci-app-isp-split 包，断言面无产物"
             exit 1
           }
+          # F-22：apk 容器要用 apk-tools 解包，CI 上唯一可用的是 SDK 里那份，
+          # 由上一步按 build-apk.sh 的 WORK 规则解析并注入。没注入就是配置又断了。
+          case "$want" in
+            apk)
+              [ -x "${APK_BIN:-}" ] || {
+                echo "::error::${{ matrix.branch }} 发货面断言要解 apk，但 APK_BIN 未注入或不可执行（${APK_BIN:-<空>}）"
+                exit 1
+              }
+              echo "用 APK_BIN=$APK_BIN 解 apk"
+              ;;
+          esac
           set --
           for f in out/*.ipk out/*.apk; do
             [ -f "$f" ] || continue
@@ -100,6 +154,17 @@ jobs:
           set -eu
           # 本次教训：本地路径全绿 ≠ SDK 路径绿。同一份源码两条构建路径，
           # payload 必须逐文件一致；不一致就是又分叉了（F7 的本质）。
+          # F-22：25.12 job 的 sdk_main 是 .apk，parity 同样要解 apk，所以用同一个
+          # 已注入的 APK_BIN（同一处定义，不另算一遍路径）。
+          case "${{ matrix.branch }}" in
+            25.12*)
+              [ -x "${APK_BIN:-}" ] || {
+                echo "::error::parity 要解 apk，但 APK_BIN 未注入或不可执行（${APK_BIN:-<空>}）"
+                exit 1
+              }
+              echo "parity 用 APK_BIN=$APK_BIN 解 apk"
+              ;;
+          esac
           sh scripts/build-ipk.sh
           VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -1)
           REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -1)
