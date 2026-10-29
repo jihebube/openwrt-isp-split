@@ -7,6 +7,8 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LIB=$ROOT/files/usr/lib/isp-split
+ISPVER=$(sed -n 's/^ISP_VERSION="\([^"]*\)"/\1/p' "$ROOT/files/usr/sbin/isp-split" | head -1)
+[ -n "$ISPVER" ] || ISPVER=0.0.0
 FIX=$ROOT/tools/fixtures
 TMP=$(mktemp -d 2>/dev/null) ||
 	TMP=$(mktemp -d /tmp/isp-split-selftest.XXXXXX 2>/dev/null) ||
@@ -2418,7 +2420,7 @@ lc_run() { lc_run_conf "$LCCONF" "$@"; }
 JQ=
 command -v jsonfilter >/dev/null 2>&1 && JQ=jsonfilter
 lc_run --json >"$TMP/lc1.json" 2>"$TMP/lc1.err"
-if [ -s "$TMP/lc1.json" ] && ! grep -q '^{"version":"0.3.0"' "$TMP/lc1.json"; then
+if [ -s "$TMP/lc1.json" ] && ! grep -q "^{\"version\":\"$ISPVER\"" "$TMP/lc1.json"; then
 	ng "linecheck --json 顶层形状异常"
 elif [ -n "$JQ" ]; then
 	_v=$(jsonfilter -i "$TMP/lc1.json" -e '@.version' 2>/dev/null)
@@ -2427,7 +2429,7 @@ elif [ -n "$JQ" ]; then
 	_b=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[0].score.breakdown[*].key' 2>/dev/null | wc -l)
 	_t=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[1].score.total' 2>/dev/null)
 	_c=$(jsonfilter -i "$TMP/lc1.json" -e '@.wans[1].nat.type' 2>/dev/null)
-	if [ "$_v" = "0.3.0" ] && [ "$_n" = "2" ] && [ -n "$_g" ] && [ "$_b" = "4" ] &&
+	if [ "$_v" = "$ISPVER" ] && [ "$_n" = "2" ] && [ -n "$_g" ] && [ "$_b" = "4" ] &&
 	   [ -n "$_t" ] && [ "$_c" = "cgnat" ]; then
 		ok "JSON schema：version/2 条 WAN/score 四段明细/嵌套 NAT 完整"
 	else
@@ -3333,6 +3335,233 @@ if ( ISP_SPLIT_CONF="$F29/conf"; export ISP_SPLIT_CONF
 	ng "18.8 --wan .. 仍被接受为设备（SEC 报告低危项）"
 else
 	ok "18.8 --wan .. / . 按 ifindex 判定后拒绝（健壮性）"
+fi
+
+# ---- 19. 发货门：FEATURE_LINECHECK=0 的“隐藏完备性” ----
+# 这些断言证明线路体检是构建期剥离，而不是运行时开关：
+#   · 剥离后的运行时树里没有实现/CLI/conf 键/页面/菜单；
+#   · 被剥离的 CLI 给出固定拒绝文案，且不留下 state 痕迹；
+#   · ipk 的文件清单与 Depends 里没有 linecheck / socat；
+#   · 文档按标记剥离后也没有剧透。
+echo "== 19. 发货门（线路体检构建期剥离）"
+F30=$TMP/fix30
+rm -rf "$F30"
+mkdir -p "$F30/root" "$F30/luci/www/luci-static/resources/view/isp-split" \
+	"$F30/luci/usr/share/luci/menu.d" "$F30/luci/usr/share/rpcd/acl.d"
+
+# 19.1 运行时树物理剥离
+cp -a "$ROOT/files/." "$F30/root/"
+if sh "$ROOT/scripts/strip-linecheck.sh" "$F30/root" >"$F30/strip.log" 2>&1; then
+	ok "19.1 strip-linecheck 成功剥离运行时树"
+else
+	ng "19.1 strip-linecheck 失败"
+	sed 's/^/    /' "$F30/strip.log" | tail -5
+fi
+
+# 19.2 零残留（白名单为空）
+_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/root" 2>/dev/null || true)
+if [ -z "$_leak" ]; then
+	ok "19.2 剥离后运行时树 grep 零残留（linecheck / LINE_CHECK / 线路体检）"
+else
+	ng "19.2 剥离后仍有残留：$(printf '%s ' $_leak)"
+fi
+
+# 19.3 语法
+if sh -n "$F30/root/usr/sbin/isp-split" && sh -n "$F30/root/etc/isp-split.conf"; then
+	ok "19.3 剥离后的 isp-split 与 conf 通过 sh -n"
+else
+	ng "19.3 剥离后语法错误"
+fi
+
+# 19.4 CLI 固定拒绝文案 + 非零退出
+cp "$F30/root/etc/isp-split.conf" "$F30/conf"
+ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
+	sh "$F30/root/usr/sbin/isp-split" linecheck >"$F30/lc.out" 2>"$F30/lc.err"
+_lc_rc=$?
+if [ "$_lc_rc" -ne 0 ] && grep -q '此版本未包含该功能' "$F30/lc.err"; then
+	ok "19.4 剥离版 linecheck：固定文案「此版本未包含该功能」+ 退出码 $_lc_rc"
+else
+	ng "19.4 剥离版 linecheck 未按约定拒绝（rc=$_lc_rc）"
+fi
+
+# 19.5 拒绝路径不得留下 state/linecheck*
+if [ -z "$(ls -d "$F30"/base/state/linecheck* 2>/dev/null)" ]; then
+	ok "19.5 拒绝路径不创建 state/linecheck*（先判后建）"
+else
+	ng "19.5 拒绝路径留下了 state/linecheck* 痕迹"
+fi
+
+# 19.6 usage 不含剧透
+ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
+	sh "$F30/root/usr/sbin/isp-split" >"$F30/usage.txt" 2>&1
+if ! grep -q 'linecheck\|LINE_CHECK\|线路体检' "$F30/usage.txt"; then
+	ok "19.6 剥离版 usage 无 linecheck / 线路体检"
+else
+	ng "19.6 剥离版 usage 仍有剧透"
+fi
+
+# 19.7 conf 面：键名不被识别
+ISP_SPLIT_CONF="$F30/conf" ISP_SPLIT_BASE="$F30/base" \
+	sh "$F30/root/usr/sbin/isp-split" conf set LINE_CHECK_GEO 0 >"$F30/conf.out" 2>&1
+_cf_rc=$?
+if [ "$_cf_rc" -ne 0 ] && grep -q "未知配置项 'LINE_CHECK_GEO'" "$F30/conf.out"; then
+	ok "19.7 剥离版 conf set LINE_CHECK_GEO：未知配置项 + 非零退出"
+else
+	ng "19.7 剥离版 conf 仍接受 LINE_CHECK_*（rc=$_cf_rc）"
+fi
+
+# 19.8 LuCI 面：menu 子节点 == 2，无体检页/节点文件
+cp "$ROOT"/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/*.js \
+	"$F30/luci/www/luci-static/resources/view/isp-split/" 2>/dev/null || true
+cp "$ROOT"/luci-app-isp-split/root/usr/share/luci/menu.d/*.json "$F30/luci/usr/share/luci/menu.d/"
+cp "$ROOT"/luci-app-isp-split/root/usr/share/rpcd/acl.d/*.json "$F30/luci/usr/share/rpcd/acl.d/"
+sh "$ROOT/scripts/strip-linecheck.sh" "$F30/luci" >/dev/null 2>&1
+_kids=$(grep -c '"admin/network/isp-split/' "$F30/luci/usr/share/luci/menu.d/luci-app-isp-split.json" 2>/dev/null || echo 0)
+if [ "$_kids" = "2" ] &&
+   [ ! -f "$F30/luci/www/luci-static/resources/view/isp-split/linecheck.js" ] &&
+   [ ! -f "$F30/luci/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
+   ! grep -q 'linecheck' "$F30/luci/usr/share/rpcd/acl.d/luci-app-isp-split.json" 2>/dev/null; then
+	ok "19.8 剥离后 menu 子节点=2，无体检页 / 菜单节点 / acl 串"
+else
+	ng "19.8 剥离后 LuCI 面不干净（子节点=$_kids）"
+fi
+
+# 19.9 config.js：剥离后仍可被 JS 解析（有 node 时）
+if command -v node >/dev/null 2>&1 &&
+   [ -f "$F30/luci/www/luci-static/resources/view/isp-split/config.js" ]; then
+	if node --check "$F30/luci/www/luci-static/resources/view/isp-split/config.js" 2>/dev/null; then
+		ok "19.9 剥离后 config.js 通过 node --check"
+	else
+		ng "19.9 剥离后 config.js 语法错误"
+	fi
+else
+	ok "19.9 跳过 node --check（无 node 或文件不存在）"
+fi
+
+# 19.10 ipk：主包 + LuCI 包的文件清单 / menu 子节点 / Depends
+# 有 ar 用 ar；没有 ar（如 OpenWrt 精简固件）就用 dd/tail 直接读 ar 头部，
+# 保证 §19 在 VM root 上也能完整跑，而不是“跳过”。
+_ipk_pull() { # <ipk> <member> <out>
+	if command -v ar >/dev/null 2>&1; then
+		ar p "$1" "$2" >"$3" && return 0
+	fi
+	_hp=$3.hdr
+	_pos=8
+	while :; do
+		# 必须落文件再解析：$(dd ...) 会吃掉头部末尾的换行，60 变 59
+		rm -f "$_hp"
+		dd if="$1" bs=1 skip="$_pos" count=60 of="$_hp" 2>/dev/null
+		[ "$(wc -c < "$_hp" 2>/dev/null || echo 0)" -eq 60 ] || return 1
+		_name=$(cut -c1-16 "$_hp" | sed 's/[[:space:]]*$//; s:/$::')
+		_size=$(cut -c49-58 "$_hp" | tr -cd '0-9')
+		_pos=$((_pos + 60))
+		if [ "$_name" = "$2" ]; then
+			tail -c +$((_pos + 1)) "$1" | head -c "$_size" >"$3"
+			return 0
+		fi
+		_pos=$((_pos + ${_size:-0}))
+		[ $((_pos % 2)) -eq 1 ] && _pos=$((_pos + 1))
+	done
+}
+_ipk_unpack() { # <ipk> <dest>
+	rm -rf "$2"
+	mkdir -p "$2/data" "$2/ctl"
+	_ipk_pull "$1" data.tar.gz "$2/data.tar.gz" &&
+		_ipk_pull "$1" control.tar.gz "$2/control.tar.gz" &&
+		tar -xzf "$2/data.tar.gz" -C "$2/data" 2>/dev/null &&
+		tar -xzf "$2/control.tar.gz" -C "$2/ctl" 2>/dev/null
+}
+if command -v tar >/dev/null 2>&1; then
+	if sh "$ROOT/scripts/build-ipk.sh" >"$F30/ipk-build.log" 2>&1; then
+		_mipk=$ROOT/dist/isp-split_${ISPVER}-1_all.ipk
+		_lipk=$ROOT/dist/luci-app-isp-split_${ISPVER}-1_all.ipk
+		if _ipk_unpack "$_mipk" "$F30/mipk" && _ipk_unpack "$_lipk" "$F30/lipk"; then
+			_m_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/mipk/data" 2>/dev/null || true)
+			_l_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/lipk/data" 2>/dev/null || true)
+			_kids=$(grep -c '"admin/network/isp-split/' \
+				"$F30/lipk/data/usr/share/luci/menu.d/luci-app-isp-split.json" 2>/dev/null || echo 0)
+			if [ -z "$_m_leak" ] && [ -z "$_l_leak" ] &&
+			   [ ! -f "$F30/mipk/data/usr/lib/isp-split/lc-run" ] &&
+			   [ ! -f "$F30/lipk/data/www/luci-static/resources/view/isp-split/linecheck.js" ] &&
+			   [ ! -f "$F30/lipk/data/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
+			   [ "$_kids" = "2" ] &&
+			   ! grep -qi 'socat' "$F30/mipk/ctl/control" "$F30/lipk/ctl/control"; then
+				ok "19.10 ipk×2：payload 零残留、无 lc-run/体检页、menu 子节点=2、Depends 无 socat"
+			else
+				ng "19.10 ipk 断言失败（menu 子节点=$_kids）"
+			fi
+		else
+			ng "19.10 ipk 解包失败"
+		fi
+	else
+		ng "19.10 build-ipk 失败"
+		sed 's/^/    /' "$F30/ipk-build.log" | tail -5
+	fi
+else
+	ok "19.10 跳过 ipk 断言（无 tar）"
+fi
+
+# 19.11 文档：按标记剥离后无剧透
+sed '/lc:begin/,/lc:end/d' "$ROOT/README.md" >"$F30/README.md"
+sed '/lc:begin/,/lc:end/d' "$ROOT/docs/CONFIGURATION.md" >"$F30/CONFIGURATION.md"
+sed '/lc:begin/,/lc:end/d' "$ROOT/docs/DESIGN.md" >"$F30/DESIGN.md"
+if ! grep -q 'linecheck\|LINE_CHECK\|线路体检' "$F30/README.md" "$F30/CONFIGURATION.md" "$F30/DESIGN.md"; then
+	ok "19.11 README / CONFIGURATION / DESIGN 剥离后无剧透"
+else
+	ng "19.11 文档剥离后仍有剧透"
+fi
+
+# 19.12 版本一致性（主 Makefile / luci Makefile / feed 两个壳 / ISP_VERSION）
+_v_main=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile" | head -1)
+_v_luci=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-isp-split/Makefile" | head -1)
+_v_f1=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/isp-split/Makefile" | head -1)
+_v_f2=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/feed/op-packages/luci-app-isp-split/Makefile" | head -1)
+if [ "$_v_main" = "$ISPVER" ] && [ "$_v_luci" = "$ISPVER" ] &&
+   [ "$_v_f1" = "$ISPVER" ] && [ "$_v_f2" = "$ISPVER" ]; then
+	ok "19.12 版本一致：ISP_VERSION=PKG_VERSION=$ISPVER（主/luci/feed×2）"
+else
+	ng "19.12 版本漂移：ISP=$ISPVER main=$_v_main luci=$_v_luci feed=$_v_f1/$_v_f2"
+fi
+
+# 19.13 apk：解包后断言文件清单 / Depends（有 apk 工具时）
+APKBIN=$(command -v apk 2>/dev/null || true)
+if [ -z "$APKBIN" ] && [ -x "$ROOT/.sdk-build/sdk/staging_dir/host/bin/apk" ]; then
+	APKBIN=$ROOT/.sdk-build/sdk/staging_dir/host/bin/apk
+fi
+if [ -n "$APKBIN" ]; then
+	_apk=$(ls "$ROOT"/dist/sdk-*/*.apk 2>/dev/null | head -1)
+	if [ -n "$_apk" ]; then
+		rm -rf "$F30/apkx" && mkdir -p "$F30/apkx"
+		# apk 3.0.5 的 extract 没有 --root，必须在目标目录里执行
+		if ( cd "$F30/apkx" && "$APKBIN" extract --allow-untrusted "$_apk" ) \
+			>"$F30/apk-extract.log" 2>&1; then
+			_apk_leak=$(grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$F30/apkx" 2>/dev/null || true)
+			_apk_dep=$("$APKBIN" adbdump "$_apk" 2>/dev/null |
+				sed -n '/^  depends:/,/^  [a-z]/p')
+			if [ -z "$_apk_leak" ] &&
+			   [ ! -f "$F30/apkx/usr/lib/isp-split/lc-run" ] &&
+			   ! printf '%s' "$_apk_dep" | grep -qi 'socat'; then
+				ok "19.13 apk：解包零残留、无 lc-run、Depends 无 socat"
+			else
+				ng "19.13 apk 仍有 linecheck 内容或 socat 依赖"
+			fi
+		else
+			ok "19.13 跳过 apk 断言（apk 无法解包该文件）"
+		fi
+	else
+		ok "19.13 跳过 apk 断言（dist 下没有 SDK 产物）"
+	fi
+else
+	ok "19.13 跳过 apk 断言（无 apk 命令）"
+fi
+
+# 19.14 init / cron：确认没有体检联动（未来也不许偷偷加定时探测）
+if ! grep -q 'linecheck' "$ROOT/files/etc/init.d/isp-split" \
+	"$ROOT/files/etc/uci-defaults/99-isp-split" 2>/dev/null &&
+   ! sed -n '/^add_cron()/,/^}/p' "$ROOT/scripts/install.sh" | grep -q 'linecheck'; then
+	ok "19.14 init / uci-defaults / cron 无体检联动（无定时探测）"
+else
+	ng "19.14 init/cron 出现 linecheck 联动"
 fi
 
 echo

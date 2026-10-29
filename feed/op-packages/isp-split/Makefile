@@ -1,13 +1,19 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=isp-split
-PKG_VERSION:=0.3.0
+PKG_VERSION:=0.2.3
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=jihebube <jihebube@users.noreply.github.com>
 
 include $(INCLUDE_DIR)/package.mk
+
+# 线路体检（linecheck）不在 0.2.3 的出货面出现。
+#   0 = 构建期物理剥离：实现、CLI、conf 键、LuCI 页/菜单、socat 依赖全部不进包；
+#   1 = 保留完整功能（0.3.0 及后续功能版用）。
+# 这是构建期开关，不是运行时开关：0 的产物里没有可被重新打开的代码。
+FEATURE_LINECHECK?=0
 
 define Package/isp-split
   SECTION:=net
@@ -19,7 +25,7 @@ define Package/isp-split
 #   Kwrt 源里 nft 版的包名是 mwan3-nft，与其他源命名不一致。
 #   nftables 版 mwan3 是硬性前提，由 install.sh 与 router-preflight 检查，
 #   并在 description 里说明。
-  DEPENDS:=+nftables +curl +socat
+  DEPENDS:=+nftables +curl $(if $(filter 1,$(FEATURE_LINECHECK)),+socat)
   PKGARCH:=all
 endef
 
@@ -32,6 +38,20 @@ define Package/isp-split/description
     - Kwrt:  apk add mwan3-nft        (软件源里自带)
     - 上游:  用 https://github.com/dl12345/mwan3 替换官方 feed 的
              iptables 版 mwan3 (2.12.5)，或从 Release 下载
+endef
+
+define Build/Prepare
+	rm -rf $(PKG_BUILD_DIR)
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./files $(PKG_BUILD_DIR)/files
+	# 标记区整段删除 + feature 专属文件删除；随后脚本自检 sh -n。
+	# 与 scripts/strip-linecheck.sh 同一套标记，SDK 与手工打包结果一致。
+	if [ "$(FEATURE_LINECHECK)" != "1" ]; then \
+		sed -i '/lc:begin/,/lc:end/d' $(PKG_BUILD_DIR)/files/usr/sbin/isp-split; \
+		sed -i '/lc:begin/,/lc:end/d' $(PKG_BUILD_DIR)/files/etc/isp-split.conf; \
+		rm -f $(PKG_BUILD_DIR)/files/usr/lib/isp-split/lc-run; \
+		sh -n $(PKG_BUILD_DIR)/files/usr/sbin/isp-split; \
+	fi
 endef
 
 define Build/Compile
@@ -112,19 +132,22 @@ define Package/isp-split/install
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_DIR) $(1)/etc/isp-split/data
 
-	$(INSTALL_BIN) ./files/usr/sbin/isp-split $(1)/usr/sbin/isp-split
-	$(INSTALL_BIN) ./files/etc/init.d/isp-split $(1)/etc/init.d/isp-split
-	$(INSTALL_BIN) ./files/usr/lib/isp-split/build.sh $(1)/usr/lib/isp-split/build.sh
-	$(INSTALL_BIN) ./files/etc/uci-defaults/99-isp-split $(1)/etc/uci-defaults/99-isp-split
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/sbin/isp-split $(1)/usr/sbin/isp-split
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/init.d/isp-split $(1)/etc/init.d/isp-split
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/build.sh $(1)/usr/lib/isp-split/build.sh
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/etc/uci-defaults/99-isp-split $(1)/etc/uci-defaults/99-isp-split
 
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/cidr2range.awk $(1)/usr/lib/isp-split/cidr2range.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/merge.awk $(1)/usr/lib/isp-split/merge.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/exclude.awk $(1)/usr/lib/isp-split/exclude.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/range2cidr.awk $(1)/usr/lib/isp-split/range2cidr.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/rules-splice.awk $(1)/usr/lib/isp-split/rules-splice.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/badcidr.awk $(1)/usr/lib/isp-split/badcidr.awk
-	$(INSTALL_DATA) ./files/usr/lib/isp-split/ispdiff.awk $(1)/usr/lib/isp-split/ispdiff.awk
-	$(INSTALL_CONF) ./files/etc/isp-split.conf $(1)/etc/isp-split.conf
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/cidr2range.awk $(1)/usr/lib/isp-split/cidr2range.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/merge.awk $(1)/usr/lib/isp-split/merge.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/exclude.awk $(1)/usr/lib/isp-split/exclude.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/range2cidr.awk $(1)/usr/lib/isp-split/range2cidr.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/rules-splice.awk $(1)/usr/lib/isp-split/rules-splice.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/badcidr.awk $(1)/usr/lib/isp-split/badcidr.awk
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/ispdiff.awk $(1)/usr/lib/isp-split/ispdiff.awk
+	if [ -f $(PKG_BUILD_DIR)/files/usr/lib/isp-split/lc-run ]; then \
+		$(INSTALL_BIN) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/lc-run $(1)/usr/lib/isp-split/lc-run; \
+	fi
+	$(INSTALL_CONF) $(PKG_BUILD_DIR)/files/etc/isp-split.conf $(1)/etc/isp-split.conf
 endef
 
 $(eval $(call BuildPackage,isp-split))

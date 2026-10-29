@@ -247,6 +247,7 @@ meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 ct state new \
 
 ---
 
+<!-- lc:begin -->
 ## 线路体检（LINE_CHECK_*）
 
 0.3.0 新增 `isp-split linecheck`：对每条启用的 WAN 依次做
@@ -372,6 +373,8 @@ rpcd 会话，探测结束后原子替换缓存目录。前台 `linecheck` 也�
 “未知（socat 未安装）”，并在建议里提示安装（`opkg install socat` / `apk add socat`）。
 
 ---
+
+<!-- lc:end -->
 
 ## 多数据源（v0.2.1 默认双源）
 

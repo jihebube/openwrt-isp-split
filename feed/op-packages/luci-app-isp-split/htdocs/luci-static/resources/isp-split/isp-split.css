@@ -799,7 +799,9 @@
 	}
 }
 
+/* lc:begin */
 /* ---------------------------------------------------------------- 线路体检（0.3.0） */
+/* lc:end */
 
 .lc-cards {
 	grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
@@ -1141,7 +1143,9 @@
 	cursor: default;
 }
 
+/* lc:begin */
 /* 尚未体检时的占位卡（BUG-23：没缓存也必须有一个能看的页面，不能白屏） */
+/* lc:end */
 .lc-placeholder {
 	grid-column: 1 / -1;
 	display: block;
@@ -1209,7 +1213,9 @@
 	}
 }
 
+/* lc:begin */
 /* 配置页：线路体检开关区的小字/行内控件 */
+/* lc:end */
 .lc-hint {
 	font-size: 0.74rem;
 	color: var(--isp-muted);

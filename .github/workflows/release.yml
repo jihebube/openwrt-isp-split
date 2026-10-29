@@ -11,6 +11,10 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+# 0.2.3 是纯修复版：构建期剥离线路体检（0.3.0 起改回 "1"）。
+env:
+  FEATURE_LINECHECK: "0"
+
 permissions:
   contents: write
 
@@ -38,6 +42,20 @@ jobs:
           mkdir -p out
           find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
           ls -lh out
+
+      - name: 零残留断言（产物里不得有 linecheck 痕迹）
+        run: |
+          set -eu
+          for ipk in out/*.ipk; do
+            [ -f "$ipk" ] || continue
+            d=$(mktemp -d)
+            ar p "$ipk" data.tar.gz | tar -xz -C "$d"
+            if grep -rIl 'linecheck\|LINE_CHECK\|线路体检' "$d"; then
+              echo "::error::$ipk 仍含 linecheck 残留"
+              exit 1
+            fi
+            rm -rf "$d"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,7 +91,9 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: rel/*
-          generate_release_notes: true
+          # 不自动生成 release notes：0.2.3 的 tag 区间包含 0.3.0 的功能提交，
+          # 自动 notes 会把线路体检的提交标题直接剧透。描述由运维手写。
+          generate_release_notes: false
           body: |
             ## 安装
 

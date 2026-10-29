@@ -14,6 +14,9 @@ set -eu
 
 VER=${1:-25.12.6}
 ARCH=${2:-x86/64}
+# 出货门：0 = 构建期剥离线路体检（0.2.3），1 = 完整功能（0.3.0+）。
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${OWRT_WORK:-$ROOT/.sdk-build}
 OUT=$ROOT/dist/sdk-$VER
@@ -57,10 +60,10 @@ fi
 # 4) 构建
 make defconfig >/dev/null
 echo "编译 isp-split"
-make package/isp-split/compile V=s
+make FEATURE_LINECHECK="$FEATURE_LINECHECK" package/isp-split/compile V=s
 
 echo "编译 luci-app-isp-split（若因 luci-base 版本差异失败，可忽略）"
-make package/luci-app-isp-split/compile V=s || echo "  跳过（依赖版本不匹配不影响主包）"
+make FEATURE_LINECHECK="$FEATURE_LINECHECK" package/luci-app-isp-split/compile V=s || echo "  跳过（依赖版本不匹配不影响主包）"
 
 # 5) 收集产物
 find bin/packages -type f \( -name 'isp-split*.apk' -o -name 'isp-split*.ipk' \

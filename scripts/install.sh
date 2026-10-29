@@ -14,9 +14,20 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$ROOT/files
+# 出货门，与 Makefile / build-ipk.sh 同义：0 = 构建期剥离，1 = 完整功能。
+FEATURE_LINECHECK=${FEATURE_LINECHECK:-0}
+case "$FEATURE_LINECHECK" in 0|1) ;; *) echo "FEATURE_LINECHECK 只能是 0 或 1" >&2; exit 1 ;; esac
+LUCI_SRC=$ROOT/luci-app-isp-split
+STAGE=""
 
 say() { printf '[install] %s\n' "$*"; }
 die() { printf '[install] 错误: %s\n' "$*" >&2; exit 1; }
+
+cleanup_stage() {
+	if [ -n "${STAGE:-}" ]; then rm -rf "$STAGE"; fi
+	return 0
+}
+trap cleanup_stage EXIT
 
 [ "$(id -u)" = "0" ] || die "需要 root 权限"
 [ -d "$SRC" ] || die "找不到 $SRC，请在仓库根目录运行"
@@ -32,8 +43,10 @@ if [ "${1:-}" = "--uninstall" ]; then
 	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
 	rm -rf /www/luci-static/resources/isp-split/logos
 	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
+	rm -f /usr/share/luci/menu.d/luci-app-isp-split-linecheck.json
 	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
-	rm -f /tmp/luci-indexcache* 2>/dev/null
+	rm -f /usr/lib/isp-split/lc-run
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
 	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
 	say "已卸载（含 LuCI 页面）"
 	exit 0
@@ -71,12 +84,38 @@ if [ -f /etc/isp-split.conf ]; then
 	KEEP_CONF=1
 fi
 
-# 复制文件
+# 复制文件。FEATURE_LINECHECK=0 时先在临时目录里做一次构建期剥离，
+# 再从剥离后的树安装——安装目录里不会出现可被重新打开的实现。
+if [ "$FEATURE_LINECHECK" != "1" ]; then
+	if grep -q 'lc:begin' "$SRC/usr/sbin/isp-split" 2>/dev/null; then
+		[ -f "$ROOT/scripts/strip-linecheck.sh" ] ||
+			die "缺少 scripts/strip-linecheck.sh，无法剥离（或改用 FEATURE_LINECHECK=1）"
+		STAGE=$(mktemp -d 2>/dev/null) || STAGE=$(mktemp -d /tmp/isp-split-stage.XXXXXX) || die "无法创建临时目录"
+		mkdir -p "$STAGE/files"
+		cp -a "$SRC/." "$STAGE/files/"
+		sh "$ROOT/scripts/strip-linecheck.sh" "$STAGE/files" >/dev/null
+		SRC=$STAGE/files
+	fi
+	if [ -d "$LUCI_SRC" ] && grep -rIq 'lc:begin' "$LUCI_SRC" 2>/dev/null; then
+		mkdir -p "$STAGE/luci"
+		cp -a "$LUCI_SRC/." "$STAGE/luci/"
+		sh "$ROOT/scripts/strip-linecheck.sh" "$STAGE/luci" >/dev/null
+		LUCI_SRC=$STAGE/luci
+	fi
+fi
 mkdir -p /usr/sbin /usr/lib/isp-split /etc/init.d /etc/isp-split/data
 cp -f "$SRC/usr/sbin/isp-split" /usr/sbin/isp-split
 cp -f "$SRC/usr/lib/isp-split/"*.awk "$SRC/usr/lib/isp-split/build.sh" /usr/lib/isp-split/
+if [ -f "$SRC/usr/lib/isp-split/lc-run" ]; then
+	cp -f "$SRC/usr/lib/isp-split/lc-run" /usr/lib/isp-split/
+fi
 cp -f "$SRC/etc/init.d/isp-split" /etc/init.d/isp-split
 chmod 755 /usr/sbin/isp-split /etc/init.d/isp-split /usr/lib/isp-split/build.sh
+if [ "$FEATURE_LINECHECK" != "1" ]; then
+	# 升级残留：旧功能版留下的引擎入口与缓存目录不能留在 0 版设备上。
+	rm -f /usr/lib/isp-split/lc-run
+	rm -rf /etc/isp-split/state/linecheck*
+fi
 
 # 配置文件：已存在则不覆盖，避免冲掉用户的 ISP_TABLE
 if [ "${KEEP_CONF:-0}" = "1" ]; then
@@ -91,7 +130,7 @@ fi
 
 # ---- 可选组件：LuCI 页面 ----
 install_luci() {
-	L=$ROOT/luci-app-isp-split
+	L=$LUCI_SRC
 	[ -d "$L" ] || { say "找不到 $L，跳过 LuCI"; return 0; }
 	mkdir -p /www/luci-static/resources/view/isp-split /usr/share/luci/menu.d /usr/share/rpcd/acl.d
 	mkdir -p /www/luci-static/resources/isp-split/logos
@@ -99,11 +138,22 @@ install_luci() {
 		/www/luci-static/resources/isp-split/ 2>/dev/null || true
 	cp -f "$L/htdocs/luci-static/resources/isp-split/logos/"*.svg \
 		/www/luci-static/resources/isp-split/logos/ 2>/dev/null || true
-	cp -f "$L/htdocs/luci-static/resources/view/isp-split/"*.js \
+	cp -f "$L/htdocs/luci-static/resources/view/isp-split/overview.js" \
+		"$L/htdocs/luci-static/resources/view/isp-split/config.js" \
 		/www/luci-static/resources/view/isp-split/
+	if [ "$FEATURE_LINECHECK" = "1" ]; then
+		cp -f "$L/htdocs/luci-static/resources/view/isp-split/linecheck.js" \
+			/www/luci-static/resources/view/isp-split/linecheck.js
+		cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" \
+			/usr/share/luci/menu.d/ 2>/dev/null || true
+	else
+		# 升级残留：0 版安装必须把旧版装的体检页/菜单节点删掉
+		rm -f /www/luci-static/resources/view/isp-split/linecheck.js
+		rm -f /usr/share/luci/menu.d/luci-app-isp-split-linecheck.json
+	fi
 	cp -f "$L/root/usr/share/luci/menu.d/luci-app-isp-split.json" /usr/share/luci/menu.d/
 	cp -f "$L/root/usr/share/rpcd/acl.d/luci-app-isp-split.json" /usr/share/rpcd/acl.d/
-	rm -f /tmp/luci-indexcache* 2>/dev/null
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
 	# 只重启 rpcd（ACL 生效所需）。uhttpd 不必重启——
 	# 静态文件与 menu.d 都是按请求读取的，重启反而会造成短暂无法访问。
 	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
@@ -114,8 +164,10 @@ remove_luci() {
 	rm -f /www/luci-static/resources/view/isp-split/*.js
 	rmdir /www/luci-static/resources/view/isp-split 2>/dev/null || true
 	rm -f /usr/share/luci/menu.d/luci-app-isp-split.json
+	rm -f /usr/share/luci/menu.d/luci-app-isp-split-linecheck.json
 	rm -f /usr/share/rpcd/acl.d/luci-app-isp-split.json
-	rm -f /tmp/luci-indexcache* 2>/dev/null
+	rm -f /usr/lib/isp-split/lc-run
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* 2>/dev/null
 	/etc/init.d/rpcd restart >/dev/null 2>&1 || true
 	say "LuCI 页面已移除"
 }

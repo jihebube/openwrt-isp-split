@@ -135,7 +135,9 @@ return view.extend({
 			isp: [],
 			dns: [],
 			domains: [],
+			/* lc:begin */
 			lc: { enable: true, geo: true, provider: 'auto', interval: 60 }
+			/* lc:end */
 		};
 
 		out.split('\n').forEach(function(line) {
@@ -156,6 +158,7 @@ return view.extend({
 				model.dns.push({ policy: f[1], dns: f[2], test: null });
 			else if (f[0] === 'domain' && f.length >= 3)
 				model.domains.push({ domain: f[1], policy: f[2] });
+			/* lc:begin */
 			else if (f[0] === 'line_check_enable')
 				model.lc.enable = (f[1] || '1') === '1';
 			else if (f[0] === 'line_check_geo')
@@ -164,6 +167,7 @@ return view.extend({
 				model.lc.provider = f[1] || 'auto';
 			else if (f[0] === 'line_check_interval')
 				model.lc.interval = parseInt(f[1], 10) || 60;
+			/* lc:end */
 		});
 
 		if (!model.isp.length) {
@@ -546,6 +550,7 @@ return view.extend({
 			}
 		}, [ svgIcon('plus'), E('span', {}, [_('添加域名')]) ]);
 
+		/* lc:begin */
 		/* ============================================================ 三、线路体检 */
 
 		var lcEnable = E('input', { 'type': 'checkbox', 'checked': model.lc.enable ? '' : null });
@@ -623,6 +628,7 @@ return view.extend({
 				_('注意：关闭归属地只停止归属地查询；出口 IP 回显、STUN 与延迟探测仍会按配置的服务器发出。要完全停发，请关闭“启用”。')
 			])
 		]);
+		/* lc:end */
 
 		/* ============================================================ 四、数据源（只读） */
 
@@ -713,10 +719,12 @@ return view.extend({
 				dns: dnsVal,
 				dom: domVal,
 				mode: modeSel.value,
+				/* lc:begin */
 				lcEnable: model.lc.enable ? '1' : '0',
 				lcGeo: model.lc.geo ? '1' : '0',
 				lcProvider: model.lc.provider,
 				lcInterval: String(model.lc.interval || 60)
+				/* lc:end */
 			};
 		}
 
@@ -733,12 +741,14 @@ return view.extend({
 				]), 'danger');
 				ok = false;
 			}
+			/* lc:begin */
 			if (!model.lc._valid) {
 				ui.addNotification(null, E('p', {}, [
 					_('线路体检的最小间隔必须是 15-3600 之间的整数秒')
 				]), 'danger');
 				ok = false;
 			}
+			/* lc:end */
 			return ok;
 		}
 
@@ -780,11 +790,13 @@ return view.extend({
 				'isp_table', v.isp,
 				'dns_table', v.dns,
 				'domain_split', v.dom,
-				'dns_mode', v.mode,
-				'line_check_enable', v.lcEnable,
+				'dns_mode', v.mode
+				/* lc:begin */
+				,'line_check_enable', v.lcEnable,
 				'line_check_geo', v.lcGeo,
 				'line_check_provider', v.lcProvider,
 				'line_check_interval', v.lcInterval
+				/* lc:end */
 			]).then(function(r) {
 				showResult(((r.stdout || '') + (r.stderr || '')) || '(无输出)');
 				ui.addNotification(null, E('p', {}, [_('预检完成，配置未被修改')]), 'info');
@@ -808,10 +820,12 @@ return view.extend({
 				.then(function() { return step(['conf', 'set', 'dns_table', v.dns], log); })
 				.then(function() { return step(['conf', 'set', 'domain_split', v.dom], log); })
 				.then(function() { return step(['conf', 'set', 'dns_mode', v.mode], log); })
+				/* lc:begin */
 				.then(function() { return step(['conf', 'set', 'line_check_enable', v.lcEnable], log); })
 				.then(function() { return step(['conf', 'set', 'line_check_geo', v.lcGeo], log); })
 				.then(function() { return step(['conf', 'set', 'line_check_provider', v.lcProvider], log); })
 				.then(function() { return step(['conf', 'set', 'line_check_interval', v.lcInterval], log); })
+				/* lc:end */
 				.then(function() {
 					if (!apply)
 						return null;
@@ -960,8 +974,10 @@ return view.extend({
 				E('div', { 'class': 'isp-btn-row' }, [ addDomBtn ])
 			]),
 
+			/* lc:begin */
 			/* ---- 线路体检 ---- */
 			lcSection,
+			/* lc:end */
 
 			/* ---- 数据源（只读） ---- */
 			E('section', { 'class': 'isp-section' }, [

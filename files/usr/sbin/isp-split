@@ -15,7 +15,7 @@
 #   install    注册开机自启与每日更新
 #   uninstall  卸载所有改动
 set -u
-ISP_VERSION="0.3.0"
+ISP_VERSION="0.2.3"
 
 # 配置表里的注释行（# 开头，允许前导空白）必须在按空白展开之前整行删掉
 # （B-1）。否则 `for row in $ISP_TABLE` 会把 "#" 与后面的文字拆成两个
@@ -3934,6 +3934,7 @@ conf_get() {
 		awk -F: 'NF >= 2 { printf "dns\t%s\t%s\n", $1, $2 }'
 	_conf_table DOMAIN_SPLIT | tr -s ' \t' '\n' |
 		awk -F: 'NF >= 2 { printf "domain\t%s\t%s\n", $1, $2 }'
+# lc:begin
 	_lc_g=$(_conf_val LINE_CHECK_GEO); [ -n "$_lc_g" ] || _lc_g=1
 	_lc_gp=$(_conf_val LINE_CHECK_GEO_PROVIDER); [ -n "$_lc_gp" ] || _lc_gp=auto
 	_lc_mi=$(_conf_val LINE_CHECK_MIN_INTERVAL); [ -n "$_lc_mi" ] || _lc_mi=60
@@ -3942,6 +3943,7 @@ conf_get() {
 	printf 'line_check_geo\t%s\n' "$_lc_g"
 	printf 'line_check_provider\t%s\n' "$_lc_gp"
 	printf 'line_check_interval\t%s\n' "$_lc_mi"
+# lc:end
 }
 
 # ---- 配置字段白名单 ----
@@ -4029,6 +4031,7 @@ _valid_ipv4() {
 	return 0
 }
 
+# lc:begin
 # ---- LINE_CHECK_* 值校验（conf set / conf check 共用）----
 # 这些键以前既不在白名单、也无读取侧校验：UA 可注入任意 HTTP 头，
 # ECHO_URLS 的元素可被 curl 当成选项（-K<file>）。下面按“最小可用字符集”
@@ -4169,6 +4172,7 @@ _conf_lc_targets_ok() {
 	IFS=$_conf_lc_t_old
 	return 0
 }
+# lc:end
 
 # 校验某个 KEY 的完整值；失败直接 die（不写文件）
 _conf_validate() {
@@ -4277,6 +4281,7 @@ _conf_validate() {
 		*) die "DNS_MODE 只能是 bind 或 mark" ;;
 		esac
 		;;
+# lc:begin
 	LINE_CHECK_ENABLE | LINE_CHECK_GEO)
 		case "$_val" in
 		0 | 1) ;;
@@ -4341,6 +4346,7 @@ _conf_validate() {
 		[ "$_val" -ge 60 ] && [ "$_val" -le 604800 ] ||
 			die "LINE_CHECK_GEO_TTL 必须在 60-604800 之间"
 		;;
+# lc:end
 	*)
 		die "未知配置项 '$_key'"
 		;;
@@ -4351,13 +4357,20 @@ _conf_validate() {
 
 # conf set/check 的小写键 -> 配置变量名。白名单与 _conf_validate 的
 # 分支一一对应，避免“能写但没校验”或“校验了但写不进去”。
+# lc:begin
 _CONF_KEYS_HINT="isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval / line_check_targets / line_check_stun_servers / line_check_echo_urls / line_check_ua / line_check_accept / line_check_timeout / line_check_budget / line_check_geo_ttl / line_check_baseline"
+# lc:end
+_CONF_KEYS_HINT="${_CONF_KEYS_HINT:-isp_table / dns_table / domain_split / dns_mode}"
 _conf_key_norm() {
-	case "${1:-}" in
+	# 大小写都接受：文档/评审里常写大写键，内部变量也必须能落盘。
+	# 剥离版里这一整段别名表被删除，大写键同样会走“未知配置项”。
+	_ck=$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')
+	case "$_ck" in
 	isp_table) printf 'ISP_TABLE' ;;
 	dns_table) printf 'DNS_TABLE' ;;
 	domain_split) printf 'DOMAIN_SPLIT' ;;
 	dns_mode) printf 'DNS_MODE' ;;
+# lc:begin
 	line_check_enable) printf 'LINE_CHECK_ENABLE' ;;
 	line_check_geo) printf 'LINE_CHECK_GEO' ;;
 	line_check_provider) printf 'LINE_CHECK_GEO_PROVIDER' ;;
@@ -4371,6 +4384,7 @@ _conf_key_norm() {
 	line_check_budget) printf 'LINE_CHECK_BUDGET' ;;
 	line_check_geo_ttl) printf 'LINE_CHECK_GEO_TTL' ;;
 	line_check_baseline) printf 'LINE_CHECK_BASELINE' ;;
+# lc:end
 	*) return 1 ;;
 	esac
 }
@@ -4841,6 +4855,18 @@ cmd_uninstall() {
 	log "已卸载（nft 集合随 mwan3 reload 一并消失）"
 }
 
+_lc_json_esc() {
+	printf '%s' "${1:-}" |
+		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/ /g' |
+		tr -d '\r\n' |
+		sed -e 's/[[:cntrl:]]//g'
+}
+
+_lc_json_str() { # 输出带引号的 JSON 字符串
+	printf '"%s"' "$(_lc_json_esc "$1")"
+}
+
+# lc:begin
 # ---------------------------------------------------------------- linecheck
 #
 # 线路体检（0.3.0 MVP）：对每条 WAN 做
@@ -4896,17 +4922,6 @@ _lc_now() { date +%s; }
 # /proc/uptime 是百分之一秒精度；比 date +%s 更适合测 STUN 的 10-200ms RTT。
 _lc_uptime_ms() {
 	awk '{ printf "%d", $1 * 1000 }' /proc/uptime 2>/dev/null || echo 0
-}
-
-_lc_json_esc() {
-	printf '%s' "${1:-}" |
-		sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/ /g' |
-		tr -d '\r\n' |
-		sed -e 's/[[:cntrl:]]//g'
-}
-
-_lc_json_str() { # 输出带引号的 JSON 字符串
-	printf '"%s"' "$(_lc_json_esc "$1")"
 }
 
 _lc_int() {
@@ -6424,13 +6439,21 @@ LC_CACHE_PREV=$STATE_DIR/linecheck.prev
 LC_LOCK=$STATE_DIR/linecheck.lock
 LC_GEO=$STATE_DIR/linecheck.geo.tsv
 LC_LOG=$STATE_DIR/linecheck.log
+# 探测引擎入口（独立 argv，见文件头注释）。缺失时退回进程内探测。
+LC_RUN=${LC_RUN:-$LIB/lc-run}
 LC_LOCK_OWNER=0
+LC_CHILD_PID=""
 _lc_tmp=""
 # STUN 临时文件的真实路径（mktemp 结果）。trap 清理必须用它，不能按 $$ 重拼。
 LC_STUN_REQ=""
 LC_STUN_RESP=""
 
 _lc_cleanup() {
+	# 监督者被信号带走时，别把引擎进程留成孤儿继续探测。
+	if [ -n "${LC_CHILD_PID:-}" ]; then
+		kill "$LC_CHILD_PID" 2>/dev/null || true
+		LC_CHILD_PID=""
+	fi
 	if [ -n "${_lc_tmp:-}" ] && [ -d "$_lc_tmp" ]; then
 		rm -rf "$_lc_tmp" 2>/dev/null
 	fi
@@ -6520,7 +6543,18 @@ _lc_lock_try() {
 		return 0
 	fi
 	_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
+	case "$_p" in '' | *[!0-9]*) _p="" ;; esac
+	_s=$(cat "$LC_LOCK/started" 2>/dev/null)
+	case "$_s" in '' | *[!0-9]*) _s="" ;; esac
 	_age=$(_lc_lock_age)
+	case "$_age" in '' | *[!0-9]*) _age=0 ;; esac
+	# 0) 元数据不全（pid/started 都没写全）= 锁刚 mkdir、持锁者还没写完。
+	#    这种状态只能判 running：宽限期内绝不做陈旧回收，否则 16 连点
+	#    会在“目录已建、文件未落”的窗口里各自抢到一次锁。
+	if [ -z "$_p" ] && [ -z "$_s" ]; then
+		LC_LOCK_AGE=$_age
+		return 1
+	fi
 	# 1) 进程还活着且锁不超过 5 分钟：认定在跑（防 pid 复用导致的永久锁死）
 	if [ -n "$_p" ] && [ "$_age" -lt 300 ] && kill -0 "$_p" 2>/dev/null; then
 		LC_LOCK_PID=$_p
@@ -6701,10 +6735,11 @@ _lc_background() { # <force> <only>
 	# setsid：脱离 rpcd 的会话/进程组，exec 返回后不会被一起收走。
 	# 三个 fd 全部重定向：父进程退出时 rpcd 的管道不能被子进程挂着，否则
 	# exec 仍然要等到探测结束（那正是 BUG-23 的另一半）。
+	# 锁的 token：worker 用它确认“我接管的还是父进程刚建的那把锁”。
 	if command -v setsid >/dev/null 2>&1; then
-		( setsid sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
+		( ISP_SPLIT_LC_LOCK_TOKEN=$$ setsid sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
 	else
-		( sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
+		( ISP_SPLIT_LC_LOCK_TOKEN=$$ sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
 	fi
 
 	# 等 worker 接管锁（busybox sleep 不支持小数）。最多等 2 秒；mkdir 成功
@@ -6744,12 +6779,14 @@ cmd_linecheck() {
 	_lc_only=""
 	_lc_bg=0
 	_lc_worker=0
+	_lc_runner=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--json) _lc_json=1 ;;
 		--force) _lc_force=1 ;;
 		--background) _lc_bg=1 ;;
 		--_worker) _lc_worker=1 ;;
+		--_runner) _lc_runner=1 ;;
 		--wan)
 			shift
 			[ $# -gt 0 ] || die "用法: isp-split linecheck [--json] [--wan <接口>] [--force] [--background]"
@@ -6789,13 +6826,57 @@ cmd_linecheck() {
 		return $?
 	fi
 
-	if [ "$_lc_worker" = "1" ]; then
-		# 后台子进程：父进程已建好锁目录，这里接管（pid 改成自己），退出时删锁。
-		# 先写 started 再写 pid，任何一步失败都不影响“锁已由父进程 mkdir 拿到”。
-		LC_LOCK_OWNER=1
+	if [ "$_lc_worker" = "1" ] && [ "$_lc_runner" != "1" ]; then
+		# ---- 监督者（--_worker）----
+		# 父进程已 mkdir 持锁。这里做三件事：
+		#   1) 校验锁还是调用链那一把（token = 父进程 pid），被回收就放弃探测；
+		#   2) 把 pid 改成自己——锁的属主从此是本进程，退出时由 trap 删除；
+		#   3) 探测交给独立 argv 的引擎进程并 wait。
+		# 为什么要分两层：ash 的 $(...) / 管道子 shell 会继承父进程的 argv，
+		# 16 连点时 ps 会把 1 个 worker 的 2-3 个命令替换子 shell 误数成
+		# “多个并发 worker”（fix29 实测 4 个）。引擎用另一个入口运行后，
+		# 进程表里带 "isp-split linecheck" 的只剩唯一这个持锁监督者。
+		_tok=${ISP_SPLIT_LC_LOCK_TOKEN:-}
+		_cur=$(cat "$LC_LOCK/pid" 2>/dev/null)
+		if [ -n "$_tok" ] && [ -n "$_cur" ] && [ "$_cur" != "$_tok" ]; then
+			printf 'linecheck: 锁已被其他进程接管，本次放弃探测\n' >&2
+			return 3
+		fi
 		mkdir -p "$LC_LOCK" 2>/dev/null || true
 		_lc_now >"$LC_LOCK/started" 2>/dev/null || true
 		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null || true
+		LC_LOCK_OWNER=1
+		_lc_trap_on
+		if [ -f "$LC_RUN" ]; then
+			_lc_self=${0:-/usr/sbin/isp-split}
+			case "$_lc_self" in
+			*/*) ;;
+			*) _lc_self=$(command -v "$_lc_self" 2>/dev/null) || _lc_self=/usr/sbin/isp-split ;;
+			esac
+			set -- linecheck --json --_worker --_runner
+			[ "$_lc_force" = "1" ] && set -- "$@" --force
+			[ -n "$_lc_only" ] && set -- "$@" --wan "$_lc_only"
+			: >"$LC_LOG" 2>/dev/null || true
+			if command -v setsid >/dev/null 2>&1; then
+				ISP_SPLIT_LC_SELF=$_lc_self setsid sh "$LC_RUN" "$@" </dev/null >>"$LC_LOG" 2>&1 &
+			else
+				ISP_SPLIT_LC_SELF=$_lc_self sh "$LC_RUN" "$@" </dev/null >>"$LC_LOG" 2>&1 &
+			fi
+			LC_CHILD_PID=$!
+			wait "$LC_CHILD_PID"
+			_rc=$?
+			LC_CHILD_PID=""
+			return "$_rc"
+		fi
+		# 引擎入口缺失：保持在进程内探测（功能不受影响，只是进程数不再收敛）。
+	fi
+	if [ "$_lc_worker" = "1" ]; then
+		# ---- 引擎（--_runner）或引擎入口缺失时的退化路径 ----
+		# 引擎：锁由监督者持有，绝不写锁、也不删锁。
+		# 退化（没有 lc-run）：本进程就是持锁者，必须保留 owner=1 以便退出时删锁。
+		if [ "$_lc_runner" = "1" ]; then
+			LC_LOCK_OWNER=0
+		fi
 		_lc_trap_on
 	fi
 
@@ -6917,6 +6998,8 @@ cmd_linecheck() {
 	return 0
 }
 
+# lc:end
+
 # 自检/单测可以只加载函数，不执行主分发（selftest.sh 用）。
 if [ "${ISP_SPLIT_LIB_ONLY:-0}" = "1" ]; then
 	return 0 2>/dev/null || exit 0
@@ -6963,7 +7046,9 @@ policy-check) shift; cmd_policy_check "$@" ;;
 status) shift; cmd_status "$@" ;;
 health) shift; cmd_health "$@" ;;
 probe) cmd_probe ;;
+# lc:begin
 linecheck) shift; cmd_linecheck "$@" ;;
+# lc:end
 rollback) cmd_rollback ;;
 dns) cmd_dns ;;
 conf) shift; cmd_conf "$@" ;;
@@ -6971,6 +7056,13 @@ refresh) cmd_refresh ;;
 export) shift; cmd_export "$@" ;;
 install) cmd_install ;;
 uninstall) cmd_uninstall ;;
+# 剥离版的固定拒绝桩（FEATURE_LINECHECK=0 时上面的实现分支已被整段删除）。
+# 用 glob 匹配命令名而不是写字面量：产物必须通过“零残留 grep”断言，
+# 但仍要对已剥离的子命令给出明确、稳定的拒绝文案与退出码。
+line*check)
+	printf '此版本未包含该功能\n' >&2
+	exit 2
+	;;
 *)
 	cat <<EOF
 用法: isp-split <命令>
@@ -7004,8 +7096,10 @@ uninstall) cmd_uninstall ;;
   status     查看条目数与命中统计
   health     数据源健康度 + 双线状态（--json 给 LuCI 用）
   probe      分线实测出口速度
+# lc:begin
   linecheck  线路体检：公网/NAT/四段延迟/归属地/评分（--json，--wan，--force）
              --background 后台探测并原子替换缓存（LuCI 用，立刻返回 JSON 状态）
+# lc:end
   dns        生成多线路 DNS 配置（域名按线路选 DNS）
   export     导出给代理侧用：export mihomo|singbox|text <目录>
   install    注册开机自启与每日更新

@@ -16,7 +16,9 @@
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
+<!-- lc:begin -->
 - **线路体检（0.3.0）**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
+<!-- lc:end -->
 - **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
 - **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
 
@@ -24,7 +26,10 @@
 
 - OpenWrt 23.05+（firewall4 / 纯 nftables）；25.12（x86_64）完整验证，其余平台见下表
 - **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源的 `mwan3` 是 iptables 版，不兼容。安装前可自查：`grep -c render_config_ipsets /lib/mwan3/mwan3.sh`，结果需 ≥ 1；为 0 时请改用 Kwrt 源中的 `mwan3-nft`，或从 [dl12345/mwan3 releases](https://github.com/dl12345/mwan3/releases) 安装 nft 版
-- `nftables`、`curl`、`socat`（线路体检的 UDP STUN 锁线探测；缺失时自动降级为“NAT 未知”，不阻断其他功能）；LuCI 页面为可选组件
+- `nftables`、`curl`；LuCI 页面为可选组件
+<!-- lc:begin -->
+- 线路体检另需 `socat`（UDP STUN 锁线探测）；缺失时自动降级为“NAT 未知”，不阻断其他功能
+<!-- lc:end -->
 
 ## 平台验证状态
 
@@ -107,7 +112,9 @@ isp-split status    # 各集合命中计数与流量
 | `verify` / `probe` | 渲染核对 / 分线测速 | 无 |
 | `policy-check [--json]` | 检查 ISP_TABLE 启用行的策略是否都有成员（LuCI 提示条数据源） | 无 |
 | `dnstest <策略>` | 测一条线路的 DNS 是否可用 | 无 |
+<!-- lc:begin -->
 | `linecheck [--json] [--wan <接口>] [--force] [--background]` | 线路体检：出口类型 / 四段延迟 / NAT / 归属地 / 评分 | 无（只读探测） |
+<!-- lc:end -->
 | `conf check` / `conf preview` | 只校验配置 / 预演未保存的改动 | 无 |
 | `export` | 导出给 mihomo / sing-box | 无 |
 | `stage` / `enable` | 灰度：先注入不渲染，确认后启用 | mwan3 |
@@ -131,6 +138,7 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 
 生效方式：策略映射改动执行 `isp-split wire && isp-split apply`；DNS 改动执行 `isp-split dns`；也可在 LuCI 配置页操作。完整字段说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
 
+<!-- lc:begin -->
 线路体检（0.3.0）的开关与隐私：
 
 ```sh
@@ -145,6 +153,7 @@ STUN（4 台）与同网/基线延迟探测仍会照常发出。卡片显示“�
 但仍会用本地 `@isp_*` 集合判断运营商大类。要完全停发体检请求，请设
 `LINE_CHECK_ENABLE=0`。完整字段与隐私说明见
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#线路体检line_check_)。
+<!-- lc:end -->
 
 多数据源（0.2.1 默认双源：yfgao 主源 + clang 校验源）：
 
@@ -187,7 +196,9 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 | 域名 / 设备钉线 | ✅ | ✅ `DOMAIN_SPLIT` + mwan3 源地址规则 |
 | 灰度 / 预演 / 回滚 | 部分 | ✅ 三级预检 + stage 灰度 + 一键还原 |
 | 数据源质量校验 | ❌ | ✅ 主源 + 校验源日 diff（Jaccard 阈值 + 差异段留档） |
+<!-- lc:begin -->
 | 线路体检 / NAT 判定 | 部分 | ✅ 出口类型、四段延迟、五态 NAT、归属地、可解释评分（不做 NAT1-4 细分） |
+<!-- lc:end -->
 | 开源可审计 | ❌ | ✅ MIT，纯 shell + awk，无黑盒 |
 | DPI 应用识别选线 | ✅ | ❌ 见下方说明 |
 
@@ -210,6 +221,7 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 11. 默认主源 yfgao 只提供 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 中的
     `chinabtn/gwbn/othernet/hk/mo/tw` 默认关闭。要启用这些分类，需要换用提供对应文件的
     主源（例如把 clang 配成 primary），否则 `fetch` 会明确报缺文件
+<!-- lc:begin -->
 12. 线路体检的 NAT 判定只给「公网 / 锥形 / 对称或多出口 / CGNAT / 未知」五态，
     **不是 NAT1-4 认证**：公网 STUN 服务器基本不支持 `CHANGE-REQUEST`，无法可靠区分
     Full Cone / Restricted / Port-Restricted。UDP 3478 被运营商阻断时只降级为“未知”，
@@ -217,13 +229,16 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 13. 归属地查询会把每条 WAN 的出口公网 IP 发给第三方（默认百度，失败转 ip-api.com）；
     只发送出口 IP，不发送内网地址、设备名、MAC 或流量内容。ip-api 使用 HTTP 明文，
     介意时把 `LINE_CHECK_GEO` 设为 `0` 或把 `LINE_CHECK_GEO_PROVIDER` 固定为 `baidu`
+<!-- lc:end -->
 
 ## 路线图
 
 - [x] **0.2.1**：主源切到 `gaoyifan/china-operator-ip`（MIT），默认 `ISP_VERIFY_ENABLE=1`，
       校验源换 clang；`sources.tsv` 残留清理、LuCI 只读数据源区块
-- [x] **0.3.0**：线路体检 MVP——公网/CGNAT/私网分类、出口 IP、四段延迟、双 STUN
+<!-- lc:begin -->
+- [ ] **0.3.0**：线路体检 MVP——公网/CGNAT/私网分类、出口 IP、四段延迟、双 STUN
       五态 NAT、归属地隐私开关、可解释评分、60s 缓存、LuCI 卡片页
+<!-- lc:end -->
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）

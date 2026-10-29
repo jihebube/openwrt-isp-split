@@ -91,6 +91,33 @@ cd repo/packages
 
 自建 **apk 源不建议**：25.12 的 `packages.adb` 索引只能由 apk-tools 3 生成且默认要求签名，无现成工具链，用 Release 分发更简单。
 
+## 出货门：FEATURE_LINECHECK
+
+`FEATURE_LINECHECK` 是**构建期**开关，默认 `0`：
+
+| 值 | 用途 | 产物 |
+|----|------|------|
+| `0` | 0.2.3 纯修复版 | 线路体检的实现/CLI/conf 键/LuCI 页与菜单/`socat` 依赖全部不进包 |
+| `1` | 0.3.0 及后续功能版 | 完整线路体检 |
+
+```sh
+# 0.2.3（默认）
+sh scripts/build-ipk.sh
+FEATURE_LINECHECK=0 sh scripts/build-apk.sh 25.12.6 x86/64
+
+# 0.3.0 预览：保留完整功能
+FEATURE_LINECHECK=1 sh scripts/build-ipk.sh
+FEATURE_LINECHECK=1 sh scripts/build-apk.sh 25.12.6 x86/64
+```
+
+剥离由源文件里的 `lc:begin` / `lc:end` 标记驱动，`scripts/strip-linecheck.sh`
+统一执行（SDK 的 `Build/Prepare` 用同一套 sed 规则）。产物必须通过
+`tools/selftest.sh` 第 19 节：文件清单无 `linecheck.js`、menu 子节点=2、
+control `Depends` 无 `socat`、grep 零残留、被剥离的 CLI 固定拒绝文案。
+
+> 0.2.3 不发布“源码 tarball”，只发运行时 install 包与 ipk/apk；
+> 0.3.0 起恢复完整源码包。
+
 ## 常见问题
 
 **安装时报 signature check failed**
