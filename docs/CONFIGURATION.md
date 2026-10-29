@@ -274,7 +274,7 @@ isp-split linecheck --force         # 绕过 60s 结果缓存，强制重测
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LINE_CHECK_ENABLE` | `1` | 总开关；`0` 时命令直接拒绝执行，LuCI 显示已关闭 |
-| `LINE_CHECK_GEO` | `1` | 归属地隐私开关；`1` 允许把每条 WAN 的**出口公网 IP**发给第三方，`0` 完全不发请求 |
+| `LINE_CHECK_GEO` | `1` | 归属地隐私开关；`1` 允许把每条 WAN 的**出口公网 IP**发给第三方，`0` 只关闭归属地查询（出口 IP 回显、STUN、延迟探测照常外发） |
 | `LINE_CHECK_GEO_PROVIDER` | `auto` | `auto`（百度优先，失败转 ip-api）/ `baidu` / `ip-api` / `off` |
 | `LINE_CHECK_GEO_TTL` | `86400` | 同一出口 IP 的归属地缓存秒数（最小 60） |
 | `LINE_CHECK_MIN_INTERVAL` | `60` | 结果缓存与手动触发最小间隔（15-3600 秒）；`--force` 可绕过 |
@@ -282,9 +282,9 @@ isp-split linecheck --force         # 绕过 60s 结果缓存，强制重测
 | `LINE_CHECK_BUDGET` | `20` | 单条 WAN 的探测预算；超出后跳过剩余 STUN/归属地并在明细里标注 |
 | `LINE_CHECK_TARGETS` | 电信/联通/移动/教育网各 2 个域名 | 格式 `<运营商源名>:<域名1>,<域名2>`；源名必须与 `ISP_TABLE` 第一列一致。线路运营商由 WAN IP / 出口 IP 匹配 `@isp_*` 得出；两者都不在集合里时直接走跨网基线，不猜运营商 |
 | `LINE_CHECK_BASELINE` | `www.baidu.com,www.qq.com` | 同网目标全部失败时的跨网基线；只判连通性，延迟项最高 15 分 |
-| `LINE_CHECK_STUN_SERVERS` | miwifi / douyu / freeswitch / cloudflare（bilibili 可选） | `<域名或 IP>:<端口>`；运行时按厂商优先解析，同一本地端口探测，失败自动换下一个；公网 STUN 可达性会波动 |
-| `LINE_CHECK_ECHO_URLS` | `api.ipify.org,ipv4.icanhazip.com` | 出口 IP 回显服务，按顺序尝试 |
-| `LINE_CHECK_UA` | 浏览器 UA | 部分运营商站点对默认 curl UA 返回 412/418，必须带浏览器 UA |
+| `LINE_CHECK_STUN_SERVERS` | miwifi / douyu / freeswitch / cloudflare（bilibili 可选） | `<域名或 IP>:<端口>`；运行时按厂商优先解析，同一本地端口探测，失败自动换下一个；公网 STUN 可达性会波动。清单为空或全部非法时该 WAN 的 NAT 判 `unknown`，不影响其它项 |
+| `LINE_CHECK_ECHO_URLS` | `api.ipify.org,ipv4.icanhazip.com` | 出口 IP 回显服务，按顺序尝试；只接受 `http(s)://` + 常规 URL 字符（不接受查询串、curl 选项或 shell 元字符） |
+| `LINE_CHECK_UA` | 浏览器 UA | 部分运营商站点对默认 curl UA 返回 412/418，必须带浏览器 UA；`conf set/check` 限制 512 字符并拒绝 CR/LF |
 
 ### 隐私声明
 

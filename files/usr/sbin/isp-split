@@ -1574,25 +1574,105 @@ cmd_selftest() {
 
 # ---------------------------------------------------------------- wire
 
+# 段名冲突保护（SEC S8，与 init 的 policy/member 保护同一口径）：
+# 同名段已存在但段内没有 isp_split=1，说明是用户/其它工具的配置，
+# 绝不静默改写、合并或打上我们的标记（否则 uninstall 会把它删掉）。
+_wire_ipset_check() {
+	_wi_set=$1
+	_wi_sec="ipset_$_wi_set"
+	_wi_type=$(uci -q get "mwan3.$_wi_sec" 2>/dev/null)
+	[ -n "$_wi_type" ] || return 0
+	if [ "$_wi_type" != "ipset" ]; then
+		die "mwan3 中已存在同名段 '$_wi_sec'（类型 $_wi_type，不是 ipset）；为保护现有配置，wire 不做改动（冲突段名: mwan3.$_wi_sec；请先在 mwan3 中删除/改名，或改用其它集合名）"
+	fi
+	[ "$(uci -q get "mwan3.$_wi_sec.isp_split" 2>/dev/null)" = "1" ] ||
+		die "mwan3 中已存在同名 ipset 段 '$_wi_sec' 且没有 isp_split 标记；为保护现有配置，wire 不做改动（冲突段名: mwan3.$_wi_sec；请先在 mwan3 中删除/改名，或改用其它集合名）"
+	return 0
+}
+
+# 生成一个 ipset 段的配置文本。候选文件由文本级重写生成（不经过
+# uci commit），这样 splice/解析校验全部通过之前不会落盘任何东西。
+_wire_ipset_block() {
+	_wb_src=$1
+	_wb_set=$2
+	_wb_file=$DATA/$_wb_src.txt
+	case "$_wb_file" in
+	*"'"*) die "数据文件路径含单引号，无法安全写入 mwan3 配置: $_wb_file" ;;
+	esac
+	printf "config ipset 'ipset_%s'\n" "$_wb_set"
+	printf "\toption name '%s'\n" "$_wb_set"
+	printf "\toption family 'ipv4'\n"
+	printf "\toption counters '1'\n"
+	printf "\toption loadfile '%s'\n" "$_wb_file"
+	printf "\toption enabled '1'\n"
+	# 精确标记：rules-splice/uninstall 只按它识别本工具的段，
+	# 不再按 isp_ 前缀误伤用户自己的 rule。
+	printf "\toption isp_split '1'\n"
+	printf "\n"
+}
+
+# 在候选配置里重写某个集合的 ipset 段：删掉同名旧块（只可能是带标记的
+# 本工具段，冲突已在 _wire_ipset_check 里 die），再追加一份完整的新块。
+_wire_ipset_text() {
+	_wt_src=$1
+	_wt_set=$2
+	_wt_sec="ipset_$_wt_set"
+	_wt_file=$WORK/mwan3.base
+	_wt_tmp=$WORK/mwan3.base.tmp
+	awk -v want="$_wt_sec" '
+		BEGIN { sq = "\047"; dq = "\"" }
+		function ours(   nm) {
+			if ($1 != "config" || $2 != "ipset") return 0
+			nm = $3
+			return (nm == want || nm == sq want sq || nm == dq want dq)
+		}
+		ours() { skip = 1; next }
+		/^[[:space:]]*config[[:space:]]/ { skip = 0 }
+		skip { next }
+		{ print }
+	' "$_wt_file" > "$_wt_tmp" || return 1
+	mv -f "$_wt_tmp" "$_wt_file" || return 1
+	# 文件末尾没有换行时先补一个，避免新块粘在上一行末尾。
+	if [ -s "$_wt_file" ] && [ -n "$(tail -c 1 "$_wt_file" 2>/dev/null)" ]; then
+		printf '\n' >> "$_wt_file" || return 1
+	fi
+	_wire_ipset_block "$_wt_src" "$_wt_set" >> "$_wt_file" || return 1
+	return 0
+}
+
 _wire_ipset() {
 	_src=$1
 	_set=$2
 	_sec="ipset_$_set"
-	uci -q get "mwan3.$_sec" >/dev/null 2>&1 || uci set "mwan3.$_sec=ipset"
-	uci set "mwan3.$_sec.name=$_set"
-	uci set "mwan3.$_sec.family=ipv4"
-	uci set "mwan3.$_sec.counters=1"
-	uci set "mwan3.$_sec.loadfile=$DATA/$_src.txt"
-	uci set "mwan3.$_sec.enabled=1"
-	# 精确标记：rules-splice/uninstall 只按它识别本工具的段，
-	# 不再按 isp_ 前缀误伤用户自己的 rule。
-	uci set "mwan3.$_sec.isp_split=1"
+	_wire_ipset_check "$_set"
+	if ! uci -q get "mwan3.$_sec" >/dev/null 2>&1; then
+		uci set "mwan3.$_sec=ipset" ||
+			die "无法创建 mwan3 ipset 段 '$_sec'"
+	fi
+	uci set "mwan3.$_sec.name=$_set" || die "无法写入 mwan3.$_sec.name"
+	uci set "mwan3.$_sec.family=ipv4" || die "无法写入 mwan3.$_sec.family"
+	uci set "mwan3.$_sec.counters=1" || die "无法写入 mwan3.$_sec.counters"
+	uci set "mwan3.$_sec.loadfile=$DATA/$_src.txt" ||
+		die "无法写入 mwan3.$_sec.loadfile"
+	uci set "mwan3.$_sec.enabled=1" || die "无法写入 mwan3.$_sec.enabled"
+	uci set "mwan3.$_sec.isp_split=1" || die "无法写入 mwan3.$_sec.isp_split"
 }
 
 _write_rule() {
 	_src=$1
 	_set=$2
 	_pol=$3
+	# 规则段名与集合名相同（mwan3.<集合名>）。若用户已有同名 rule
+	# 段且没有我们的标记，splice 会把两段合并、用户的 use_policy 条件
+	# 被覆盖，之后还会被当成我们的块整段删除——必须在写片段前硬失败。
+	_wr_type=$(uci -q get "mwan3.$_set" 2>/dev/null)
+	if [ -n "$_wr_type" ]; then
+		if [ "$_wr_type" != "rule" ]; then
+			die "mwan3 中已存在同名段 '$_set'（类型 $_wr_type，不是 rule）；为保护现有配置，wire 不做改动（冲突段名: mwan3.$_set；请先在 mwan3 中删除/改名，或改用其它集合名）"
+		fi
+		[ "$(uci -q get "mwan3.$_set.isp_split" 2>/dev/null)" = "1" ] ||
+			die "mwan3 中已存在同名 rule 段 '$_set' 且没有 isp_split 标记；为保护现有配置，wire 不做改动（冲突段名: mwan3.$_set；请先在 mwan3 中删除/改名，或改用其它集合名）"
+	fi
 	{
 		printf "config rule '%s'\n" "$_set"
 		printf "\toption ipset '%s'\n" "$_set"
@@ -2291,11 +2371,22 @@ cmd_policy_check() {
 	return 0
 }
 
+# 原子替换 mwan3 配置。调用方必须已经用 uci -c 临时目录解析校验过 $1。
+# `cat > 目标` 是先截断再写，掉电/被杀会留下半截 mwan3；mv -f 在同文件
+# 系统上是 rename(2)，要么旧文件、要么完整新文件。模式沿用原文件，
+# 避免把 600 的 /etc/config/* 变成 644。
+_mwan3_atomic_install() {
+	_mi_src=$1
+	[ -f "$_mi_src" ] || return 1
+	_mi_mode=$(stat -c %a "$CFG_MWAN3" 2>/dev/null) || _mi_mode=600
+	chmod "$_mi_mode" "$_mi_src" 2>/dev/null || true
+	mv -f "$_mi_src" "$CFG_MWAN3"
+}
+
 cmd_wire() {
 	_openclash_fakeip_warn
 	need_nft
-	# 先确认 work 目录可写再动 UCI：否则可能 commit 了 ipset 段之后才发现
-	# 写不了规则片段，留下半套配置。
+	# 先确认 work 目录可写再动 UCI：否则可能写到一半才发现写不了规则片段。
 	_work_writable || die "work 目录不可写（$WORK）：无法写入规则片段，配置未改动"
 
 	# 0. 策略预检（BUG-25）：必须在动 UCI/nft 之前。mwan3 对"策略不存在"
@@ -2304,12 +2395,8 @@ cmd_wire() {
 	_precheck_policies ||
 		die "策略预检失败：上面的策略在 mwan3 中缺失或没有可用成员，规则无法正确渲染（本次未改动任何配置）。运行 isp-split init 绑定线路后重试"
 
-	# 1. 集合声明
-	_wire_all() { _wire_ipset "$1" "$2"; }
-	foreach_enabled _wire_all
-	uci -q commit mwan3
-
-	# 2. 规则片段
+	# 1. 规则片段（只写 work 目录，不动 UCI）。_write_rule 同时检查
+	#    同名 rule 段是否被用户占用；冲突时在写任何 UCI 之前 die。
 	: > "$WORK/rules.txt" || die "无法写入 $WORK/rules.txt（work 目录不可写？）"
 	_write_all() { _write_rule "$1" "$2" "$3"; }
 	foreach_enabled _write_all
@@ -2320,16 +2407,40 @@ cmd_wire() {
 	[ -s "$WORK/rules.txt" ] ||
 		log "警告：ISP_TABLE 中没有启用的运营商，本次规则块为空（已有 isp-split 规则将被移除）"
 
-	# 4. 插入到正确位置
+	# 2. ipset 段名冲突全量预检：所有行都通过才允许进入写阶段。
+	#    放在 uci set 之前，避免"第一条已写、第二条冲突"留下暂存区残料。
+	_wire_check_all() { _wire_ipset_check "$2"; }
+	foreach_enabled _wire_check_all
+
+	# 3. uci set 只写暂存区，不 commit。中途任何 die 都由 trap 撤销，
+	#    避免半套 ipset 段留在 /tmp/.uci 被下一次无关 commit 带进配置。
+	WIRE_DIRTY=1
+	_wire_cleanup() {
+		[ "${WIRE_DIRTY:-0}" = "1" ] && uci -q revert mwan3 2>/dev/null
+	}
+	trap '_wire_cleanup' EXIT
+	trap '_wire_cleanup; exit 130' INT TERM
+	_wire_all() { _wire_ipset "$1" "$2"; }
+	foreach_enabled _wire_all
+
+	# 4. 生成候选配置：备份原文 -> 文本级重写 ipset 段 -> splice 规则。
+	#    此时正式配置仍未被改动（只有 uci 暂存区）。
 	cp "$CFG_MWAN3" "$WORK/mwan3.bak" ||
 		die "无法备份 $CFG_MWAN3 到 $WORK/mwan3.bak，配置未改动"
+	cp "$WORK/mwan3.bak" "$WORK/mwan3.base" ||
+		die "无法生成待校验配置（$WORK/mwan3.base），配置未改动"
+	_wire_text_all() {
+		_wire_ipset_text "$1" "$2" ||
+			die "无法在候选配置中重写 ipset 段 'ipset_$2'，配置未改动"
+	}
+	foreach_enabled _wire_text_all
 	awk -v insert="$WORK/rules.txt" -v anchor="$ISP_ANCHOR" \
-		-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" ||
+		-f "$LIB/rules-splice.awk" "$WORK/mwan3.base" > "$WORK/mwan3.new" ||
 		die "规则注入失败（锚点缺失或配置不可写），配置未改动"
 
 	# 冒烟检查：必须用新生成的 mwan3.new 做 uci 解析，而不是读旧的
 	# /etc/config/mwan3（旧写法永远通过，等于没检查）。把新文件放到临时
-	# 目录并命名为 mwan3，校验通过后才覆盖正式配置。
+	# 目录并命名为 mwan3，校验通过后才替换正式配置。
 	_ucitmp=$WORK/uci-check
 	rm -rf "$_ucitmp"
 	mkdir -p "$_ucitmp" || die "无法创建 uci 校验临时目录"
@@ -2343,9 +2454,23 @@ cmd_wire() {
 	fi
 	rm -rf "$_ucitmp"
 
-	cat "$WORK/mwan3.new" > "$CFG_MWAN3"
+	# 5. 内容校验通过后，才原子替换正式配置。
+	_mwan3_atomic_install "$WORK/mwan3.new" ||
+		die "无法原子替换 $CFG_MWAN3（已放弃，备份在 $WORK/mwan3.bak）"
+
+	# 6. 落盘之后才 commit uci 暂存区。文件里已经是同一份校验过的内容；
+	#    commit 失败也只清暂存区并告警，不把已校验的配置回退成旧的。
+	if uci -q commit mwan3; then
+		WIRE_DIRTY=0
+		trap - EXIT INT TERM
+	else
+		uci -q revert mwan3 2>/dev/null
+		WIRE_DIRTY=0
+		trap - EXIT INT TERM
+		log "警告：uci commit mwan3 失败；$CFG_MWAN3 已按校验通过的内容原子替换"
+	fi
 	log "规则已注入（备份: $WORK/mwan3.bak）"
-	# 5. 收敛孤儿 ipset / policy / member 段：必须放在规则块重写之后 ——
+	# 7. 收敛孤儿 ipset / policy / member 段：必须放在规则块重写之后 ——
 	# 改名时旧规则这一刻才消失；若在注入前做，旧规则仍引用旧段，会被
 	# 误判成"保留"。
 	_prune_orphan_ipsets
@@ -3904,10 +4029,156 @@ _valid_ipv4() {
 	return 0
 }
 
+# ---- LINE_CHECK_* 值校验（conf set / conf check 共用）----
+# 这些键以前既不在白名单、也无读取侧校验：UA 可注入任意 HTTP 头，
+# ECHO_URLS 的元素可被 curl 当成选项（-K<file>）。下面按“最小可用字符集”
+# 收口，凡是能变成第二个 argv / shell 元字符的输入一律拒绝。
+
+_conf_lc_ctrl() { # 含 CR/LF/TAB 等控制字符 -> 0
+	printf '%s' "${1:-}" | grep -q '[[:cntrl:]]'
+}
+
+_conf_lc_url_ok() {
+	case "${1:-}" in
+	http://?* | https://?*) ;;
+	*) return 1 ;;
+	esac
+	# 只放行 URL 常规字符；; & | $ ` < > ( ) { } [ ] * ? ! # ' " \ 空格
+	# 全部不在集合里，因此 curl 选项注入和 shell 元字符都会被拒。
+	_conf_lc_bad=$(printf '%s' "$1" | tr -d 'A-Za-z0-9:/._~%+=-')
+	[ -z "$_conf_lc_bad" ] || return 1
+	# host 段必须是域名或严格 IPv4 字面量（不含 userinfo/端口）
+	_conf_lc_rest=${1#*://}
+	_conf_lc_host=${_conf_lc_rest%%/*}
+	_conf_lc_host=${_conf_lc_host%%:*}
+	case "$_conf_lc_host" in
+	'' | -* | .* | *. | *..* | *[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
+_conf_lc_urls_ok() {
+	_conf_lc_urls_n=0
+	_conf_lc_urls_old=$IFS
+	_conf_lc_urls_list=$(printf '%s' "${1:-}" | tr ',' ' ' | tr '\t\r\n' '   ')
+	IFS=' '
+	for _conf_lc_u in $_conf_lc_urls_list; do
+		[ -n "$_conf_lc_u" ] || continue
+		_conf_lc_url_ok "$_conf_lc_u" || {
+			IFS=$_conf_lc_urls_old
+			return 1
+		}
+		_conf_lc_urls_n=$((_conf_lc_urls_n + 1))
+	done
+	IFS=$_conf_lc_urls_old
+	[ "$_conf_lc_urls_n" -gt 0 ]
+}
+
+_conf_lc_stun_ok() {
+	_conf_lc_stun_old=$IFS
+	_conf_lc_stun_list=$(printf '%s' "${1:-}" | tr '\t\r\n' '   ')
+	IFS=' '
+	for _conf_lc_s in $_conf_lc_stun_list; do
+		[ -n "$_conf_lc_s" ] || continue
+		case "$_conf_lc_s" in
+		*:*) ;;
+		*)
+			IFS=$_conf_lc_stun_old
+			return 1
+			;;
+		esac
+		_conf_lc_sh=${_conf_lc_s%:*}
+		_conf_lc_sp=${_conf_lc_s##*:}
+		case "$_conf_lc_sh" in
+		'' | -* | .* | *. | *..* | *[!A-Za-z0-9._-]*)
+			IFS=$_conf_lc_stun_old
+			return 1
+			;;
+		esac
+		case "$_conf_lc_sp" in
+		'' | *[!0-9]*)
+			IFS=$_conf_lc_stun_old
+			return 1
+			;;
+		esac
+		[ "$_conf_lc_sp" -ge 1 ] && [ "$_conf_lc_sp" -le 65535 ] || {
+			IFS=$_conf_lc_stun_old
+			return 1
+		}
+	done
+	IFS=$_conf_lc_stun_old
+	# 空清单是合法配置：运行时降级为 unknown，不崩、不探测。
+	return 0
+}
+
+_conf_lc_domain_ok() {
+	case "${1:-}" in '' | -* | .* | *. | *..*) return 1 ;; esac
+	_valid_domain "$1"
+}
+
+_conf_lc_domains_ok() {
+	_conf_lc_dom_old=$IFS
+	_conf_lc_dom_list=$(printf '%s' "${1:-}" | tr ',' ' ' | tr '\t\r\n' '   ')
+	IFS=' '
+	for _conf_lc_d in $_conf_lc_dom_list; do
+		[ -n "$_conf_lc_d" ] || continue
+		_conf_lc_domain_ok "$_conf_lc_d" || {
+			IFS=$_conf_lc_dom_old
+			return 1
+		}
+	done
+	IFS=$_conf_lc_dom_old
+	return 0
+}
+
+_conf_lc_targets_ok() {
+	_conf_lc_t_old=$IFS
+	_conf_lc_t_list=$(printf '%s' "${1:-}" | tr '\t\r\n' '   ')
+	IFS=' '
+	for _conf_lc_line in $_conf_lc_t_list; do
+		[ -n "$_conf_lc_line" ] || continue
+		_conf_lc_save_ifs=$IFS
+		IFS=':'
+		set -- $_conf_lc_line
+		IFS=$_conf_lc_save_ifs
+		[ $# -eq 2 ] || {
+			IFS=$_conf_lc_t_old
+			return 1
+		}
+		_valid_src "$1" || {
+			IFS=$_conf_lc_t_old
+			return 1
+		}
+		_conf_lc_dlist=$(printf '%s' "$2" | tr ',' ' ')
+		_conf_lc_dn=0
+		IFS=' '
+		for _conf_lc_td in $_conf_lc_dlist; do
+			[ -n "$_conf_lc_td" ] || continue
+			_conf_lc_domain_ok "$_conf_lc_td" || {
+				IFS=$_conf_lc_t_old
+				return 1
+			}
+			_conf_lc_dn=$((_conf_lc_dn + 1))
+		done
+		IFS=$_conf_lc_save_ifs
+		[ "$_conf_lc_dn" -gt 0 ] || {
+			IFS=$_conf_lc_t_old
+			return 1
+		}
+	done
+	IFS=$_conf_lc_t_old
+	return 0
+}
+
 # 校验某个 KEY 的完整值；失败直接 die（不写文件）
 _conf_validate() {
 	_key=$1
 	_val=$2
+	# 整段校验里会做 `for x in $val`；关掉路径名展开，避免值里的 * ? [
+	# 被当前目录文件名替换，导致“校验的值”和“写入的值”不是同一份。
+	_conf_had_f=0
+	case $- in *f*) _conf_had_f=1 ;; esac
+	set -f
 	# 注释行不参与校验（B-1）：整行删掉后再按空白拆字段。清理必须发生在
 	# 空白展开之前，否则 "# 说明:xxx" 会被拆成 "#" 和 "说明:xxx" 两段。
 	# 这里只改局部副本，写回文件的内容仍保留用户注释。
@@ -3915,8 +4186,17 @@ _conf_validate() {
 	ISP_TABLE | DNS_TABLE | DOMAIN_SPLIT) _val=$(_strip_comments "$_val") ;;
 	esac
 	case "$_val" in
-	*'$'* | *'`'* | *'"'* | *"'"* | *'\'* | *';'* | *'|'*)
-		die "配置值含不允许的字符（\$ \` \" ' \\ ; |）"
+	*'$'* | *'`'* | *'"'* | *"'"* | *'\'*)
+		die "配置值含不允许的字符（\$ \` \" ' \\）"
+		;;
+	esac
+	# ; | 只在会进 uci 参数 / 表字段的键上禁止；UA/ACCEPT 合法地包含 ';'
+	# （Accept: text/html;q=0.9），URL 的非法字符由专门的 URL 校验挡。
+	case "$_key" in
+	ISP_TABLE | DNS_TABLE | DOMAIN_SPLIT)
+		case "$_val" in
+		*';'* | *'|'*) die "配置值含不允许的字符（; |）" ;;
+		esac
 		;;
 	esac
 
@@ -4016,9 +4296,82 @@ _conf_validate() {
 		[ "$_val" -ge 15 ] && [ "$_val" -le 3600 ] ||
 			die "LINE_CHECK_MIN_INTERVAL 必须在 15-3600 之间"
 		;;
+	LINE_CHECK_UA | LINE_CHECK_ACCEPT)
+		[ -n "$_val" ] || die "$_key 不能为空"
+		[ "${#_val}" -le 512 ] ||
+			die "$_key 过长（最多 512 字符）"
+		if _conf_lc_ctrl "$_val"; then
+			die "$_key 不能包含 CR/LF/TAB 等控制字符（会注入 HTTP 头）"
+		fi
+		;;
+	LINE_CHECK_ECHO_URLS)
+		_conf_lc_urls_ok "$_val" ||
+			die "LINE_CHECK_ECHO_URLS 必须是以逗号/空白分隔的 http(s):// URL（只允许 URL 常规字符，不接受 curl 选项或 shell 元字符）"
+		;;
+	LINE_CHECK_STUN_SERVERS)
+		_conf_lc_stun_ok "$_val" ||
+			die "LINE_CHECK_STUN_SERVERS 每项必须是 <域名或IPv4>:<端口1-65535>（空清单可接受）"
+		;;
+	LINE_CHECK_TARGETS)
+		_conf_lc_targets_ok "$_val" ||
+			die "LINE_CHECK_TARGETS 格式必须是 <运营商源名>:<域名1>,<域名2>（域名只允许 [A-Za-z0-9._-]）"
+		;;
+	LINE_CHECK_BASELINE)
+		_conf_lc_domains_ok "$_val" ||
+			die "LINE_CHECK_BASELINE 只能是逗号/空白分隔的域名（只允许 [A-Za-z0-9._-]）"
+		;;
+	LINE_CHECK_TIMEOUT)
+		case "$_val" in
+		'' | *[!0-9]*) die "LINE_CHECK_TIMEOUT 必须是整数秒（1-10）" ;;
+		esac
+		[ "$_val" -ge 1 ] && [ "$_val" -le 10 ] ||
+			die "LINE_CHECK_TIMEOUT 必须在 1-10 之间"
+		;;
+	LINE_CHECK_BUDGET)
+		case "$_val" in
+		'' | *[!0-9]*) die "LINE_CHECK_BUDGET 必须是整数秒（8-120）" ;;
+		esac
+		[ "$_val" -ge 8 ] && [ "$_val" -le 120 ] ||
+			die "LINE_CHECK_BUDGET 必须在 8-120 之间"
+		;;
+	LINE_CHECK_GEO_TTL)
+		case "$_val" in
+		'' | *[!0-9]*) die "LINE_CHECK_GEO_TTL 必须是整数秒（60-604800）" ;;
+		esac
+		[ "$_val" -ge 60 ] && [ "$_val" -le 604800 ] ||
+			die "LINE_CHECK_GEO_TTL 必须在 60-604800 之间"
+		;;
 	*)
 		die "未知配置项 '$_key'"
 		;;
+	esac
+	# die 会直接 exit；正常返回时恢复调用前的 glob 状态。
+	[ "$_conf_had_f" = "1" ] || set +f
+}
+
+# conf set/check 的小写键 -> 配置变量名。白名单与 _conf_validate 的
+# 分支一一对应，避免“能写但没校验”或“校验了但写不进去”。
+_CONF_KEYS_HINT="isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval / line_check_targets / line_check_stun_servers / line_check_echo_urls / line_check_ua / line_check_accept / line_check_timeout / line_check_budget / line_check_geo_ttl / line_check_baseline"
+_conf_key_norm() {
+	case "${1:-}" in
+	isp_table) printf 'ISP_TABLE' ;;
+	dns_table) printf 'DNS_TABLE' ;;
+	domain_split) printf 'DOMAIN_SPLIT' ;;
+	dns_mode) printf 'DNS_MODE' ;;
+	line_check_enable) printf 'LINE_CHECK_ENABLE' ;;
+	line_check_geo) printf 'LINE_CHECK_GEO' ;;
+	line_check_provider) printf 'LINE_CHECK_GEO_PROVIDER' ;;
+	line_check_interval) printf 'LINE_CHECK_MIN_INTERVAL' ;;
+	line_check_targets) printf 'LINE_CHECK_TARGETS' ;;
+	line_check_stun_servers) printf 'LINE_CHECK_STUN_SERVERS' ;;
+	line_check_echo_urls) printf 'LINE_CHECK_ECHO_URLS' ;;
+	line_check_ua) printf 'LINE_CHECK_UA' ;;
+	line_check_accept) printf 'LINE_CHECK_ACCEPT' ;;
+	line_check_timeout) printf 'LINE_CHECK_TIMEOUT' ;;
+	line_check_budget) printf 'LINE_CHECK_BUDGET' ;;
+	line_check_geo_ttl) printf 'LINE_CHECK_GEO_TTL' ;;
+	line_check_baseline) printf 'LINE_CHECK_BASELINE' ;;
+	*) return 1 ;;
 	esac
 }
 
@@ -4028,17 +4381,9 @@ _conf_write() {
 	_key=$1
 	_val=$2
 	_target=${3:-$CONF}
-	case "$_key" in
-	isp_table) _key=ISP_TABLE ;;
-	dns_table) _key=DNS_TABLE ;;
-	domain_split) _key=DOMAIN_SPLIT ;;
-	dns_mode) _key=DNS_MODE ;;
-	line_check_enable) _key=LINE_CHECK_ENABLE ;;
-	line_check_geo) _key=LINE_CHECK_GEO ;;
-	line_check_provider) _key=LINE_CHECK_GEO_PROVIDER ;;
-	line_check_interval) _key=LINE_CHECK_MIN_INTERVAL ;;
-	*) die "未知配置项 '$_key'，可选：isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval" ;;
-	esac
+	_raw_key=$_key
+	_key=$(_conf_key_norm "$_raw_key") ||
+		die "未知配置项 '$_raw_key'，可选：$_CONF_KEYS_HINT"
 
 	# 写入前必须通过白名单校验；失败即 die，绝不落盘
 	_conf_validate "$_key" "$_val"
@@ -4121,7 +4466,7 @@ _conf_write() {
 conf_set() {
 	_key=${1:-}
 	_val=${2:-}
-	[ -n "$_key" ] || die "用法: isp-split conf set <isp_table|dns_table|domain_split|dns_mode|line_check_enable|line_check_geo|line_check_provider|line_check_interval> <值>"
+	[ -n "$_key" ] || die "用法: isp-split conf set <项> <值>（可用项: $_CONF_KEYS_HINT）"
 	[ -f "$CONF" ] || die "找不到 $CONF"
 
 	# 允许用 | 代替换行（前端传参更省事）
@@ -4144,17 +4489,9 @@ conf_check() {
 	_ck_val=${2:-}
 	[ -n "$_ck_key" ] || die "用法: isp-split conf check <项> <值>"
 	_ck_val=$(printf '%s' "$_ck_val" | tr '|' '\n')
-	case "$_ck_key" in
-	isp_table) _ck_key=ISP_TABLE ;;
-	dns_table) _ck_key=DNS_TABLE ;;
-	domain_split) _ck_key=DOMAIN_SPLIT ;;
-	dns_mode) _ck_key=DNS_MODE ;;
-	line_check_enable) _ck_key=LINE_CHECK_ENABLE ;;
-	line_check_geo) _ck_key=LINE_CHECK_GEO ;;
-	line_check_provider) _ck_key=LINE_CHECK_GEO_PROVIDER ;;
-	line_check_interval) _ck_key=LINE_CHECK_MIN_INTERVAL ;;
-	*) die "未知配置项 '$_ck_key'，可选：isp_table / dns_table / domain_split / dns_mode / line_check_enable / line_check_geo / line_check_provider / line_check_interval" ;;
-	esac
+	_ck_raw=$_ck_key
+	_ck_key=$(_conf_key_norm "$_ck_raw") ||
+		die "未知配置项 '$_ck_raw'，可选：$_CONF_KEYS_HINT"
 	_conf_validate "$_ck_key" "$_ck_val" || return $?
 	echo "$_ck_key 校验通过"
 }
@@ -4488,7 +4825,7 @@ cmd_uninstall() {
 		cp "$CFG_MWAN3" "$WORK/mwan3.bak"
 		awk -v insert="$WORK/rules.txt" -v anchor="$ISP_ANCHOR" \
 			-f "$LIB/rules-splice.awk" "$WORK/mwan3.bak" > "$WORK/mwan3.new" &&
-			cat "$WORK/mwan3.new" > "$CFG_MWAN3"
+			_mwan3_atomic_install "$WORK/mwan3.new"
 	fi
 
 	# 按标记删，而不是按当前表名：改名/删除的孤儿段也要清掉（B-4）。
@@ -4786,7 +5123,9 @@ _lc_wan_one() {
 	_dev=$(ifstatus "$_want" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
 	_logical=$_want
 	if [ -z "$_dev" ]; then
-		if [ -d "/sys/class/net/$_want" ]; then
+		# 用 ifindex 判断“真实网络设备”：--wan .. / . 虽然能让 -d 成立
+		# （/sys/class/net/.. 存在），但不是设备，不能进 curl/socat。
+		if [ -e "/sys/class/net/$_want/ifindex" ]; then
 			_dev=$_want
 		else
 			return 1
@@ -4799,7 +5138,7 @@ _lc_wan_one() {
 	*)
 		# --wan 可以是裸设备（如 br-lan / pppoe-wan1）：ifstatus 不认，
 		# 用 operstate 判断，否则会把一条好好的线判成“未连接”。
-		if [ -d "/sys/class/net/$_dev" ]; then
+		if [ -e "/sys/class/net/$_dev/ifindex" ]; then
 			case "$(cat "/sys/class/net/$_dev/operstate" 2>/dev/null)" in
 			up) _state=online; _upn=1 ;;
 			down) _state=offline; _upn=0 ;;
@@ -4818,7 +5157,7 @@ _lc_wan_one() {
 		fi
 		;;
 	esac
-	[ -d "/sys/class/net/$_dev" ] || _upn=0
+	[ -e "/sys/class/net/$_dev/ifindex" ] || _upn=0
 	_ip=$(ifstatus "$_want" 2>/dev/null | jsonfilter -e '@.["ipv4-address"][0].address' 2>/dev/null)
 	[ -n "$_ip" ] || _ip=$(_lc_dev_ip "$_dev")
 	printf '%s\t%s\t%s\t%s\t%s\n' "$_logical" "$_dev" "$_upn" "$_state" "$_ip"
@@ -4970,19 +5309,61 @@ _lc_stun_once() { # <device> <server_ip> <server_port> <local_port> <timeout>
 	_sport=$3
 	_lport=$4
 	_sto=$5
-	_tmp=${TMPDIR:-/tmp}/isp-lc-stun.$$
-	_txid=$(_lc_stun_build "$_tmp.req" 2>/dev/null) || { rm -f "$_tmp.req"; return 1; }
+
+	# SEC S4：旧实现用固定路径 /tmp/isp-lc-stun.$$.req/.resp。$$ 可预测，
+	# 且 shell 的 `>`/socat 的 `>` 都会跟随 symlink，本机低权用户只要在
+	# /tmp 预铺链接，就能让 root 覆盖/截断任意文件。
+	# 现在：umask 077 + mktemp 随机名（O_EXCL 创建，别人无法预占），
+	# 创建后立即把同一个 inode 截断为 0；写入前再拒绝 symlink 作为
+	# 纵深防御。清理只使用下面两个变量里的真实路径，绝不按 $$ 重拼。
+	_sr_old_umask=$(umask)
+	umask 077
+	_sr_req=$(mktemp "${TMPDIR:-/tmp}/isp-lc-stun.XXXXXXXX" 2>/dev/null)
+	LC_STUN_REQ=$_sr_req
+	_sr_resp=$(mktemp "${TMPDIR:-/tmp}/isp-lc-stun.XXXXXXXX" 2>/dev/null)
+	LC_STUN_RESP=$_sr_resp
+	umask "$_sr_old_umask"
+	if [ -z "$_sr_req" ] || [ -z "$_sr_resp" ]; then
+		[ -n "$_sr_req" ] && rm -f "$_sr_req"
+		[ -n "$_sr_resp" ] && rm -f "$_sr_resp"
+		LC_STUN_REQ=""
+		LC_STUN_RESP=""
+		return 1
+	fi
+	if [ -L "$_sr_req" ] || [ -L "$_sr_resp" ]; then
+		rm -f "$_sr_req" "$_sr_resp"
+		LC_STUN_REQ=""
+		LC_STUN_RESP=""
+		return 1
+	fi
+	if ! : >"$_sr_req" 2>/dev/null || ! : >"$_sr_resp" 2>/dev/null; then
+		rm -f "$_sr_req" "$_sr_resp"
+		LC_STUN_REQ=""
+		LC_STUN_RESP=""
+		return 1
+	fi
+
+	_txid=$(_lc_stun_build "$_sr_req" 2>/dev/null) || {
+		rm -f "$_sr_req" "$_sr_resp"
+		LC_STUN_REQ=""
+		LC_STUN_RESP=""
+		return 1
+	}
 	_t0=$(_lc_uptime_ms)
 	socat -T "$_sto" - UDP4:"$_sip":"$_sport",bind=:"$_lport",so-bindtodevice="$_sdev" \
-		<"$_tmp.req" >"$_tmp.resp" 2>/dev/null
+		<"$_sr_req" >"$_sr_resp" 2>/dev/null
 	_rc=$?
 	_t1=$(_lc_uptime_ms)
 	if [ "$_rc" -ne 0 ]; then
-		rm -f "$_tmp.req" "$_tmp.resp"
+		rm -f "$_sr_req" "$_sr_resp"
+		LC_STUN_REQ=""
+		LC_STUN_RESP=""
 		return 1
 	fi
-	_res=$(_lc_stun_parse "$_tmp.resp" "$_txid")
-	rm -f "$_tmp.req" "$_tmp.resp"
+	_res=$(_lc_stun_parse "$_sr_resp" "$_txid")
+	rm -f "$_sr_req" "$_sr_resp"
+	LC_STUN_REQ=""
+	LC_STUN_RESP=""
 	[ -n "$_res" ] || return 1
 	printf '%s %s %s' "$_res" "$((_t1 - _t0))"
 }
@@ -5192,11 +5573,18 @@ _lc_stun_probe() { # <device> <wan_ip> <wan_class>
 		fi
 	done
 	IFS=$_old_ifs
-	_srv_list="$_srv_main $_srv_alt"
-
-
+	# SEC S2：_srv_main/_srv_alt 都为空时，旧写法 "=" 拼出来是一个空格，
+	# `[ -z "$_srv_list" ]` 判不出来；随后 `set -- $_srv_list` 得到 0 个
+	# 参数，`$1` 在 set -u 下直接让整条 WAN 的结果丢失。这里按拼接后的
+	# 非空白内容判空，并保证后面重试分支只在确实有服务器时才展开。
+	_srv_list=""
+	if [ -n "${_srv_main}${_srv_alt}" ]; then
+		_srv_list="$_srv_main $_srv_alt"
+	fi
 	if [ -z "$_srv_list" ]; then
 		LC_STUN_DETAIL="STUN 服务器域名全部解析失败（检查 DNS 或 LINE_CHECK_STUN_SERVERS）"
+		LC_STUN_TYPE=unknown
+		LC_STUN_CONF=unknown
 		return 0
 	fi
 
@@ -5229,10 +5617,11 @@ _lc_stun_probe() { # <device> <wan_ip> <wan_class>
 		_probe "$_s" "$_pn"
 		[ "${_probe_ok:-0}" = "1" ] && _pok=$((_pok + 1))
 	done
-	# 一个都没成功且预算还够：把第一个再试一次（UDP 首包偶发丢包）
+	# 一个都没成功且预算还够：把第一个再试一次（UDP 首包偶发丢包）。
+	# 即使上面的判空被绕过，也先用 $# 确认展开后确实有参数，绝不裸用 $1。
 	if [ "$_pok" -eq 0 ] && ! _lc_deadline_hit; then
 		set -- $_srv_list
-		_probe "$1" 1
+		[ $# -ge 1 ] && _probe "$1" 1
 	fi
 
 	_m1=$(printf '%s\n' "$LC_STUN_MAPS" | awk -F'|' '$3=="ok"{print $4; exit}')
@@ -6037,10 +6426,21 @@ LC_GEO=$STATE_DIR/linecheck.geo.tsv
 LC_LOG=$STATE_DIR/linecheck.log
 LC_LOCK_OWNER=0
 _lc_tmp=""
+# STUN 临时文件的真实路径（mktemp 结果）。trap 清理必须用它，不能按 $$ 重拼。
+LC_STUN_REQ=""
+LC_STUN_RESP=""
 
 _lc_cleanup() {
 	if [ -n "${_lc_tmp:-}" ] && [ -d "$_lc_tmp" ]; then
 		rm -rf "$_lc_tmp" 2>/dev/null
+	fi
+	if [ -n "${LC_STUN_REQ:-}" ]; then
+		rm -f "$LC_STUN_REQ" 2>/dev/null
+		LC_STUN_REQ=""
+	fi
+	if [ -n "${LC_STUN_RESP:-}" ]; then
+		rm -f "$LC_STUN_RESP" 2>/dev/null
+		LC_STUN_RESP=""
 	fi
 	if [ "${LC_LOCK_OWNER:-0}" = "1" ] && [ -d "$LC_LOCK" ]; then
 		[ "$(cat "$LC_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LC_LOCK" 2>/dev/null
@@ -6084,41 +6484,72 @@ _lc_sweep() {
 	return 0
 }
 
+# 锁年龄。started 是锁主写入的 epoch 秒；pid/started 写入有窗口期，
+# 缺失时退回目录 mtime，绝不能把“还没写”当成 epoch 0（旧实现会算出
+# 56 年，于是把刚创建的锁误判成陈旧锁并抢占，SEC S7）。
+_lc_lock_age() {
+	_t=$(cat "$LC_LOCK/started" 2>/dev/null)
+	case "$_t" in '' | *[!0-9]*) _t="" ;; esac
+	if [ -z "$_t" ]; then
+		_t=$(stat -c %Y "$LC_LOCK" 2>/dev/null)
+		case "$_t" in '' | *[!0-9]*) _t="" ;; esac
+	fi
+	if [ -z "$_t" ]; then
+		printf '0'
+		return 0
+	fi
+	_a=$(( $(_lc_now) - _t ))
+	[ "$_a" -ge 0 ] 2>/dev/null || _a=0
+	printf '%s' "$_a"
+}
+
 # 0=拿到锁 1=已有体检在跑（LC_LOCK_PID/LC_LOCK_AGE） 2=建不了锁
+#
+# 竞态修复（SEC S7）：mkdir 成功是唯一原子“持锁”步骤。之后写 started/pid
+# 失败只降级——锁仍然归我们，后来者不得以“内容不全”为由强抢；内容不全
+# 时按目录 mtime 计算年龄，5 秒宽限期覆盖 mkdir -> 写文件 -> exec 的窗口。
 _lc_lock_try() {
 	LC_LOCK_PID=""
 	LC_LOCK_AGE=""
 	mkdir -p "$STATE_DIR" 2>/dev/null || return 2
 	if mkdir "$LC_LOCK" 2>/dev/null; then
-		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
-		_lc_now >"$LC_LOCK/started" 2>/dev/null
+		# 先写 started 再写 pid：任一步失败都不影响“已持锁”的事实。
+		_lc_now >"$LC_LOCK/started" 2>/dev/null || true
+		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null || true
 		LC_LOCK_OWNER=1
 		return 0
 	fi
 	_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
-	_t=$(cat "$LC_LOCK/started" 2>/dev/null)
-	_age=$(( $(_lc_now) - ${_t:-0} ))
-	[ "$_age" -ge 0 ] 2>/dev/null || _age=0
-	if [ -n "$_p" ]; then
-		# 进程还活着且锁不超过 5 分钟：认定在跑（防 pid 复用导致的永久锁死）
-		if [ "$_age" -lt 300 ] && kill -0 "$_p" 2>/dev/null; then
-			LC_LOCK_PID=$_p
-			LC_LOCK_AGE=$_age
-			return 1
-		fi
-	else
-		# 另一个 --background 刚 mkdir 完、还没写 pid：按“在跑”处理，别抢
-		if [ "$_age" -lt 5 ]; then
-			LC_LOCK_AGE=$_age
-			return 1
+	_age=$(_lc_lock_age)
+	# 1) 进程还活着且锁不超过 5 分钟：认定在跑（防 pid 复用导致的永久锁死）
+	if [ -n "$_p" ] && [ "$_age" -lt 300 ] && kill -0 "$_p" 2>/dev/null; then
+		LC_LOCK_PID=$_p
+		LC_LOCK_AGE=$_age
+		return 1
+	fi
+	# 2) 刚创建/刚交接的锁：pid 可能还没写，或父进程刚退出等 worker 接管。
+	#    宽限期内一律按“在跑”处理，绝不走 rm -rf 抢占。
+	if [ "$_age" -lt 5 ]; then
+		[ -n "$_p" ] && LC_LOCK_PID=$_p
+		LC_LOCK_AGE=$_age
+		return 1
+	fi
+	# 3) 真正陈旧：用 rename 原子地把旧锁搬走（同一父目录下只有一个竞争者
+	#    能成功），再 mkdir 新锁。这样不会出现 A 刚 rm、B 又 rm 掉 A 新锁。
+	_stale=$LC_LOCK.stale.$$
+	rm -rf "$_stale" 2>/dev/null
+	if mv "$LC_LOCK" "$_stale" 2>/dev/null; then
+		rm -rf "$_stale" 2>/dev/null
+		if mkdir "$LC_LOCK" 2>/dev/null; then
+			_lc_now >"$LC_LOCK/started" 2>/dev/null || true
+			printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null || true
+			LC_LOCK_OWNER=1
+			return 0
 		fi
 	fi
-	rm -rf "$LC_LOCK" 2>/dev/null
-	mkdir "$LC_LOCK" 2>/dev/null || return 2
-	printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
-	_lc_now >"$LC_LOCK/started" 2>/dev/null
-	LC_LOCK_OWNER=1
-	return 0
+	# 抢锁失败（别人先搬走/先建好）：按“已有体检在跑”处理，不报错。
+	LC_LOCK_AGE=$_age
+	return 1
 }
 
 # 缓存有效性：meta + last.json + 每条被请求的 WAN 的 json/txt 都在，且 age < interval。
@@ -6276,19 +6707,29 @@ _lc_background() { # <force> <only>
 		( sh "$_lc_self" "$@" </dev/null >>"$LC_LOG" 2>&1 & )
 	fi
 
-	# 等子进程把 pid 写进锁（busybox sleep 不支持小数，最多等 1 秒）。
-	sleep 1
-	_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
+	# 等 worker 接管锁（busybox sleep 不支持小数）。最多等 2 秒；mkdir 成功
+	# 就已持锁，pid 还没写成 worker 时只降级返回，绝不删锁/强抢——那正是
+	# 并发 12 次时误判“陈旧锁”、起多个 worker 的窗口（SEC S7）。
+	_i=0
+	_p=""
+	while [ "$_i" -lt 2 ]; do
+		sleep 1
+		_i=$((_i + 1))
+		[ -d "$LC_LOCK" ] || break
+		_p=$(cat "$LC_LOCK/pid" 2>/dev/null)
+		[ -n "$_p" ] && [ "$_p" != "$$" ] && break
+	done
 	if [ ! -d "$LC_LOCK" ]; then
-		# 1 秒内已经跑完（夹具/极快线路）：直接告诉页面读缓存
+		# 2 秒内已经跑完（夹具/极快线路）：直接告诉页面读缓存
 		printf '{"command":"linecheck","background":true,"started":true,"finished":true,"pid":0}\n'
 		return 0
 	fi
 	if [ -z "$_p" ] || [ "$_p" = "$$" ]; then
-		rm -rf "$LC_LOCK" 2>/dev/null
-		LC_LOCK_OWNER=0
-		printf '{"command":"linecheck","background":true,"started":false,"error":"后台进程启动失败，见 %s"}\n' "$LC_LOG"
-		return 1
+		# 降级：不删锁、不强抢。worker 稍后写入 pid 即自愈；若 worker
+		# 确实没起来，锁的 pid 会随父进程退出变成死 pid，下一个调用在
+		# 5 秒宽限后按陈旧锁回收。
+		printf '{"command":"linecheck","background":true,"started":true,"pid":0,"pending":true}\n'
+		return 0
 	fi
 	printf '{"command":"linecheck","background":true,"started":true,"pid":%s,"started_at":%s}\n' \
 		"$_p" "$(cat "$LC_LOCK/started" 2>/dev/null || _lc_now)"
@@ -6350,10 +6791,11 @@ cmd_linecheck() {
 
 	if [ "$_lc_worker" = "1" ]; then
 		# 后台子进程：父进程已建好锁目录，这里接管（pid 改成自己），退出时删锁。
+		# 先写 started 再写 pid，任何一步失败都不影响“锁已由父进程 mkdir 拿到”。
 		LC_LOCK_OWNER=1
 		mkdir -p "$LC_LOCK" 2>/dev/null || true
-		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null
-		_lc_now >"$LC_LOCK/started" 2>/dev/null
+		_lc_now >"$LC_LOCK/started" 2>/dev/null || true
+		printf '%s\n' "$$" >"$LC_LOCK/pid" 2>/dev/null || true
 		_lc_trap_on
 	fi
 

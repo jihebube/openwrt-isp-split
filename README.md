@@ -134,14 +134,16 @@ DOMAIN_SPLIT="bilivideo.com:wanb_only"
 线路体检（0.3.0）的开关与隐私：
 
 ```sh
-LINE_CHECK_ENABLE=1          # 总开关
-LINE_CHECK_GEO=1             # 1=允许把出口公网 IP 发给第三方查归属地；0=完全关闭
+LINE_CHECK_ENABLE=1          # 总开关；0=完全不执行体检
+LINE_CHECK_GEO=1             # 1=允许把出口公网 IP 发给第三方查归属地；0=只关闭归属地查询
 LINE_CHECK_GEO_PROVIDER=auto # auto | baidu | ip-api | off
 LINE_CHECK_MIN_INTERVAL=60   # 结果缓存/手动触发最小间隔（秒）
 ```
 
-关闭归属地后不会发起任何第三方请求，卡片显示“未查询”；省/市不可知，
-但仍会用本地 `@isp_*` 集合判断运营商大类。完整字段与隐私说明见
+关闭归属地只停止归属地查询；出口 IP 回显（api.ipify.org / icanhazip.com）、
+STUN（4 台）与同网/基线延迟探测仍会照常发出。卡片显示“未查询”；省/市不可知，
+但仍会用本地 `@isp_*` 集合判断运营商大类。要完全停发体检请求，请设
+`LINE_CHECK_ENABLE=0`。完整字段与隐私说明见
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#线路体检line_check_)。
 
 多数据源（0.2.1 默认双源：yfgao 主源 + clang 校验源）：

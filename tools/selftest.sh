@@ -2479,7 +2479,7 @@ sed 's/^LINE_CHECK_GEO=1$/LINE_CHECK_GEO=0/' "$LCCONF" >"$TMP/lc-geo0.conf"
 lc_run_conf "$TMP/lc-geo0.conf" --json --force >"$TMP/lc-geo0.json" 2>/dev/null
 if grep -q '"geo_enabled":false' "$TMP/lc-geo0.json" &&
    grep -q '"status":"off"' "$TMP/lc-geo0.json"; then
-	ok "LINE_CHECK_GEO=0：JSON geo_enabled=false、状态 off，不发起第三方请求"
+	ok "LINE_CHECK_GEO=0：JSON geo_enabled=false、状态 off，不发起归属地请求"
 else
 	ng "归属地关闭行为异常"
 fi
@@ -3066,6 +3066,273 @@ if [ "$_b25_rc" -eq 0 ] &&
 else
 	ng "17.11 --assume-yes 默认绑定异常（rc=$_b25_rc）"
 	sed 's/^/    /' "$B25/init-auto.log" | head -25
+fi
+
+echo "== 18. fix29 发版前安全加固（SEC S1/S2/S4/S6/S7/S8）"
+F29=$TMP/fix29
+mkdir -p "$F29/bin" "$F29/stun"
+
+# ---- 18.1 F1：STUN 临时文件不再用可预测的 $$ 路径 ----
+if grep -q 'mktemp "${TMPDIR:-/tmp}/isp-lc-stun.XXXXXXXX"' "$ROOT/files/usr/sbin/isp-split" &&
+   grep -q 'LC_STUN_REQ=' "$ROOT/files/usr/sbin/isp-split" &&
+   grep -q 'rm -f "$LC_STUN_REQ"' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "18.1 STUN 临时文件改用 mktemp 随机名 + 真实路径 trap 清理（SEC S4）"
+else
+	ng "18.1 STUN 临时文件仍是可预测路径/没有 trap 清理（SEC S4）"
+fi
+
+# 动态复测：在旧实现会命中的 /tmp/isp-lc-stun.$$.req 位置放 symlink，
+# 新实现必须走 mktemp，受害文件保持原样。socat 用 fake（只返回失败）。
+printf '#!/bin/sh\nexit 1\n' > "$F29/bin/socat"
+chmod +x "$F29/bin/socat"
+printf 'ISP_TABLE="chinatelecom:isp_tel:wan_only:1"\n' > "$F29/conf"
+if command -v hexdump >/dev/null 2>&1; then
+	(
+		PATH="$F29/bin:$PATH"
+		TMPDIR="$F29/stun"
+		ISP_SPLIT_CONF="$F29/conf"
+		export PATH TMPDIR ISP_SPLIT_CONF
+		. "$TMP/isp-lib.sh" >/dev/null 2>&1
+		printf 'ORIGINAL-A\n' > "$TMPDIR/victim-a"
+		printf 'ORIGINAL-B\n' > "$TMPDIR/victim-b"
+		ln -sf "$TMPDIR/victim-a" "$TMPDIR/isp-lc-stun.$$.req"
+		ln -sf "$TMPDIR/victim-b" "$TMPDIR/isp-lc-stun.$$.resp"
+		_lc_stun_once lo 127.0.0.1 3478 40000 1 >/dev/null 2>&1
+	) >/dev/null 2>&1
+	if [ "$(cat "$F29/stun/victim-a")" = "ORIGINAL-A" ] &&
+	   [ "$(cat "$F29/stun/victim-b")" = "ORIGINAL-B" ]; then
+		ok "18.1 symlink 预置到旧 \$\$ 路径不再写穿（受害文件未被覆盖/截断）"
+	else
+		ng "18.1 STUN 仍跟随 symlink 写穿受害文件（SEC S4）"
+	fi
+else
+	ok "18.1 无 hexdump，symlink 动态复测跳过（静态检查已覆盖）"
+fi
+
+# ---- 18.2 F2：无标记同名 ipset / rule 段必须硬失败 ----
+b25_reset "$B25/s7"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s7" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s7" wanb_only isp_split_wanb_only_m1 wan2 marked
+echo "mwan3.ipset_isp_tel=ipset" >> "$B25/s7/show"
+printf 'isp_tel\n' > "$B25/s7/data/ipset_isp_tel.name"
+printf 'ipv4\n' > "$B25/s7/data/ipset_isp_tel.family"
+printf '/tmp/user-cmcc.txt\n' > "$B25/s7/data/ipset_isp_tel.loadfile"
+printf '1\n' > "$B25/s7/data/ipset_isp_tel.enabled"
+b25_run "$B25/s7" "$B25/conf" wire > "$F29/wire-ipset-conflict.log" 2>&1
+_b29_rc=$?
+if [ "$_b29_rc" -ne 0 ] &&
+   grep -q "已存在同名 ipset 段 'ipset_isp_tel' 且没有 isp_split 标记" "$F29/wire-ipset-conflict.log" &&
+   [ "$(cat "$B25/s7/data/ipset_isp_tel.loadfile")" = "/tmp/user-cmcc.txt" ] &&
+   [ ! -f "$B25/s7/data/ipset_isp_tel.isp_split" ] &&
+   [ ! -s "$B25/s7/commit.log" ]; then
+	ok "18.2 无标记同名 ipset 段：wire die 且未改写用户段（SEC S8）"
+else
+	ng "18.2 无标记同名 ipset 段保护失败（rc=$_b29_rc）"
+	sed 's/^/    /' "$F29/wire-ipset-conflict.log" | tail -8
+fi
+
+b25_reset "$B25/s8"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s8" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s8" wanb_only isp_split_wanb_only_m1 wan2 marked
+echo "mwan3.isp_tel=rule" >> "$B25/s8/show"
+printf 'balanced\n' > "$B25/s8/data/isp_tel.use_policy"
+b25_run "$B25/s8" "$B25/conf" wire > "$F29/wire-rule-conflict.log" 2>&1
+_b29_rc=$?
+if [ "$_b29_rc" -ne 0 ] &&
+   grep -q "已存在同名 rule 段 'isp_tel' 且没有 isp_split 标记" "$F29/wire-rule-conflict.log" &&
+   [ "$(cat "$B25/s8/data/isp_tel.use_policy")" = "balanced" ] &&
+   [ ! -f "$B25/s8/data/isp_tel.isp_split" ]; then
+	ok "18.2 无标记同名 rule 段：wire die 且未合并/覆盖用户规则（SEC S8）"
+else
+	ng "18.2 无标记同名 rule 段保护失败（rc=$_b29_rc）"
+	sed 's/^/    /' "$F29/wire-rule-conflict.log" | tail -8
+fi
+
+# ---- 18.3 F3：原子 mv + commit 不得早于内容校验 ----
+if grep -q 'mv -f "$_mi_src" "$CFG_MWAN3"' "$ROOT/files/usr/sbin/isp-split" &&
+   ! grep -q 'cat "$WORK/mwan3.new" > "$CFG_MWAN3"' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "18.3 mwan3 写回改为原子 mv（不再 cat 截断写）"
+else
+	ng "18.3 mwan3 写回仍是非原子 cat >（SEC S8）"
+fi
+
+b25_reset "$B25/s9"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s9" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s9" wanb_only isp_split_wanb_only_m1 wan2 marked
+cp "$B25/conf" "$F29/conf-anchor"
+printf 'ISP_ANCHOR="NO_SUCH_ANCHOR_ZZZ"\n' >> "$F29/conf-anchor"
+b25_run "$B25/s9" "$F29/conf-anchor" wire > "$F29/wire-anchor-fail.log" 2>&1
+_b29_rc=$?
+if [ "$_b29_rc" -ne 0 ] &&
+   grep -q '规则注入失败' "$F29/wire-anchor-fail.log" &&
+   cmp -s "$B25/mwan3" "$FIX/mwan3" &&
+   [ ! -s "$B25/s9/commit.log" ]; then
+	ok "18.3 splice 校验失败时没有提前 commit、正式配置未被改动（SEC S8）"
+else
+	ng "18.3 commit 早于内容校验或失败时已改写配置（rc=$_b29_rc）"
+	sed 's/^/    /' "$F29/wire-anchor-fail.log" | tail -8
+fi
+
+b25_reset "$B25/s10"
+cp "$FIX/mwan3" "$B25/mwan3"
+b25_policy "$B25/s10" wan_only isp_split_wan_only_m1 wan1 marked
+b25_policy "$B25/s10" wanb_only isp_split_wanb_only_m1 wan2 marked
+b25_run "$B25/s10" "$B25/conf" wire > "$F29/wire-ok.log" 2>&1
+_b29_rc=$?
+b25_run "$B25/s10" "$B25/conf" wire > "$F29/wire-ok2.log" 2>&1
+_b29_rc2=$?
+_b29_ip=$(grep -c "^config ipset 'ipset_isp_tel'" "$B25/mwan3" 2>/dev/null || true)
+_b29_ru=$(grep -c "^config rule 'isp_tel'" "$B25/mwan3" 2>/dev/null || true)
+if [ "$_b29_rc" -eq 0 ] && [ "$_b29_rc2" -eq 0 ] &&
+   [ "$_b29_ip" = "1" ] && [ "$_b29_ru" = "1" ] &&
+   grep -q 'isp_split=1\|option isp_split' "$B25/mwan3"; then
+	ok "18.3 wire 正常回归 + 复跑幂等（ipset=1 rule=1，内容含 isp_split 标记）"
+else
+	ng "18.3 wire 正常回归/幂等失败（rc=$_b29_rc/$_b29_rc2 ipset=$_b29_ip rule=$_b29_ru）"
+	sed 's/^/    /' "$F29/wire-ok.log" | tail -10
+fi
+
+# ---- 18.4 F5：并发抢锁只允许 1 个赢家；mkdir 窗口不得被误判陈旧 ----
+cat > "$F29/locktry.sh" <<'LOCKTRY'
+#!/bin/sh
+ISP_SPLIT_BASE=$1
+ISP_SPLIT_CONF=$2
+export ISP_SPLIT_BASE ISP_SPLIT_CONF
+. "$3" >/dev/null 2>&1
+_lc_lock_try
+echo $?
+LOCKTRY
+chmod +x "$F29/locktry.sh"
+rm -rf "$F29/lock1"
+mkdir -p "$F29/lock1"
+i=0
+while [ "$i" -lt 12 ]; do
+	i=$((i + 1))
+	( sh "$F29/locktry.sh" "$F29/lock1" "$F29/conf" "$TMP/isp-lib.sh" \
+		> "$F29/lock1/rc.$i" 2>/dev/null ) &
+done
+wait
+_b29_win=$(grep -l '^0$' "$F29/lock1/rc."* 2>/dev/null | wc -l | tr -d ' ')
+_b29_lose=$(grep -l '^1$' "$F29/lock1/rc."* 2>/dev/null | wc -l | tr -d ' ')
+if [ "$_b29_win" = "1" ] && [ "$_b29_lose" = "11" ]; then
+	ok "18.4 12 并发抢锁只有 1 个赢家（SEC S7）"
+else
+	ng "18.4 12 并发抢锁赢家数异常：win=$_b29_win lose=$_b29_lose（SEC S7）"
+fi
+
+rm -rf "$F29/lock2"
+mkdir -p "$F29/lock2/state/linecheck.lock"
+_b29_rc=$(sh "$F29/locktry.sh" "$F29/lock2" "$F29/conf" "$TMP/isp-lib.sh" 2>/dev/null)
+if [ "$_b29_rc" = "1" ]; then
+	ok "18.4 mkdir 后尚未写 pid/started 的窗口期按“在跑”处理，不抢占（SEC S7）"
+else
+	ng "18.4 空锁目录窗口被误判陈旧并抢占（rc=$_b29_rc，SEC S7）"
+fi
+
+# ---- 18.5 F6：9 个 LINE_CHECK_* 键的写入侧校验 ----
+cp "$B25/conf" "$F29/conf-f6"
+cp "$F29/conf-f6" "$F29/conf-f6.before"
+_b29_ua=$(printf 'EvilUA\r\nX-Injected-Header: pwned')
+b25_run "$B25/s11" "$F29/conf-f6" conf set line_check_ua "$_b29_ua" \
+	> "$F29/conf-ua-inject.log" 2>&1
+_b29_rc=$?
+if [ "$_b29_rc" -ne 0 ] &&
+   grep -q '不能包含 CR/LF' "$F29/conf-ua-inject.log" &&
+   cmp -s "$F29/conf-f6" "$F29/conf-f6.before"; then
+	ok "18.5 LINE_CHECK_UA 的 CR/LF 头注入被拒且配置未落盘（SEC S1）"
+else
+	ng "18.5 LINE_CHECK_UA 头注入未被拒绝（rc=$_b29_rc，SEC S1）"
+	sed 's/^/    /' "$F29/conf-ua-inject.log" | tail -5
+fi
+
+b25_run "$B25/s11" "$F29/conf-f6" conf check line_check_echo_urls '-K/tmp/lc-curlrc' \
+	> "$F29/conf-url-inject.log" 2>&1
+_b29_rc=$?
+b25_run "$B25/s11" "$F29/conf-f6" conf check line_check_echo_urls \
+	'https://api.ipify.org' > "$F29/conf-url-ok.log" 2>&1
+_b29_rc_ok=$?
+if [ "$_b29_rc" -ne 0 ] && [ "$_b29_rc_ok" -eq 0 ] &&
+   grep -q '校验通过' "$F29/conf-url-ok.log"; then
+	ok "18.5 ECHO_URLS 拒绝 curl 选项注入、接受 http(s):// URL（SEC S1/S2）"
+else
+	ng "18.5 ECHO_URLS 校验异常（inject=$_b29_rc ok=$_b29_rc_ok）"
+fi
+
+b25_run "$B25/s11" "$F29/conf-f6" conf set line_check_ua \
+	'Mozilla/5.0 (X11; Linux x86_64) Test/1.0' > "$F29/conf-ua-ok.log" 2>&1
+_b29_rc=$?
+if [ "$_b29_rc" -eq 0 ] &&
+   grep -q '^LINE_CHECK_UA="Mozilla/5.0 (X11; Linux x86_64) Test/1.0"' "$F29/conf-f6"; then
+	ok "18.5 含 ; ( ) 的合法 UA 可以写入（白名单不是一刀切）"
+else
+	ng "18.5 合法 UA 被误拒（rc=$_b29_rc）"
+	sed 's/^/    /' "$F29/conf-ua-ok.log" | tail -5
+fi
+
+# ---- 18.6 F6：STUN 清单为空/全部非法时不崩（set -u） ----
+if ( ISP_SPLIT_CONF="$F29/conf"; export ISP_SPLIT_CONF
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	LC_START=$(_lc_now)
+	LC_BUDGET=20
+	LINE_CHECK_STUN_SERVERS=" "
+	_lc_stun_probe lo 127.0.0.1 private
+	printf '%s|%s\n' "$LC_STUN_TYPE" "$LC_STUN_DETAIL" ) > "$F29/stun-empty.log" 2>&1
+then
+	_b29_rc=0
+else
+	_b29_rc=$?
+fi
+if [ "$_b29_rc" -eq 0 ] &&
+   grep -q '^unknown|' "$F29/stun-empty.log" &&
+   ! grep -q 'parameter not set' "$F29/stun-empty.log"; then
+	ok "18.6 STUN 清单为空时返回 unknown 态，不触发 set -u 崩溃（SEC S2）"
+else
+	ng "18.6 STUN 空清单仍崩溃（rc=$_b29_rc，SEC S2）"
+	sed 's/^/    /' "$F29/stun-empty.log" | tail -5
+fi
+
+if ( ISP_SPLIT_CONF="$F29/conf"; export ISP_SPLIT_CONF
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	LC_START=$(_lc_now)
+	LC_BUDGET=20
+	LINE_CHECK_STUN_SERVERS="bad,entry"
+	_lc_stun_probe lo 127.0.0.1 private
+	printf '%s|%s\n' "$LC_STUN_TYPE" "$LC_STUN_DETAIL" ) > "$F29/stun-bad.log" 2>&1
+then
+	_b29_rc=0
+else
+	_b29_rc=$?
+fi
+if [ "$_b29_rc" -eq 0 ] &&
+   grep -q '^unknown|' "$F29/stun-bad.log" &&
+   ! grep -q 'parameter not set' "$F29/stun-bad.log"; then
+	ok "18.6 STUN 清单全部非法时同样降级 unknown，不丢整条 WAN（SEC S2）"
+else
+	ng "18.6 STUN 全非法清单仍崩溃（rc=$_b29_rc，SEC S2）"
+	sed 's/^/    /' "$F29/stun-bad.log" | tail -5
+fi
+
+# ---- 18.7 F4：隐私文案与实现一致 ----
+if ! grep -q '不会发起任何第三方请求' "$ROOT/README.md" "$ROOT/docs/CONFIGURATION.md" "$ROOT/docs/DESIGN.md" &&
+   grep -q '关闭归属地只停止归属地查询' "$ROOT/README.md" &&
+   grep -q '只关闭归属地查询' "$ROOT/docs/CONFIGURATION.md" &&
+   grep -q '只停止归属地查询' "$ROOT/docs/DESIGN.md" &&
+   grep -q '出口 IP 回显、STUN' "$ROOT/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/config.js"; then
+	ok "18.7 README/CONFIGURATION/DESIGN/UI 均改为“GEO=0 只关归属地查询”（SEC S6）"
+else
+	ng "18.7 仍存在“GEO=0 不发任何第三方请求”的旧措辞（SEC S6）"
+fi
+
+# ---- 18.8 F7：--wan .. / . 不再被当成网络设备 ----
+if ( ISP_SPLIT_CONF="$F29/conf"; export ISP_SPLIT_CONF
+	. "$TMP/isp-lib.sh" >/dev/null 2>&1
+	_lc_wan_one .. >/dev/null 2>&1 ); then
+	ng "18.8 --wan .. 仍被接受为设备（SEC 报告低危项）"
+else
+	ok "18.8 --wan .. / . 按 ifindex 判定后拒绝（健壮性）"
 fi
 
 echo
