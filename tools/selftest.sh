@@ -3565,7 +3565,7 @@ else
 	ng "19.6 主包 ipk 解包失败"
 fi
 
-# 19.7 LuCI 包 payload：体检页 + 独立菜单节点 + 子节点=3 + CSS 含 .lc-*
+# 19.7 LuCI 包 payload：体检页 + 独立菜单节点 + 子节点=4 + CSS 含 .lc-*
 if [ -n "$_lipk" ] && _ipk_unpack "$_lipk" "$F31/l" 2>/dev/null; then
 	_l=$F31/l/data
 	_lproblem=""
@@ -3578,7 +3578,7 @@ if [ -n "$_lipk" ] && _ipk_unpack "$_lipk" "$F31/l" 2>/dev/null; then
 	# 体检节点在独立 menu.d 文件里，LuCI 运行时合并菜单，所以跨文件数子节点
 	_kids=$(cat "$_l"/usr/share/luci/menu.d/*.json 2>/dev/null |
 		grep -c '"admin/network/isp-split/' || true)
-	[ "${_kids:-0}" = "3" ] || _lproblem="$_lproblem menu子节点=${_kids:-0}"
+	[ "${_kids:-0}" = "4" ] || _lproblem="$_lproblem menu子节点=${_kids:-0}"
 	_css=$_l/www/luci-static/resources/isp-split/isp-split.css
 	grep -q '\.lc-' "$_css" 2>/dev/null || _lproblem="$_lproblem CSS无.lc-*"
 	if [ -f "$_css" ]; then
@@ -3587,7 +3587,7 @@ if [ -n "$_lipk" ] && _ipk_unpack "$_lipk" "$F31/l" 2>/dev/null; then
 		[ "$_co" = "$_cc" ] || _lproblem="$_lproblem CSS花括号{$_co}/{$_cc}"
 	fi
 	if [ -z "$_lproblem" ]; then
-		ok "19.7 LuCI payload：linecheck.js + 体检菜单节点 + 子节点=3 + CSS 含 .lc-* 且花括号平衡"
+		ok "19.7 LuCI payload：linecheck.js + 体检菜单节点 + 子节点=4（含引导）+ CSS 含 .lc-* 且花括号平衡"
 	else
 		ng "19.7 LuCI payload 面缺失：$_lproblem"
 	fi
@@ -3803,7 +3803,7 @@ else
 	ng "19b.7 剥离版 conf 仍接受 LINE_CHECK_*（rc=$_cf_rc）"
 fi
 
-# 19b.8 LuCI 面：menu 子节点 == 2，无体检页/节点文件
+# 19b.8 LuCI 面：menu 子节点 == 3（状态/配置/引导），无体检页/节点文件
 cp "$ROOT"/luci-app-isp-split/htdocs/luci-static/resources/view/isp-split/*.js \
 	"$F30/luci/www/luci-static/resources/view/isp-split/" 2>/dev/null || true
 mkdir -p "$F30/luci/www/luci-static/resources/isp-split"
@@ -3813,11 +3813,11 @@ cp "$ROOT"/luci-app-isp-split/root/usr/share/luci/menu.d/*.json "$F30/luci/usr/s
 cp "$ROOT"/luci-app-isp-split/root/usr/share/rpcd/acl.d/*.json "$F30/luci/usr/share/rpcd/acl.d/"
 sh "$ROOT/scripts/strip-linecheck.sh" "$F30/luci" >/dev/null 2>&1
 _kids=$(grep -c '"admin/network/isp-split/' "$F30/luci/usr/share/luci/menu.d/luci-app-isp-split.json" 2>/dev/null || echo 0)
-if [ "$_kids" = "2" ] &&
+if [ "$_kids" = "3" ] &&
    [ ! -f "$F30/luci/www/luci-static/resources/view/isp-split/linecheck.js" ] &&
    [ ! -f "$F30/luci/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
    ! grep -q 'linecheck' "$F30/luci/usr/share/rpcd/acl.d/luci-app-isp-split.json" 2>/dev/null; then
-	ok "19b.8 剥离后 menu 子节点=2，无体检页 / 菜单节点 / acl 串"
+	ok "19b.8 剥离后 menu 子节点=3（引导保留），无体检页 / 菜单节点 / acl 串"
 else
 	ng "19b.8 剥离后 LuCI 面不干净（子节点=$_kids）"
 fi
@@ -3913,9 +3913,9 @@ if command -v tar >/dev/null 2>&1; then
 			   [ ! -f "$F30/mipk/data/usr/lib/isp-split/lc-run" ] &&
 			   [ ! -f "$F30/lipk/data/www/luci-static/resources/view/isp-split/linecheck.js" ] &&
 			   [ ! -f "$F30/lipk/data/usr/share/luci/menu.d/luci-app-isp-split-linecheck.json" ] &&
-			   [ "$_kids" = "2" ] &&
+			   [ "$_kids" = "3" ] &&
 			   ! grep -qi 'socat' "$F30/mipk/ctl/control" "$F30/lipk/ctl/control"; then
-				ok "19b.10 ipk×2：payload 零残留、无 lc-run/体检页、menu 子节点=2、Depends 无 socat"
+				ok "19b.10 ipk×2：payload 零残留、无 lc-run/体检页、menu 子节点=3、Depends 无 socat"
 			else
 				ng "19b.10 ipk 断言失败（menu 子节点=$_kids）"
 			fi
@@ -5200,12 +5200,12 @@ _node=${NODE:-}
 [ -n "$_node" ] || _node=$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)
 if [ -n "$_node" ]; then
 	_js_bad=""
-	for _f in overview.js config.js linecheck.js; do
+	for _f in overview.js config.js linecheck.js wizard.js; do
 		"$_node" --check "$LUCI_R/view/isp-split/$_f" >/dev/null 2>&1 ||
 			_js_bad="$_js_bad $_f"
 	done
 	if [ -z "$_js_bad" ]; then
-		ok "24.8 overview.js / config.js / linecheck.js 全部通过 node --check"
+		ok "24.8 overview.js / config.js / linecheck.js / wizard.js 全部通过 node --check"
 	else
 		ng "24.8 node --check 失败:$_js_bad"
 	fi
@@ -7380,6 +7380,176 @@ else
 	fi
 fi
 
+
+echo "== 34. v0.3.3 LuCI 首启向导 + doctor 环境横幅（FIX35）"
+W35=$TMP/w35
+mkdir -p "$W35"
+W35_JS=$LUCI_R/view/isp-split/wizard.js
+W35_OV=$LUCI_R/view/isp-split/overview.js
+W35_ACL=$ROOT/luci-app-isp-split/root/usr/share/rpcd/acl.d/luci-app-isp-split.json
+W35_MENU=$ROOT/luci-app-isp-split/root/usr/share/luci/menu.d/luci-app-isp-split.json
+
+# ---- 34.1 页面/菜单：四步都在，菜单节点是「引导」且排在状态页之前 ----
+_w35_bad=""
+[ -s "$W35_JS" ] || _w35_bad="$_w35_bad 缺wizard.js"
+for _w35_s in '环境自检' '体检' '绑定骨架' '生效'; do
+	grep -Fq "title: '$_w35_s'" "$W35_JS" || _w35_bad="$_w35_bad 缺步骤[$_w35_s]"
+done
+grep -Fq '"admin/network/isp-split/wizard"' "$W35_MENU" || _w35_bad="$_w35_bad 无菜单节点"
+grep -Fq '"title": "引导"' "$W35_MENU" || _w35_bad="$_w35_bad 菜单标题不是「引导」"
+_w35_w=$(grep -n '"admin/network/isp-split/wizard"' "$W35_MENU" | cut -d: -f1)
+_w35_o=$(grep -n '"admin/network/isp-split/overview"' "$W35_MENU" | cut -d: -f1)
+if [ -n "$_w35_w" ] && [ -n "$_w35_o" ]; then
+	[ "$_w35_w" -lt "$_w35_o" ] || _w35_bad="$_w35_bad 引导节点不在状态页之前(order)"
+else
+	_w35_bad="$_w35_bad 节点行号取不到"
+fi
+if [ -z "$_w35_bad" ]; then
+	ok "34.1 wizard.js 四步齐 + 菜单节点「引导」(order 0，先于状态页)"
+else
+	ng "34.1 向导页面/菜单缺项:$_w35_bad"
+fi
+
+# ---- 34.2 打包面：Makefile / install.sh / payload 校验 / feed 四处都认 wizard.js ----
+_w35_bad=""
+grep -q 'view/isp-split/wizard\.js' "$ROOT/luci-app-isp-split/Makefile" || _w35_bad="$_w35_bad Makefile"
+grep -q 'view/isp-split/wizard\.js' "$ROOT/scripts/install.sh" || _w35_bad="$_w35_bad install.sh"
+grep -q 'wizard\.js' "$ROOT/scripts/verify-package-payload.sh" || _w35_bad="$_w35_bad payload-check"
+grep -Fq '菜单子节点 = 4' "$ROOT/scripts/verify-package-payload.sh" || _w35_bad="$_w35_bad payload-4节点"
+cmp -s "$W35_JS" "$FEED_LUCI/view/isp-split/wizard.js" || _w35_bad="$_w35_bad feed不一致"
+if [ -z "$_w35_bad" ]; then
+	ok "34.2 wizard.js 进包清单：LuCI Makefile + install.sh + payload 校验(4 节点) + feed 逐字节一致"
+else
+	ng "34.2 打包面缺项:$_w35_bad（feed 侧请先跑 tools/sync-feed.sh）"
+fi
+
+# ---- 34.3 acl.d 白名单：向导状态只给单文件写，读面收紧 ----
+_w35_bad=""
+grep -Fq '"/etc/isp-split/state/wizard.json": [ "write" ]' "$W35_ACL" ||
+	_w35_bad="$_w35_bad 缺向导状态单文件写"
+grep -Fq '"/etc/isp-split/state/*": [ "write"' "$W35_ACL" &&
+	_w35_bad="$_w35_bad 出现目录级写"
+grep -Fq '"/etc/isp-split": [ "read" ]' "$W35_ACL" && _w35_bad="$_w35_bad 读面仍有目录项"
+[ "$(grep -c '": \[ "write" \]' "$W35_ACL")" = "1" ] ||
+	_w35_bad="$_w35_bad 路径级 write 出现次数非1"
+grep -Fq '"/usr/sbin/isp-split": [ "exec" ]' "$W35_ACL" || _w35_bad="$_w35_bad exec 路径变了"
+[ "$(grep -c '"exec"' "$W35_ACL")" = "2" ] || _w35_bad="$_w35_bad exec出现次数非2(方法+路径)"
+if [ -z "$_w35_bad" ]; then
+	ok "34.3 ACL 白名单：唯一新增写权限=/etc/isp-split/state/wizard.json，无目录写，exec 面未扩大"
+else
+	ng "34.3 ACL 白名单异常:$_w35_bad"
+fi
+
+# ---- 34.4 向导只能经 WIZ 表调 CLI：唯一 fs.exec + 11 条白名单 argv ----
+_w35_bad=""
+[ "$(grep -c 'fs\.exec(' "$W35_JS")" = "1" ] || _w35_bad="$_w35_bad fs.exec 不止一处"
+for _w35_v in "doctor: [ 'doctor', '--json' ]" \
+	"bootstrap_dry: [ 'bootstrap' ]" \
+	"bootstrap_apply: [ 'bootstrap', '--apply' ]" \
+	"rollback_list: [ 'bootstrap', '--rollback' ]" \
+	"rollback_yes: [ 'bootstrap', '--rollback', '--yes' ]" \
+	"plan: [ 'plan' ]" \
+	"wire: [ 'wire' ]" \
+	"apply: [ 'apply' ]" \
+	"sync: [ 'sync' ]" \
+	"WIZ.linecheck_bg = [ 'linecheck', '--background' ]"; do
+	grep -Fq "$_w35_v" "$W35_JS" || _w35_bad="$_w35_bad 缺[$_w35_v]"
+done
+for _w35_x in uninstall 'conf set' '--assume-yes' 'stage'; do
+	grep -Fq -- "$_w35_x" "$W35_JS" && _w35_bad="$_w35_bad 白名单外子命令[$_w35_x]"
+done
+if [ -z "$_w35_bad" ]; then
+	ok "34.4 向导白名单：全文件唯一 fs.exec 走 WIZ 表（doctor/linecheck/bootstrap/plan/wire/apply/sync/rollback）"
+else
+	ng "34.4 白名单异常:$_w35_bad"
+fi
+
+# ---- 34.5 危险动作二次确认：文案列出写入/重载内容 + sync 勾选 ----
+_w35_bad=""
+for _w35_t in '确认写入 mwan3 骨架' '将写入 mwan3 配置' 'reload mwan3' '1-3 秒' \
+	'我知道会短暂断流 1-3 秒' '确认撤销本次引导' '确认整链同步' '确认重写规则并生效' \
+	'「上一步」只改界面'; do
+	grep -Fq "$_w35_t" "$W35_JS" || _w35_bad="$_w35_bad 缺[$_w35_t]"
+done
+grep -Fq "'disabled': ''" "$W35_JS" && grep -Fq 'syncBtn.disabled = !ev.target.checked' "$W35_JS" ||
+	_w35_bad="$_w35_bad sync 未勾选即可点"
+if [ -z "$_w35_bad" ]; then
+	ok "34.5 确认点：bootstrap --apply / wire+apply / sync（含断流勾选）/ rollback 均有二次确认文案"
+else
+	ng "34.5 确认点缺项:$_w35_bad"
+fi
+
+# ---- 34.6 状态机：4 步 + done/done_at + 硬门 + 半截写入降级 ----
+_w35_bad=""
+grep -Fq "var STATE_FILE = '/etc/isp-split/state/wizard.json';" "$W35_JS" ||
+	_w35_bad="$_w35_bad 状态路径"
+grep -Fq '/etc/isp-split/state/wizard.json' "$W35_ACL" || _w35_bad="$_w35_bad ACL 路径不一致"
+[ "$(grep -c "key: '" "$W35_JS")" = "4" ] || _w35_bad="$_w35_bad 步骤数非4"
+grep -Fq 'this.state.done = 1;' "$W35_JS" || _w35_bad="$_w35_bad 未写 done=1"
+grep -Fq 'this.state.done_at = nowSec();' "$W35_JS" || _w35_bad="$_w35_bad 未写 done_at"
+grep -Fq 'done: this.state.done ? 1 : 0' "$W35_JS" || _w35_bad="$_w35_bad 序列化缺 done"
+grep -Fq 'done_at: this.state.done_at || 0' "$W35_JS" || _w35_bad="$_w35_bad 序列化缺 done_at"
+grep -Fq 'if (st.done && !st.done_at)' "$W35_JS" || _w35_bad="$_w35_bad 半截写入未降级"
+grep -Fq 'doctorFailed: function()' "$W35_JS" || _w35_bad="$_w35_bad 无 fail 判定"
+grep -Fq "checks[i].status === 'fail'" "$W35_JS" || _w35_bad="$_w35_bad fail 判定字段"
+grep -Fq 'if (!this.canProceed())' "$W35_JS" || _w35_bad="$_w35_bad 无硬门"
+grep -Fq 'goStep(this.state.step + 1)' "$W35_JS" || _w35_bad="$_w35_bad 前进转移"
+grep -Fq 'goStep(self.state.step - 1)' "$W35_JS" || _w35_bad="$_w35_bad 后退转移"
+grep -Fq 'intIn(n, 0, STEPS.length - 1, 0)' "$W35_JS" || _w35_bad="$_w35_bad 步号越界收敛"
+if [ -z "$_w35_bad" ]; then
+	ok "34.6 状态机：4 步转移表 + done=1/done_at 落盘 + fail 硬门 + 半截写入降级"
+else
+	ng "34.6 状态机缺项:$_w35_bad"
+fi
+
+# ---- 34.7 overview 环境横幅：10 分钟缓存 / fail 不可关 / warn 可折叠 / 全绿一行 ----
+_w35_bad=""
+grep -Fq 'DOCTOR_TTL_MS = 600 * 1000' "$W35_OV" || _w35_bad="$_w35_bad 无10分钟TTL"
+grep -Fq 'isp-split.doctor.v1' "$W35_OV" || _w35_bad="$_w35_bad 无localStorage缓存键"
+[ "$(grep -c "'doctor', '--json'" "$W35_OV")" = "1" ] || _w35_bad="$_w35_bad doctor 调用不止一处"
+grep -Fq '这条横幅在有 fail 项时不能关闭' "$W35_OV" || _w35_bad="$_w35_bad fail 不可关文案"
+grep -Fq 'isp-banner-close' "$W35_OV" && _w35_bad="$_w35_bad 出现了关闭按钮"
+grep -Fq "detail.setAttribute('hidden', '')" "$W35_OV" || _w35_bad="$_w35_bad warn 折叠"
+grep -Fq "_('查看建议')" "$W35_OV" || _w35_bad="$_w35_bad 折叠按钮"
+grep -Fq "环境体检正常（" "$W35_OV" || _w35_bad="$_w35_bad 全绿一行"
+_w35_d=$(grep -n "id': 'isp-doctor'" "$W35_OV" | cut -d: -f1)
+_w35_c=$(grep -n "id': 'isp-cards'" "$W35_OV" | cut -d: -f1)
+if [ -n "$_w35_d" ] && [ -n "$_w35_c" ]; then
+	[ "$_w35_d" -lt "$_w35_c" ] || _w35_bad="$_w35_bad 横幅不在页面顶部"
+else
+	_w35_bad="$_w35_bad 横幅/卡片位置取不到"
+fi
+if [ -z "$_w35_bad" ]; then
+	ok "34.7 overview 横幅：顶部 + 10 分钟缓存(内存/localStorage) + fail 不可关 + warn 折叠 + 全绿一行"
+else
+	ng "34.7 环境横幅缺项:$_w35_bad"
+fi
+
+# ---- 34.8 XSS：向导页零 innerHTML（A-15 的 E() 文本节点口径） ----
+if [ "$(grep -c 'innerHTML' "$W35_JS")" = "0" ]; then
+	ok "34.8 wizard.js 零 innerHTML（外部字段一律走 E() 文本节点）"
+else
+	ng "34.8 wizard.js 出现 innerHTML（A-15）"
+fi
+
+# ---- 34.9 语法：完整版 + 剥离版都要能被 JS 引擎解析 ----
+_w35_node=${NODE:-}
+[ -n "$_w35_node" ] || _w35_node=$(command -v node 2>/dev/null || command -v nodejs 2>/dev/null || true)
+if [ -n "$_w35_node" ]; then
+	rm -rf "$W35/strip"
+	mkdir -p "$W35/strip"
+	cp -a "$ROOT/luci-app-isp-split/htdocs" "$W35/strip/"
+	sh "$ROOT/scripts/strip-linecheck.sh" "$W35/strip" >/dev/null 2>&1
+	_w35_stripjs=$W35/strip/htdocs/luci-static/resources/view/isp-split/wizard.js
+	if "$_w35_node" --check "$W35_JS" 2>"$W35/full.err" &&
+	   "$_w35_node" --check "$_w35_stripjs" 2>"$W35/strip.err"; then
+		ok "34.9 wizard.js 完整版 + 剥离版（FEATURE_LINECHECK=0）均通过 node --check"
+	else
+		ng "34.9 wizard.js node --check 失败: $(tail -2 "$W35/full.err" "$W35/strip.err" 2>/dev/null | tr '\n' ' ')"
+	fi
+else
+	skip "34.9 wizard.js node --check（环境里没有 node/nodejs）"
+fi
 
 echo
 echo "通过 $pass 项，失败 $fail 项，跳过 $skipn 项"

@@ -317,12 +317,17 @@ assert_feature1() { # <pkg> <payload-dir>
 			echo "::error::$_pkg：缺少线路体检菜单节点 luci-app-isp-split-linecheck.json" >&2
 			_bad=1
 		fi
-		# 7) 菜单子节点 = 3（状态 / 配置 / 线路体检）。
+		# 6b) 首启向导页（0.3.3）：没有它菜单里的「引导」节点会 404
+		if [ ! -s "$_views/wizard.js" ]; then
+			echo "::error::$_pkg：缺少 view/isp-split/wizard.js（首启向导页）" >&2
+			_bad=1
+		fi
+		# 7) 菜单子节点 = 4（状态 / 配置 / 引导 / 线路体检）。
 		#    体检节点在独立文件里，LuCI 运行时会合并 menu.d，所以跨文件数。
 		_kids=$(cat "$_payload"/usr/share/luci/menu.d/*.json 2>/dev/null |
 			grep -c '"admin/network/isp-split/' || true)
-		if [ "${_kids:-0}" != "3" ]; then
-			echo "::error::$_pkg：menu 子节点=${_kids:-0}（完整版应为 3：状态/配置/线路体检）" >&2
+		if [ "${_kids:-0}" != "4" ]; then
+			echo "::error::$_pkg：menu 子节点=${_kids:-0}（完整版应为 4：状态/配置/引导/线路体检）" >&2
 			_bad=1
 		fi
 		# 8) CSS 必须实际带体检样式类（与 0 版「无 .lc-*」相反的断言）

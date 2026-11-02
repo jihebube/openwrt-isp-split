@@ -175,6 +175,7 @@ install_luci() {
 		/www/luci-static/resources/isp-split/logos/ 2>/dev/null || true
 	cp -f "$L/htdocs/luci-static/resources/view/isp-split/overview.js" \
 		"$L/htdocs/luci-static/resources/view/isp-split/config.js" \
+		"$L/htdocs/luci-static/resources/view/isp-split/wizard.js" \
 		/www/luci-static/resources/view/isp-split/
 	if [ "$FEATURE_LINECHECK" = "1" ]; then
 		cp -f "$L/htdocs/luci-static/resources/view/isp-split/linecheck.js" \

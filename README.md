@@ -19,7 +19,8 @@
 <!-- lc:begin -->
 - **线路体检**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
 <!-- lc:end -->
-- **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
+- **首启向导**：LuCI「引导」页四步闭环（环境自检 `doctor` → 体检（可选）→ 绑定 mwan3 骨架 `bootstrap` → 生效 `plan`/`wire`+`apply`/`sync`），进度写 `state/wizard.json`、完成后入口变「重新引导」；危险动作（写 mwan3、reload mwan3、sync、撤销）一律二次确认，失败留在本步并展开命令与输出，「撤销本次引导」先列将删除的段清单再执行 `bootstrap --rollback`
+- **LuCI 界面**：卡片式状态页（运营商命中卡片 / 双线健康 / 兜底流量 / 数据源健康度 / 下次 cron；顶部一条 `doctor` 环境横幅，fail 红且不可关、warn 可折叠、全绿一行）+ 表单化配置页（上下移动排序、行内校验、保存前预检、测线按钮、只读数据源区块），深浅色与移动端自适应
 - **安全设计**：三级只读预检、stage 灰度、改动前自动备份、卸载自动还原 mwan3 与 DNS 配置；配置写入前后双向校验，非法值不落盘
 
 ## 环境要求
@@ -210,7 +211,7 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 
 完整的授权面、信任边界与回归防线见 [docs/SECURITY.md](docs/SECURITY.md)。三条最常被误解的先写在前面：
 
-1. **LuCI ACL 的 `write` = 以 root 执行任意 `isp-split` 子命令**。rpcd 只按可执行文件路径授权，不按子命令细分；默认安装只有 root 拥有该 ACL，不要把它授给“受限运维”账号。`read` 能读 `/etc/isp-split.conf` 与整个 `state/` 树（含公网 IP、归属地、STUN 映射）。
+1. **LuCI ACL 的 `write` = 以 root 执行任意 `isp-split` 子命令**。rpcd 只按可执行文件路径授权，不按子命令细分；默认安装只有 root 拥有该 ACL，不要把它授给“受限运维”账号。`read` 能读 `/etc/isp-split.conf` 与整个 `state/` 树（含公网 IP、归属地、STUN 映射）。0.3.3 起 `write` 另有一个**单文件**写权限 `/etc/isp-split/state/wizard.json`（首启向导进度）；向导按钮侧的 argv 白名单只是前端约束，不是 ACL 边界——详见 [docs/SECURITY.md](docs/SECURITY.md) §1.1。
 2. **外网文本不会变成 HTML**。归属地、回显 IP、STUN 详情等全部经 `_lc_json_esc` 落盘，LuCI 侧只用 `E()` 文本节点渲染；全文唯一的 `innerHTML` 是静态图标 SVG，不接受 JSON 字段。`AUDIT-SECURITY-v2` §A-15 的结论是当前链路不可利用，selftest 已加“伪造全字段 payload”回归断言。
 3. **`uninstall` 的 BASE 有硬守卫**。`ISP_SPLIT_BASE=/etc isp-split uninstall` 会被拒绝；真实根只接受默认 `/etc/isp-split`，其它目录必须显式 `--i-know-what-im-doing`。`export` 的 README/数据文件统一走同目录临时文件 + 原子 `rename`，不写穿符号链接。
 

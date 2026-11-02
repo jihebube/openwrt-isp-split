@@ -47,6 +47,7 @@ for f in usr/sbin/isp-split etc/isp-split.conf etc/init.d/isp-split \
 done
 for f in htdocs/luci-static/resources/view/isp-split/overview.js \
          htdocs/luci-static/resources/view/isp-split/config.js \
+         htdocs/luci-static/resources/view/isp-split/wizard.js \
          htdocs/luci-static/resources/view/isp-split/linecheck.js \
          htdocs/luci-static/resources/isp-split/isp-split.css \
          root/usr/share/luci/menu.d/luci-app-isp-split.json \

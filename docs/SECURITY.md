@@ -9,8 +9,8 @@
 
 | 组 | 实际能力 |
 |---|---|
-| `read` | `ubus file read/stat`；读 `/etc/isp-split.conf`、`/etc/isp-split` 及其 `state/` 子树 |
-| `write` | `ubus file exec`；对 `/usr/sbin/isp-split` 执行**任意子命令** |
+| `read` | `ubus file read/stat`；读 `/etc/isp-split.conf`、`/etc/isp-split/*` 及其 `state/*` 子树（0.3.3 起不再单列 `/etc/isp-split` 目录项） |
+| `write` | `ubus file exec` + `ubus file write`；对 `/usr/sbin/isp-split` 执行**任意子命令**，且只允许写一个文件：`/etc/isp-split/state/wizard.json`（首启向导的进度，见下） |
 
 关键点：rpcd 的 `file exec` ACL 是**按可执行文件路径**授权的，不按 argv 里的子命令
 细分。因此拿到 `write` 的账号等价于拿到：
@@ -33,6 +33,22 @@ isp-split wire / apply / fetch / conf set / export / uninstall ...
 - 未来若要把 `write` 收窄到白名单子命令，正确做法是增加一个按 argv 校验的
   wrapper，而不是继续依赖 rpcd 的路径 ACL。当前版本没有实现 wrapper，故本文
   按“write = 任意子命令”如实记录。
+
+### 1.1 首启向导（0.3.3）的写面
+
+向导要在浏览器里记住“走到第几步”，这份进度落在 `/etc/isp-split/state/wizard.json`。
+为此 `write` 组多了一个**单文件**写权限：
+
+- 只授 `file write` 给这一个路径，**不**给 `/etc/isp-split/state/*` 目录写权限；
+- 内容由前端序列化（`schema/step/done/started/updated/done_at`），CLI 侧不读它；
+- 页面读进度走 `read` 组已有的 `state/*`。
+
+向导的按钮侧还有一层**前端白名单**：`wizard.js` 里所有命令都来自一张写死的
+`WIZ` 表（`doctor` / `linecheck --background` / `bootstrap[ --apply|--rollback]` /
+`plan` / `wire` / `apply` / `sync`），参数从不拼接用户输入，全文件只有一处
+`fs.exec`。这层白名单挡的是“页面被塞了假按钮”，**不是** ACL 边界——能拿到
+`write` 的账号仍然可以直接调 `/usr/sbin/isp-split` 的任意子命令（同上表）。
+把 ACL 真正收窄成白名单，仍然要靠 1.0 节最后那条 wrapper。
 
 ## 2. 外部文本 → `last.json` → LuCI：为什么不是 XSS
 
