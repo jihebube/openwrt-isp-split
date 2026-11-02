@@ -133,12 +133,15 @@ cp -f "$SRC/usr/lib/isp-split/"*.awk "$SRC/usr/lib/isp-split/build.sh" /usr/lib/
 # F-14：卸载清理的唯一实现必须跟着装进设备——`isp-split uninstall` 靠它，
 # 缺了这一份就只能退回"各写一份清单"的老路（install 路径当时正是漏装它）。
 cp -f "$SRC/usr/lib/isp-split/teardown.sh" /usr/lib/isp-split/teardown.sh
+# doctor 的判据实现（doctor 子命令用；preflight 在仓库里跑时也 source 它）
+cp -f "$SRC/usr/lib/isp-split/doctor.sh" /usr/lib/isp-split/doctor.sh
 if [ -f "$SRC/usr/lib/isp-split/lc-run" ]; then
 	cp -f "$SRC/usr/lib/isp-split/lc-run" /usr/lib/isp-split/
 fi
 cp -f "$SRC/etc/init.d/isp-split" /etc/init.d/isp-split
 chmod 755 /usr/sbin/isp-split /etc/init.d/isp-split /usr/lib/isp-split/build.sh \
 	/usr/lib/isp-split/teardown.sh
+chmod 644 /usr/lib/isp-split/doctor.sh 2>/dev/null || true
 if [ "$FEATURE_LINECHECK" != "1" ]; then
 	# 升级残留：旧功能版留下的引擎入口与缓存目录不能留在 0 版设备上。
 	rm -f /usr/lib/isp-split/lc-run

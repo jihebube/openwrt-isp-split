@@ -3548,12 +3548,16 @@ if [ -n "$_mipk" ] && _ipk_unpack "$_mipk" "$F31/m" 2>/dev/null; then
 	[ -f "$_m/usr/lib/isp-split/lc-run" ] || _problem="$_problem 缺lc-run"
 	[ -f "$_m/usr/lib/isp-split/lc-run" ] && ! sh -n "$_m/usr/lib/isp-split/lc-run" 2>/dev/null &&
 		_problem="$_problem lc-run语法错"
+	# 0.3.3：doctor 的判据实现必须在包里（与 teardown.sh 同理，漏装=doctor 拒绝运行）
+	[ -f "$_m/usr/lib/isp-split/doctor.sh" ] || _problem="$_problem 缺doctor.sh"
+	[ -f "$_m/usr/lib/isp-split/doctor.sh" ] && ! sh -n "$_m/usr/lib/isp-split/doctor.sh" 2>/dev/null &&
+		_problem="$_problem doctor.sh语法错"
 	sh -n "$_m/usr/sbin/isp-split" 2>/dev/null || _problem="$_problem 主脚本语法错"
 	for _k in LINE_CHECK_ENABLE LINE_CHECK_GEO LINE_CHECK_MIN_INTERVAL LINE_CHECK_STUN_SERVERS; do
 		grep -q "^${_k}=" "$_m/etc/isp-split.conf" 2>/dev/null || _problem="$_problem 缺${_k}"
 	done
 	if [ -z "$_problem" ]; then
-		ok "19.6 主包 payload：lc-run 在包里 + conf 四类 LINE_CHECK_* 键 + 语法通过"
+		ok "19.6 主包 payload：lc-run + doctor.sh 在包里 + conf 四类 LINE_CHECK_* 键 + 语法通过"
 	else
 		ng "19.6 主包 payload 面缺失：$_problem"
 	fi
@@ -6026,6 +6030,1353 @@ else
 		ok "A-15 静态断言：三个 view 的 innerHTML 各仅 1 处且为静态 SVG，外网字段只经 E() 文本节点"
 	else
 		ng "A-15 XSS 静态断言失败:$_a27_xss_bad"
+	fi
+fi
+
+echo "== 28. bootstrap 一键骨架（净机 / 已全配 / 部分配置 / 失败回滚）"
+# 这一节要真写 mwan3，所以只在"root + 有 uci + 有 /etc/config/mwan3"的环境跑；
+# 开发机/CI 容器如实跳过（不算通过），由 VM 覆盖（见 FIX34-SUMMARY 的原始输出）。
+B34=$TMP/b34
+mkdir -p "$B34/base/work" "$B34/base/state" "$B34/bin" "$B34/domains"
+cat > "$B34/conf" <<'B34_CONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+cmcc:isp_cmcc:balanced:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+COUNT_FALLBACK="0"
+B34_CONF
+
+# 仓库里的主脚本 + 临时 BASE/CONF：不碰设备上的 /etc/isp-split 与 conf。
+b34_run() {
+	(
+		ISP_SPLIT_CONF=$B34/conf
+		ISP_SPLIT_BASE=$B34/base
+		ISP_SPLIT_LIB=$ROOT/files/usr/lib/isp-split
+		ISP_SPLIT_MWAN3=/etc/config/mwan3
+		MWAN3_SERVICE=/bin/true
+		export ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB ISP_SPLIT_MWAN3 MWAN3_SERVICE
+		sh "$ROOT/files/usr/sbin/isp-split" "$@"
+	)
+}
+
+# 与 _bt_discover 同口径的候选 WAN（只用于断言数量，不复制实现里的细节）
+b34_cand() {
+	for _s in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^=]*\)=interface$/\1/p'); do
+		case "$_s" in lan | loopback) continue ;; esac
+		_p=$(uci -q get "network.$_s.proto" 2>/dev/null) || _p=""
+		case "$_p" in pppoe | dhcp | static) printf '%s\n' "$_s" ;; esac
+	done
+}
+b34_marked() { # <type>
+	uci -q show mwan3 2>/dev/null |
+		sed -n "s/^mwan3\.\([^=]*\)=$1\$/\1/p" |
+		while IFS= read -r _s; do
+			[ "$(uci -q get "mwan3.$_s.isp_split" 2>/dev/null)" = "1" ] && printf '%s\n' "$_s"
+		done
+}
+b34_md5() { md5sum /etc/config/mwan3 2>/dev/null | awk '{ print $1 }'; }
+b34_leftover() { # 残留事务目录数
+	_n=0
+	for _d in "$B34/base/work"/boot-uci.*; do [ -d "$_d" ] && _n=$((_n + 1)); done
+	printf '%s' "$_n"
+}
+
+if [ "$(id -u)" = 0 ] && command -v uci >/dev/null 2>&1 && [ -f /etc/config/mwan3 ]; then
+	_b34_bak=$TMP/mwan3.selftest.bak
+	cp /etc/config/mwan3 "$_b34_bak"
+	uci -q revert mwan3 2>/dev/null || true
+	b34_restore() {
+		[ -f "$_b34_bak" ] && cp -f "$_b34_bak" /etc/config/mwan3
+		uci -q revert mwan3 2>/dev/null || true
+	}
+	trap 'b34_restore; rm -rf "$TMP"' EXIT
+
+	# ---------- 28.1 净机：只有 globals 的 mwan3 ----------
+	cat > /etc/config/mwan3 <<'B34_FIXTURE'
+config globals 'globals'
+	option mmx_mask '0x3F00'
+B34_FIXTURE
+	uci -q revert mwan3 2>/dev/null || true
+	_net_before=$(uci -q show network 2>/dev/null | md5sum | awk '{ print $1 }')
+	_cand_n=$(b34_cand | grep -c .)
+	_md5_before=$(b34_md5)
+
+	# dry-run 必须一个字节都不改
+	b34_run bootstrap >"$B34/s1-dry.log" 2>&1
+	_s1_dry_rc=$?
+	_md5_after_dry=$(b34_md5)
+
+	# apply
+	b34_run bootstrap --apply >"$B34/s1-apply.log" 2>&1
+	_s1_rc=$?
+	_md5_after=$(b34_md5)
+	_marked_if=$(b34_marked interface)
+	_marked_if_n=$(printf '%s\n' "$_marked_if" | grep -c .)
+	_marked_m=$(b34_marked member)
+	_marked_p=$(b34_marked policy)
+
+	_s1_bad=""
+	[ "$_s1_dry_rc" = 0 ] || _s1_bad="$_s1_bad dry_rc=$_s1_dry_rc"
+	[ "$_md5_after_dry" = "$_md5_before" ] || _s1_bad="$_s1_bad dry-run改写了配置"
+	grep -q '^== 将创建' "$B34/s1-dry.log" || _s1_bad="$_s1_bad dry-run无计划"
+	[ "$_s1_rc" = 0 ] || _s1_bad="$_s1_bad apply_rc=$_s1_rc"
+	[ "$_md5_after" != "$_md5_before" ] || _s1_bad="$_s1_bad apply未写入"
+	[ "$_cand_n" -ge 1 ] || _s1_bad="$_s1_bad 夹具没有候选WAN"
+	[ "$_marked_if_n" = "$_cand_n" ] || _s1_bad="$_s1_bad 标记接口=$_marked_if_n/$_cand_n"
+	# 每条新接口的字段与标记
+	for _i in $_marked_if; do
+		[ "$(uci -q get "mwan3.$_i.enabled")" = 1 ] || _s1_bad="$_s1_bad $_i.enabled"
+		[ "$(uci -q get "mwan3.$_i.family")" = ipv4 ] || _s1_bad="$_s1_bad $_i.family"
+		[ "$(uci -q get "mwan3.$_i.initial_state")" = online ] || _s1_bad="$_s1_bad $_i.initial_state"
+		[ -n "$(uci -q get "mwan3.$_i.track_ip")" ] || _s1_bad="$_s1_bad $_i.track_ip空"
+		[ "$(uci -q get "mwan3.$_i.isp_split")" = 1 ] || _s1_bad="$_s1_bad $_i.无标记"
+		_m="${_i}_m1_w1"
+		[ "$(uci -q get "mwan3.$_m")" = member ] || _s1_bad="$_s1_bad 缺成员$_m"
+		[ "$(uci -q get "mwan3.$_m.interface")" = "$_i" ] || _s1_bad="$_s1_bad 成员$_m指向错"
+		[ "$(uci -q get "mwan3.$_m.isp_split")" = 1 ] || _s1_bad="$_s1_bad 成员$_m无标记"
+	done
+	# 三个策略都存在、带标记、成员可解析
+	for _p in wan_only wanb_only balanced; do
+		[ "$(uci -q get "mwan3.$_p")" = policy ] || _s1_bad="$_s1_bad 缺策略$_p"
+		[ "$(uci -q get "mwan3.$_p.isp_split")" = 1 ] || _s1_bad="$_s1_bad 策略$_p无标记"
+		_um=$(uci -q get "mwan3.$_p.use_member" 2>/dev/null)
+		[ -n "$_um" ] || _s1_bad="$_s1_bad 策略$_p无成员"
+		for _m in $_um; do
+			[ "$(uci -q get "mwan3.$_m")" = member ] || _s1_bad="$_s1_bad 策略$_p引用未知成员$_m"
+		done
+	done
+	# network 只读 + 暂存区干净 + 备份/记录文件
+	_net_after=$(uci -q show network 2>/dev/null | md5sum | awk '{ print $1 }')
+	[ "$_net_after" = "$_net_before" ] || _s1_bad="$_s1_bad network被改"
+	[ -z "$(uci changes mwan3 2>/dev/null)" ] || _s1_bad="$_s1_bad 暂存区有残留"
+	ls "$B34/base/state"/mwan3.bootstrap.*.bak >/dev/null 2>&1 || _s1_bad="$_s1_bad 无备份"
+	[ -s "$B34/base/state/bootstrap.created" ] || _s1_bad="$_s1_bad 无created清单"
+	grep -q '^interface ' "$B34/base/state/bootstrap.created" 2>/dev/null ||
+		_s1_bad="$_s1_bad created无interface行"
+	[ "$(b34_leftover)" = 0 ] || _s1_bad="$_s1_bad 残留事务目录"
+	if [ -z "$_s1_bad" ]; then
+		ok "28.1 净机：dry-run 零改动；--apply 建 $_marked_if_n 接口+成员+3 策略（全部 isp_split=1），network 未动、暂存区干净"
+	else
+		ng "28.1 净机场景异常:$_s1_bad"
+		sed 's/^/    /' "$B34/s1-apply.log" | tail -6
+	fi
+
+	# ---------- 28.2 已全配：默认拒绝 + --force no-op ----------
+	_md5_before=$(b34_md5)
+	b34_run bootstrap --apply >"$B34/s2-refuse.log" 2>&1
+	_s2_rc=$?
+	_md5_after=$(b34_md5)
+	b34_run bootstrap --force --apply >"$B34/s2-force.log" 2>&1
+	_s2f_rc=$?
+	_s2_bad=""
+	[ "$_s2_rc" != 0 ] || _s2_bad="$_s2_bad 未拒绝"
+	grep -q '已配置' "$B34/s2-refuse.log" || _s2_bad="$_s2_bad 拒绝理由缺失"
+	[ "$_md5_after" = "$_md5_before" ] || _s2_bad="$_s2_bad 拒绝时仍改配置"
+	[ "$_s2f_rc" = 0 ] || _s2_bad="$_s2_bad force_rc=$_s2f_rc"
+	grep -q '没有需要新建的段' "$B34/s2-force.log" || _s2_bad="$_s2_bad force非no-op"
+	[ "$(b34_md5)" = "$_md5_before" ] || _s2_bad="$_s2_bad force改了配置"
+	[ -z "$(uci changes mwan3 2>/dev/null)" ] || _s2_bad="$_s2_bad 暂存区残留"
+	if [ -z "$_s2_bad" ]; then
+		ok "28.2 已全配：默认拒绝补段（rc=$_s2_rc，配置不变）；--force 是 no-op（逐字节一致）"
+	else
+		ng "28.2 已全配场景异常:$_s2_bad"
+	fi
+
+	# ---------- 28.3 部分配置：只补缺失，手配段原样幸存 ----------
+	uci -q delete mwan3.balanced
+	uci -q set mwan3.wanb_user=interface
+	uci -q set mwan3.wanb_user.enabled=0
+	uci -q set mwan3.wanb_user.family=ipv4
+	uci -q set mwan3.wanb_user_m1=member
+	uci -q set mwan3.wanb_user_m1.interface=wanb_user
+	uci -q set mwan3.wanb_user_m1.metric=9
+	uci -q set mwan3.wanb_user_pol=policy
+	uci -q set mwan3.wanb_user_pol.use_member=wanb_user_m1
+	uci -q commit mwan3
+	b34_run bootstrap --force --apply >"$B34/s3.log" 2>&1
+	_s3_rc=$?
+	_s3_bad=""
+	[ "$_s3_rc" = 0 ] || _s3_bad="$_s3_bad rc=$_s3_rc"
+	[ "$(uci -q get mwan3.balanced)" = policy ] || _s3_bad="$_s3_bad balanced未补回"
+	[ "$(uci -q get mwan3.balanced.isp_split)" = 1 ] || _s3_bad="$_s3_bad balanced无标记"
+	[ "$(uci -q get mwan3.wanb_user.enabled)" = 0 ] || _s3_bad="$_s3_bad 手配enabled被改"
+	[ -z "$(uci -q get mwan3.wanb_user.isp_split 2>/dev/null)" ] || _s3_bad="$_s3_bad 手配段被加标记"
+	[ "$(uci -q get mwan3.wanb_user_m1.metric)" = 9 ] || _s3_bad="$_s3_bad 手配成员被改"
+	[ "$(uci -q get mwan3.wanb_user_pol.use_member)" = wanb_user_m1 ] ||
+		_s3_bad="$_s3_bad 手配策略被改"
+	if [ -z "$_s3_bad" ]; then
+		ok "28.3 部分配置：只补回缺失的 balanced；手配 interface/member/policy 的 enabled/metric/use_member 一个字段都没动"
+	else
+		ng "28.3 部分配置场景异常:$_s3_bad"
+		sed 's/^/    /' "$B34/s3.log" | tail -8
+	fi
+
+	# ---------- 28.4 --apply 中途失败：正式配置不变、无事务残留 ----------
+	uci -q delete mwan3.wan_only
+	uci -q commit mwan3
+	_md5_before=$(b34_md5)
+	cat >"$B34/bin/uci" <<'B34_STUB'
+#!/bin/sh
+case "$*" in
+*"set mwan3.wan_only=policy"*)
+	echo "stub: 拒绝写入（模拟事务中途失败）" >&2
+	exit 1
+	;;
+esac
+exec /sbin/uci "$@"
+B34_STUB
+	chmod +x "$B34/bin/uci"
+	(
+		PATH="$B34/bin:$PATH"
+		export PATH
+		b34_run bootstrap --force --apply
+	) >"$B34/s4.log" 2>&1
+	_s4_rc=$?
+	_s4_bad=""
+	[ "$_s4_rc" != 0 ] || _s4_bad="$_s4_bad 失败却返回0"
+	grep -q '正式配置未改动' "$B34/s4.log" || _s4_bad="$_s4_bad 缺'正式配置未改动'"
+	[ "$(b34_md5)" = "$_md5_before" ] || _s4_bad="$_s4_bad 失败后配置被改"
+	[ -z "$(uci -q get mwan3.wan_only 2>/dev/null)" ] || _s4_bad="$_s4_bad 半套写入"
+	[ -z "$(uci changes mwan3 2>/dev/null)" ] || _s4_bad="$_s4_bad 全局暂存区被污染"
+	[ "$(b34_leftover)" = 0 ] || _s4_bad="$_s4_bad 残留事务目录"
+	if [ -z "$_s4_bad" ]; then
+		ok "28.4 --apply 失败：rc≠0、mwan3 逐字节不变、私有 confdir 事务丢弃、全局暂存区干净"
+	else
+		ng "28.4 失败回滚场景异常:$_s4_bad"
+		sed 's/^/    /' "$B34/s4.log" | tail -6
+	fi
+	rm -f "$B34/bin/uci"
+
+	# ---------- 28.5 --rollback / uninstall：只删标记段，手配段与"仍被引用"的段幸存 ----------
+	b34_run bootstrap --force --apply >"$B34/s5-apply.log" 2>&1
+	_first_if=$(b34_marked interface | head -1)
+	_first_mem="${_first_if}_m1_w1"
+	uci -q set mwan3.user_pol=policy
+	uci -q add_list "mwan3.user_pol.use_member=$_first_mem"
+	uci -q commit mwan3
+	_md5_before=$(b34_md5)
+	b34_run bootstrap --rollback </dev/null >"$B34/s5-guard.log" 2>&1
+	_s5_guard_rc=$?
+	_s5_bad=""
+	[ "$_s5_guard_rc" != 0 ] || _s5_bad="$_s5_bad 非交互未拒绝"
+	[ "$(b34_md5)" = "$_md5_before" ] || _s5_bad="$_s5_bad 拒绝时仍改配置"
+	b34_run bootstrap --rollback --yes >"$B34/s5.log" 2>&1
+	_s5_rc=$?
+	[ "$_s5_rc" = 0 ] || _s5_bad="$_s5_bad rollback_rc=$_s5_rc"
+	# 被 user_pol 引用的成员与它指向的接口必须保留（删了 mwan3 会渲染失败）
+	[ "$(uci -q get "mwan3.$_first_mem")" = member ] || _s5_bad="$_s5_bad 被引用成员被删"
+	[ "$(uci -q get "mwan3.$_first_if")" = interface ] || _s5_bad="$_s5_bad 被引用接口被删"
+	grep -q '仍被' "$B34/s5.log" || _s5_bad="$_s5_bad 无保留警告"
+	# 手配段一个都不能少
+	[ "$(uci -q get mwan3.wanb_user)" = interface ] || _s5_bad="$_s5_bad 手配接口被删"
+	[ "$(uci -q get mwan3.wanb_user_m1)" = member ] || _s5_bad="$_s5_bad 手配成员被删"
+	[ "$(uci -q get mwan3.wanb_user_pol)" = policy ] || _s5_bad="$_s5_bad 手配策略被删"
+	[ "$(uci -q get mwan3.user_pol)" = policy ] || _s5_bad="$_s5_bad 无标记策略被删"
+	# 其它标记段（策略/成员/ipset）应已消失
+	[ -z "$(b34_marked policy)" ] || _s5_bad="$_s5_bad 标记策略残留"
+	[ -z "$(b34_marked ipset)" ] || _s5_bad="$_s5_bad 标记ipset残留"
+	if [ -z "$_s5_bad" ]; then
+		ok "28.5 --rollback：非交互先拒绝；--yes 后标记策略/成员/ipset 全清，被 user_pol 引用的成员与接口保留并告警，手配四段幸存"
+	else
+		ng "28.5 rollback 场景异常:$_s5_bad"
+		sed 's/^/    /' "$B34/s5.log" | tail -10
+	fi
+
+	# 解除引用后再回滚：这次连成员与接口都应删干净
+	uci -q delete mwan3.user_pol
+	uci -q commit mwan3
+	b34_run bootstrap --rollback --yes >"$B34/s5b.log" 2>&1
+	_s5b_bad=""
+	[ -z "$(b34_marked interface)" ] || _s5b_bad="$_s5b_bad 标记接口残留"
+	[ -z "$(b34_marked member)" ] || _s5b_bad="$_s5b_bad 标记成员残留"
+	[ -z "$(b34_marked policy)" ] || _s5b_bad="$_s5b_bad 标记策略残留"
+	[ "$(uci -q get mwan3.wanb_user)" = interface ] || _s5b_bad="$_s5b_bad 手配接口被删"
+	[ "$(uci -q get mwan3.wanb_user_pol)" = policy ] || _s5b_bad="$_s5b_bad 手配策略被删"
+	if [ -z "$_s5b_bad" ]; then
+		ok "28.5b 解除引用后再回滚：标记 interface/member/policy 全清（含 bootstrap 建的接口），手配段仍在"
+	else
+		ng "28.5b 二次回滚异常:$_s5b_bad"
+	fi
+
+	b34_restore
+	trap 'rm -rf "$TMP"' EXIT
+	if cmp -s /etc/config/mwan3 "$_b34_bak"; then
+		ok "28.6 夹具恢复：selftest 结束后 /etc/config/mwan3 与开跑前逐字节一致"
+	else
+		ng "28.6 夹具恢复失败：/etc/config/mwan3 与备份不一致"
+	fi
+else
+	skip "28.1 bootstrap 净机场景：非 root / 无 uci（开发机、CI 容器），由 VM 覆盖"
+	skip "28.2 bootstrap 已全配场景：同上"
+	skip "28.3 bootstrap 部分配置场景：同上"
+	skip "28.4 bootstrap --apply 失败回滚：同上"
+	skip "28.5 bootstrap --rollback 只删标记段：同上"
+	skip "28.6 mwan3 夹具恢复：同上"
+fi
+
+echo "== 29. uninstall/teardown 只删 bootstrap 自建段（isp_split=1），手配段与仍被引用的段幸存"
+# 用状态存储式 uci 桩：show/get/delete/commit 都落到同一份"配置文件"，
+# 因为 teardown 的删除顺序本身就是要断言的语义（先策略 -> 再成员引用 ->
+# 再接口引用），只回放固定输出测不出来。
+D34=$TMP/d34
+mkdir -p "$D34/bin" "$D34/state/data"
+cat > "$D34/bin/uci" <<'D34_UCI'
+#!/bin/sh
+S=${FAKE_UCI_STATE:?}
+[ "$1" = "-q" ] && shift
+cmd=$1
+shift
+case "$cmd" in
+show)
+	[ "${1:-}" = "mwan3" ] || exit 1
+	cat "$S/show" 2>/dev/null
+	exit 0
+	;;
+get)
+	p=$1
+	cfg=${p%%.*}
+	rest=${p#*.}
+	sec=${rest%%.*}
+	opt=""
+	[ "$rest" != "$sec" ] && opt=${rest#*.}
+	[ "$cfg" = "mwan3" ] || exit 1
+	if [ -z "$opt" ]; then
+		sed -n "s/^mwan3\.$sec=//p" "$S/show" 2>/dev/null | head -1 | grep -q . || exit 1
+		sed -n "s/^mwan3\.$sec=//p" "$S/show" 2>/dev/null | head -1
+		exit 0
+	fi
+	[ -f "$S/data/$sec.$opt" ] || exit 1
+	tr '\n' ' ' <"$S/data/$sec.$opt" | sed 's/ $//'
+	exit 0
+	;;
+delete)
+	p=$1
+	cfg=${p%%.*}
+	rest=${p#*.}
+	sec=${rest%%.*}
+	opt=""
+	[ "$rest" != "$sec" ] && opt=${rest#*.}
+	[ "$cfg" = "mwan3" ] || exit 1
+	if [ -z "$opt" ]; then
+		grep -q "^mwan3\.$sec=" "$S/show" 2>/dev/null || exit 1
+		grep -v "^mwan3\.$sec=" "$S/show" >"$S/show.new" 2>/dev/null
+		mv "$S/show.new" "$S/show"
+		rm -f "$S/data/$sec".*
+	else
+		rm -f "$S/data/$sec.$opt"
+	fi
+	exit 0
+	;;
+commit) exit 0 ;;
+*) exit 1 ;;
+esac
+D34_UCI
+chmod +x "$D34/bin/uci"
+
+d34_seed() {
+	_s=$1
+	mkdir -p "$_s/data"
+	cat >"$_s/show" <<'D34_SHOW'
+mwan3.globals=globals
+mwan3.wan1=interface
+mwan3.wan2=interface
+mwan3.user_if=interface
+mwan3.wan1_m1_w1=member
+mwan3.wan2_m1_w1=member
+mwan3.user_m=member
+mwan3.wan_only=policy
+mwan3.wanb_only=policy
+mwan3.user_pol=policy
+mwan3.isp_tel=ipset
+mwan3.isp_tel_rule=rule
+D34_SHOW
+	_v() { printf '%s\n' "$2" >"$_s/data/$1"; }
+	_v wan1.isp_split 1
+	_v wan1.enabled 1
+	_v wan2.isp_split 1
+	_v wan2.enabled 1
+	_v user_if.enabled 0
+	_v wan1_m1_w1.isp_split 1
+	_v wan1_m1_w1.interface wan1
+	_v wan2_m1_w1.isp_split 1
+	_v wan2_m1_w1.interface wan2
+	_v user_m.interface user_if
+	_v wan_only.isp_split 1
+	_v wan_only.use_member wan1_m1_w1
+	_v wanb_only.isp_split 1
+	_v wanb_only.use_member wan2_m1_w1
+	_v user_pol.use_member wan2_m1_w1
+	_v isp_tel.isp_split 1
+	_v isp_tel_rule.isp_split 1
+}
+d34_run() {
+	_s=$1
+	(
+		PATH="$D34/bin:$PATH"
+		FAKE_UCI_STATE=$_s
+		ISP_SPLIT_BASE=$D34/base
+		MWAN3_SERVICE=/bin/true
+		export PATH FAKE_UCI_STATE ISP_SPLIT_BASE MWAN3_SERVICE
+		sh "$ROOT/files/usr/lib/isp-split/teardown.sh" mwan3 --i-know-what-im-doing
+	)
+}
+d34_has() { # <state> <section> -> 类型或空
+	sed -n "s/^mwan3\.$2=//p" "$1/show" 2>/dev/null | head -1
+}
+
+d34_seed "$D34/s1"
+d34_run "$D34/s1" >"$D34/s1.log" 2>&1
+_d34_bad=""
+[ -z "$(d34_has "$D34/s1" wan1)" ] || _d34_bad="$_d34_bad 自建接口wan1未删"
+[ "$(d34_has "$D34/s1" wan2)" = interface ] || _d34_bad="$_d34_bad 被成员引用的wan2被删"
+[ -z "$(d34_has "$D34/s1" wan1_m1_w1)" ] || _d34_bad="$_d34_bad 失去引用的成员未删"
+[ "$(d34_has "$D34/s1" wan2_m1_w1)" = member ] || _d34_bad="$_d34_bad 被user_pol引用的成员被删"
+[ -z "$(d34_has "$D34/s1" wan_only)" ] || _d34_bad="$_d34_bad 标记策略未删"
+[ -z "$(d34_has "$D34/s1" isp_tel)" ] || _d34_bad="$_d34_bad 标记ipset未删"
+[ -z "$(d34_has "$D34/s1" isp_tel_rule)" ] || _d34_bad="$_d34_bad 标记rule未删"
+[ "$(d34_has "$D34/s1" user_if)" = interface ] || _d34_bad="$_d34_bad 手配接口被删"
+[ ! -f "$D34/s1/data/user_if.isp_split" ] || _d34_bad="$_d34_bad 手配段被加标记"
+[ "$(d34_has "$D34/s1" user_m)" = member ] || _d34_bad="$_d34_bad 手配成员被删"
+[ "$(d34_has "$D34/s1" user_pol)" = policy ] || _d34_bad="$_d34_bad 无标记策略被删"
+grep -q '仍被其它策略引用，保留' "$D34/s1.log" || _d34_bad="$_d34_bad 成员保留无告警"
+grep -q '仍被成员引用，保留' "$D34/s1.log" || _d34_bad="$_d34_bad 接口保留无告警"
+grep -q '已删除 1 个带 isp_split 标记的 mwan3 interface 段' "$D34/s1.log" ||
+	_d34_bad="$_d34_bad 接口删除计数缺失"
+grep -q '已删除 1 个带 isp_split 标记的 mwan3 rule 段' "$D34/s1.log" ||
+	_d34_bad="$_d34_bad rule删除计数缺失"
+if [ -z "$_d34_bad" ]; then
+	ok "29.1 teardown mwan3：标记 ipset/rule/策略/成员/接口按引用顺序删除；手配 3 段与无标记策略幸存"
+else
+	ng "29.1 teardown mwan3 行为异常:$_d34_bad"
+	sed 's/^/    /' "$D34/s1.log" | tail -8
+fi
+
+# 29.2 解除引用后：接口与成员都应删干净（不能"永远保留"）
+d34_seed "$D34/s2"
+sed 's/^mwan3\.user_pol=policy$//' "$D34/s2/show" | grep -v '^$' >"$D34/s2/show.new"
+mv "$D34/s2/show.new" "$D34/s2/show"
+d34_run "$D34/s2" >"$D34/s2.log" 2>&1
+_d34_bad=""
+[ -z "$(d34_has "$D34/s2" wan2_m1_w1)" ] || _d34_bad="$_d34_bad 成员未删"
+[ -z "$(d34_has "$D34/s2" wan2)" ] || _d34_bad="$_d34_bad 接口未删"
+[ "$(d34_has "$D34/s2" user_if)" = interface ] || _d34_bad="$_d34_bad 手配接口被误删"
+if [ -z "$_d34_bad" ]; then
+	ok "29.2 无外部引用时，bootstrap 建的接口与成员全部删除（手配接口仍在）"
+else
+	ng "29.2 解除引用后的删除异常:$_d34_bad"
+fi
+
+# 29.3 --list 必须点名 interface 段（清单与实现同一份，禁止再漏）
+_d34_list=$(sh "$ROOT/files/usr/lib/isp-split/teardown.sh" --list 2>/dev/null)
+case "$_d34_list" in
+*'isp_split=1 标记的 mwan3 interface 段'*)
+	ok "29.3 teardown --list 明示会删 isp_split=1 的 mwan3 interface 段（拍板①的可核对清单）"
+	;;
+*)
+	ng "29.3 teardown --list 没有列出 interface 段（拍板①的删除面不可核对）"
+	;;
+esac
+
+echo "== 30. doctor 兼容矩阵判据（C1–C6 正/反用例 + P10 版本探测）"
+# 判据函数只吃探针缓存（DOC_*），所以这里可以构造任意机器：注入 P1/P2/P3/P4/P5/P7/P8/P9
+# 的结果，只让判据本身跑，断言 verdict 与 finding code。不改 /proc、不碰系统配置。
+D30=$TMP/d30
+mkdir -p "$D30/bin" "$D30/emptybin" "$D30/dnsmasq.d" "$D30/c6/bin" "$D30/apk/bin" "$D30/minbin"
+# 只放 awk：给 P10 用"没有包管理器"的 PATH，同时 doc_pkg_version 里的 awk 还能跑
+ln -sf "$(command -v awk)" "$D30/minbin/awk" 2>/dev/null || cp "$(command -v awk)" "$D30/minbin/awk" 2>/dev/null || true
+
+cat > "$D30/bin/cat" <<'D30_CAT'
+#!/bin/sh
+if [ "${FAKE_DNSMASQ_COMM:-0}" = "1" ]; then
+	case "$1" in
+	/proc/*/comm) printf 'dnsmasq\n'; exit 0 ;;
+	esac
+fi
+exec /bin/cat "$@"
+D30_CAT
+cat > "$D30/bin/pidof" <<'D30_PIDOF'
+#!/bin/sh
+[ -n "${FAKE_PIDOF_PID:-}" ] && printf '%s\n' "$FAKE_PIDOF_PID"
+exit 0
+D30_PIDOF
+chmod +x "$D30/bin/cat" "$D30/bin/pidof"
+
+# 共用夹具：把 11 个探针的缓存全部预置，判据函数只消费缓存。
+d30_ctx() {
+	. "$ROOT/files/usr/lib/isp-split/doctor.sh" || exit 99
+	PATH="$D30/bin:$PATH"
+	export PATH
+	DOMAIN_SPLIT=""
+	DOMAINDIR="$D30/domains"
+	BASE="$D30/base"
+	DATA="$D30/base/data"
+	DNS_MODE=bind
+	DNSMASQ_DEFAULT_DIR="$D30/dnsmasq.d"
+	DOC_P1_DONE=1
+	DOC_P1_TSV=""
+	DOC_P1_RC=0
+	DOC_P2_DONE=1
+	DOC_P2_MAP=""
+	DOC_P2_RC=0
+	DOC_P3_DONE=1
+	DOC_P3_SOURCE=default
+	DOC_P3_DIRS="$D30/dnsmasq.d"
+	DOC_P3_DETAIL=fixture
+	DOC_P4_DONE=1
+	DOC_P4_RC=0
+	DOC_P4=""
+	DOC_P4_RAW=""
+	DOC_P4B_DONE=1
+	DOC_P4B=1
+	DOC_P5_DONE=1
+	DOC_P5=""
+	DOC_MINPREF=2005
+	DOC_P6_DONE=1
+	DOC_RG_DEV=pppoe-wan
+	DOC_RG_VIA=192.0.2.1
+	DOC_RG_TABLE=main
+	DOC_DEF_V4="default via 192.0.2.1 dev pppoe-wan"
+	DOC_DEF_V6=""
+	DOC_P7_DONE=1
+	DOC_TUN=""
+	DOC_P8_DONE=1
+	DOC_OFF_SW=0
+	DOC_OFF_HW=0
+	DOC_OFF_FLOWTABLE=0
+	DOC_OFF_FLOWADD=0
+	DOC_OFF_TURBOACC=0
+	DOC_OFF_VENDOR=""
+	DOC_P9_DONE=1
+	DOC_CT_COUNT=10
+	DOC_CT_MAX=65536
+	DOC_CT_ACCT=0
+	DOC_CT_EST=7440
+	DOC_CT_TUNED=""
+	DOC_P11_DONE=1
+	DOC_MMX_MASK=0x3F00
+	DOC_MMX_MASK_DEC=16128
+	DOC_MMX_SOURCE=default
+	DOC_W=""
+}
+d30_codes() { # <find-json>
+	printf '%s' "$1" | grep -o '"code":"[^"]*"' 2>/dev/null |
+		sed 's/^"code":"//; s/"$//' | tr '\n' ','
+}
+d30_case() { # <label> <expect-verdict> <expect-code|-> <fn> [<expect-substr>]
+	_out=$("$4" 2>&1)
+	_v=$(printf '%s\n' "$_out" | sed -n 's/^V=//p' | head -1)
+	_c=$(printf '%s\n' "$_out" | sed -n 's/^C=//p' | head -1)
+	_bad=""
+	[ "$_v" = "$2" ] || _bad="$_bad verdict=${_v:-空}(期望$2)"
+	if [ "$3" != "-" ]; then
+		case ",$_c," in
+		*",$3,"*) ;;
+		*) _bad="$_bad 缺finding:$3(实际:${_c:-空})" ;;
+		esac
+	fi
+	if [ -n "${5:-}" ]; then
+		printf '%s' "$_out" | grep -q -- "$5" || _bad="$_bad 缺内容:$5"
+	fi
+	if [ -z "$_bad" ]; then
+		ok "$1"
+	else
+		ng "$1:$_bad"
+		printf '%s\n' "$_out" | sed 's/^/    /' | tail -6
+	fi
+}
+
+# ---------------- C1：53 端口归属 + dnsmasq 片段 ----------------
+d30_c1_unknown() {
+	d30_ctx
+	doc_check_dns53
+	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
+}
+d30_c1_ok_notneeded() {
+	d30_ctx
+	FAKE_DNSMASQ_COMM=1
+	FAKE_PIDOF_PID=""
+	export FAKE_DNSMASQ_COMM FAKE_PIDOF_PID
+	DOC_P1_TSV="udp	/proc/net/udp	00000000:0035	07	4242"
+	DOC_P2_MAP="/proc/999999/fd:
+7 -> socket:[4242]"
+	doc_check_dns53
+	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
+}
+d30_c1_conflict_orphan() {
+	d30_ctx
+	FAKE_DNSMASQ_COMM=1
+	export FAKE_DNSMASQ_COMM
+	DOMAIN_SPLIT="example.com:wan_only"
+	DOC_P1_TSV="udp	/proc/net/udp	00000000:0035	07	4242"
+	DOC_P2_MAP="/proc/999999/fd:
+7 -> socket:[4242]"
+	doc_check_dns53
+	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
+}
+d30_c1_conflict_third() {
+	d30_ctx
+	FAKE_DNSMASQ_COMM=0
+	export FAKE_DNSMASQ_COMM
+	DOC_P1_TSV="udp	/proc/net/udp	00000000:0035	07	3333"
+	DOC_P2_MAP="/proc/$$/fd:
+7 -> socket:[3333]"
+	doc_check_dns53
+	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
+}
+d30_c1_warn_mark() {
+	d30_ctx
+	FAKE_DNSMASQ_COMM=0
+	export FAKE_DNSMASQ_COMM
+	DNS_MODE=mark
+	DOC_P1_TSV="udp	/proc/net/udp	00000000:0035	07	3333"
+	DOC_P2_MAP="/proc/$$/fd:
+7 -> socket:[3333]"
+	doc_check_dns53
+	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
+}
+d30_case "30.1 C1 无监听者 -> unknown（不把'不知道'判成'没问题'）" unknown - d30_c1_unknown
+d30_case "30.2 C1 dnsmasq 独占 :53 且没有域名分流 -> ok / DNS_FRAGMENT_NOT_NEEDED" ok DNS_FRAGMENT_NOT_NEEDED d30_c1_ok_notneeded
+d30_case "30.3 C1 dnsmasq 在跑但片段不在加载目录 -> conflict / DNS_FRAGMENT_ORPHAN" conflict DNS_FRAGMENT_ORPHAN d30_c1_conflict_orphan
+d30_case "30.4 C1 第三方程序持有 :53（bind 模式）-> conflict / DNS_BYPASS_DEAD" conflict DNS_BYPASS_DEAD d30_c1_conflict_third
+d30_case "30.5 C1 同一机器改 mark 模式 -> warn / DNS_BYPASS_PARTIAL（nft 侧仍生效）" warn DNS_BYPASS_PARTIAL d30_c1_warn_mark
+
+# ---------------- C2：TUN 劫持 ----------------
+d30_c2_ok() {
+	d30_ctx
+	doc_check_tun
+	printf 'V=%s\nC=%s\n' "$DOC_C2_VERDICT" "$(d30_codes "$DOC_C2_FIND")"
+}
+d30_c2_conflict_default() {
+	d30_ctx
+	DOC_TUN="tun0"
+	DOC_RG_DEV="tun0"
+	doc_check_tun
+	printf 'V=%s\nC=%s\n' "$DOC_C2_VERDICT" "$(d30_codes "$DOC_C2_FIND")"
+}
+d30_c2_conflict_fakeip() {
+	d30_ctx
+	DOC_TUN="tun0"
+	DOC_RG_DEV="tun0"
+	_openclash_fakeip() { return 0; }
+	doc_check_tun
+	printf 'V=%s\nC=%s\n' "$DOC_C2_VERDICT" "$(d30_codes "$DOC_C2_FIND")"
+}
+d30_c2_warn_preempt() {
+	d30_ctx
+	DOC_TUN="tun0"
+	DOC_P5="100	0x80000	0xffffffff	100	-	-	0"
+	doc_check_tun
+	printf 'V=%s\nC=%s\n' "$DOC_C2_VERDICT" "$(d30_codes "$DOC_C2_FIND")"
+}
+d30_c2_ok_idle() {
+	d30_ctx
+	DOC_TUN="tun0"
+	doc_check_tun
+	printf 'V=%s\nC=%s\n' "$DOC_C2_VERDICT" "$(d30_codes "$DOC_C2_FIND")"
+}
+d30_case "30.6 C2 无 TUN -> ok" ok - d30_c2_ok
+d30_case "30.7 C2 默认路由指向 TUN -> conflict / TUN_DEFAULT_ROUTE" conflict TUN_DEFAULT_ROUTE d30_c2_conflict_default
+d30_case "30.8 C2 默认路由 + fake-ip -> conflict / TUN_FAKEIP（比 TUN_DEFAULT_ROUTE 更具体）" conflict TUN_FAKEIP d30_c2_conflict_fakeip
+d30_case "30.9 C2 TUN 空闲但 ip rule 抢先（pref 100 < 2005）-> warn / TUN_RULE_PREEMPT" warn TUN_RULE_PREEMPT d30_c2_warn_preempt
+d30_case "30.10 C2 TUN 存在但既不抢路由也不抢 rule -> ok / TUN_IDLE" ok TUN_IDLE d30_c2_ok_idle
+
+# ---------------- C3：位段占用 ----------------
+d30_c3_ok_mwan3() {
+	d30_ctx
+	DOC_W="inet	mwan3	mwan3_rules	10	mark	mask_set	0x00003f00	0x00000500	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+d30_c3_conflict_unordered() {
+	d30_ctx
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00001000	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_c3_warn_ordered() {
+	d30_ctx
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00001000	-"
+	DOC_P5="100	0x1000	0xffffffff	100	-	-	0"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_c3_conflict_ctmark() {
+	d30_ctx
+	DOC_W="inet	oaf	prerouting	30	ctmark	mask_set	0x00003f00	0x00000100	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_c3_ok_outside() {
+	d30_ctx
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00080000	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_c3_unknown() {
+	d30_ctx
+	DOC_P4B=0
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00001000	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_c3_custom_mask() {
+	d30_ctx
+	DOC_MMX_MASK=0xFC00
+	DOC_MMX_MASK_DEC=64512
+	DOC_MMX_SOURCE="uci mwan3.globals.mmx_mask"
+	DOC_W="inet	mwan3	mwan3_rules	10	mark	mask_set	0x0000fc00	0x00004000	-"
+	DOC_P5="2005	0x4000	0xfc00	5	-	-	0"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+d30_case "30.11 C3 位段只有 mwan3 自己写 -> ok" ok - d30_c3_ok_mwan3 '"mmx_mask":"0x3F00"'
+d30_case "30.12 C3 第三方写者落在位段内且没有先手 rule -> conflict / MARK_OVERLAP_UNORDERED" conflict MARK_OVERLAP_UNORDERED d30_c3_conflict_unordered
+d30_case "30.13 C3 同一写者但它的 rule 排在 mwan3 之前 -> warn / MARK_OVERLAP_ORDERED" warn MARK_OVERLAP_ORDERED d30_c3_warn_ordered
+d30_case "30.14 C3 ct mark 被改写（OAF 类）-> conflict / CTMARK_COLLISION" conflict CTMARK_COLLISION d30_c3_conflict_ctmark
+d30_case "30.15 C3 第三方写者全在位段之外 -> ok / MARK_OUTSIDE" ok MARK_OUTSIDE d30_c3_ok_outside
+d30_case "30.16 C3 table inet mwan3 不存在 -> unknown（不猜）" unknown - d30_c3_unknown
+d30_case "30.17 C3 mmx_mask 改成 0xFC00：阈值现算 + MMX_MASK_CUSTOM，不误报" ok MMX_MASK_CUSTOM d30_c3_custom_mask '"mmx_mask":"0xFC00"'
+
+# P5 回归：`ip -4 rule show` 里的空行不能被解析成一条"精确 fwmark 0xffffffff"的假规则
+mkdir -p "$D30/ipbin"
+cat > "$D30/ipbin/ip" <<'D30_IP5'
+#!/bin/sh
+printf '\n'
+echo "2005:	from all fwmark 0x500/0x3f00 lookup 5"
+exit 0
+D30_IP5
+chmod +x "$D30/ipbin/ip"
+d30_p5_blank() {
+	d30_ctx
+	PATH="$D30/ipbin:$D30/bin:$PATH"
+	export PATH
+	unset DOC_P5_DONE DOC_P5 DOC_MINPREF
+	doc_p5_iprule
+	if [ "$DOC_P5_ROWS" = 1 ] && printf '%s' "$DOC_P5" | grep -q '0x500' &&
+		! printf '%s' "$DOC_P5" | grep -q '0xffffffff'; then
+		printf 'V=ok\n'
+	else
+		printf 'V=bad(rows=%s)\n' "$DOC_P5_ROWS"
+		printf 'C=%s\n' "$DOC_P5"
+	fi
+}
+d30_case "30.34 P5 回归：rule 输出中的空行不再伪造 '精确 fwmark 0xffffffff' 读者" ok - d30_p5_blank
+
+# ---------------- C4：offload / 统计口径 ----------------
+d30_c4_ok() {
+	d30_ctx
+	doc_check_offload
+	printf 'V=%s\nC=%s\n' "$DOC_C4_VERDICT" "$(d30_codes "$DOC_C4_FIND")"
+}
+d30_c4_warn_sw() {
+	d30_ctx
+	DOC_OFF_SW=1
+	doc_check_offload
+	printf 'V=%s\nC=%s\n' "$DOC_C4_VERDICT" "$(d30_codes "$DOC_C4_FIND")"
+}
+d30_c4_warn_stale() {
+	d30_ctx
+	DOC_OFF_FLOWADD=3
+	doc_check_offload
+	printf 'V=%s\nC=%s\n' "$DOC_C4_VERDICT" "$(d30_codes "$DOC_C4_FIND")"
+}
+d30_c4_conflict_hw() {
+	d30_ctx
+	DOC_OFF_HW=1
+	doc_check_offload
+	printf 'V=%s\nC=%s\n' "$DOC_C4_VERDICT" "$(d30_codes "$DOC_C4_FIND")"
+}
+d30_case "30.18 C4 未开 offload -> ok" ok - d30_c4_ok
+d30_case "30.19 C4 软件 offload -> warn / OFFLOAD_SW_COUNTERS（口径问题，不阻断）" warn OFFLOAD_SW_COUNTERS d30_c4_warn_sw
+d30_case "30.20 C4 uci 关了但规则表仍有 flow add -> warn / OFFLOAD_STALE（改了没 reload）" warn OFFLOAD_STALE d30_c4_warn_stale
+d30_case "30.21 C4 硬件加速 -> conflict / OFFLOAD_HW_ROUTING" conflict OFFLOAD_HW_ROUTING d30_c4_conflict_hw
+
+# ---------------- C5：写者清单 ----------------
+d30_c5_ok() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_W="inet	mwan3	mwan3_rules	10	mark	mask_set	0x00003f00	0x00000500	-"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
+d30_c5_warn_legacy() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_W="ip	filter	PREROUTING	5	mark	mask_set	0x00003f00	0x00000100	-"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
+d30_c5_warn_inmask() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00000100	-"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
+d30_c5_warn_foreign() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_P4="table inet mwan3 {
+	chain mwan3_rules {
+	}
+	chain evil {
+	}
+}"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
+d30_c5_conflict_inherit() {
+	d30_ctx
+	DOC_C3_VERDICT=conflict
+	DOC_W="inet	proxy	prerouting	20	mark	set	-	0x00001000	-"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
+d30_case "30.22 C5 只有 mwan3 写者 -> ok" ok - d30_c5_ok
+d30_case "30.23 C5 iptables-nft 残留写者 -> warn / LEGACY_MARK_WRITER" warn LEGACY_MARK_WRITER d30_c5_warn_legacy
+d30_case "30.24 C5 第三方写者位段有交集（C3 未判 conflict 时）-> warn / MARK_WRITERS_IN_MASK" warn MARK_WRITERS_IN_MASK d30_c5_warn_inmask
+d30_case "30.25 C5 有人往 inet mwan3 塞外来链 -> warn / MWAN3_TABLE_FOREIGN_CHAIN" warn MWAN3_TABLE_FOREIGN_CHAIN d30_c5_warn_foreign
+d30_case "30.26 C5 继承 C3 的 conflict（同一故障不重复计数）" conflict - d30_c5_conflict_inherit
+
+# ---------------- C6：共存白名单 ----------------
+cat > "$D30/c6/bin/tailscale" <<'D30_TS'
+#!/bin/sh
+exit 0
+D30_TS
+cat > "$D30/c6/bin/pidof" <<'D30_PIDOF2'
+#!/bin/sh
+printf '4242\n'
+D30_PIDOF2
+cat > "$D30/c6/bin/opkg" <<'D30_OPKG'
+#!/bin/sh
+echo "mwan3 - 3.6.12-r5"
+echo "tailscale - ${FAKE_TS_VER:-1.78.1}"
+exit 0
+D30_OPKG
+cat > "$D30/c6/bin/uci" <<'D30_UCI6'
+#!/bin/sh
+[ "$1" = "-q" ] && shift
+case "$*" in
+"get tailscale.settings.exit_node") [ -n "${FAKE_EXIT_NODE:-}" ] && printf '%s\n' "$FAKE_EXIT_NODE" && exit 0; exit 1 ;;
+esac
+exit 1
+D30_UCI6
+chmod +x "$D30/c6/bin/"*
+
+d30_c6_ctx() {
+	d30_ctx
+	PATH="$D30/c6/bin:$D30/bin:$PATH"
+	export PATH
+}
+d30_c6_ok() {
+	d30_ctx
+	# 只用真实系统路径：三个产品都没装（VM/宿主均如此），判 not_installed
+	PATH="$D30/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+	export PATH
+	doc_check_whitelist
+	printf 'V=%s\nC=%s\n' "$DOC_C6_VERDICT" "$(d30_codes "$DOC_C6_FIND")"
+	printf 'X=%s\n' "$DOC_C6_FACTS"
+}
+d30_c6_warn_exitnode() {
+	d30_c6_ctx
+	FAKE_EXIT_NODE=100.64.0.1
+	export FAKE_EXIT_NODE
+	doc_check_whitelist
+	printf 'V=%s\nC=%s\n' "$DOC_C6_VERDICT" "$(d30_codes "$DOC_C6_FIND")"
+	printf 'X=%s\n' "$DOC_C6_FACTS"
+}
+d30_c6_drift() {
+	d30_c6_ctx
+	FAKE_TS_VER=1.99.0
+	export FAKE_TS_VER
+	doc_check_whitelist
+	printf 'V=%s\nC=%s\n' "$DOC_C6_VERDICT" "$(d30_codes "$DOC_C6_FIND")"
+	printf 'X=%s\n' "$DOC_C6_FACTS"
+}
+d30_c6_conflict() {
+	d30_c6_ctx
+	DOC_C3_VERDICT=ok
+	DOC_C3_OVERLAP_NAMES="tailscale"
+	doc_check_whitelist
+	printf 'V=%s\nC=%s\n' "$DOC_C6_VERDICT" "$(d30_codes "$DOC_C6_FIND")"
+	printf 'X=%s\n' "$DOC_C6_FACTS"
+}
+d30_case "30.27 C6 三个白名单产品都没装 -> ok / WHITELIST_GREEN" ok WHITELIST_GREEN d30_c6_ok '"state":"not_installed"'
+d30_case "30.28 C6 tailscale 开了 exit_node -> warn / EXIT_NODE_HIJACK（GREEN 也要说）" warn - d30_c6_warn_exitnode '"code":"EXIT_NODE_HIJACK"'
+d30_case "30.29 C6 版本漂移 1.99.0 -> warn / green_with_version_drift" warn - d30_c6_drift '"state":"green_with_version_drift"'
+d30_case "30.30 C6 覆盖位段的写者指向 tailscale -> conflict（机制门槛不过）" conflict - d30_c6_conflict '"state":"conflict"'
+
+# ---------------- P10：版本探测（opkg / apk / 都没有） ----------------
+d30_p10_opkg() {
+	PATH="$D30/c6/bin:$D30/minbin"
+	export PATH
+	. "$ROOT/files/usr/lib/isp-split/doctor.sh"
+	printf 'V=%s\n' "$(doc_pkg_version mwan3)"
+}
+cat > "$D30/apk/bin/apk" <<'D30_APK'
+#!/bin/sh
+echo "mwan3-3.6.12-r5 x86_64 {mwan3} (MIT) [installed]"
+exit 0
+D30_APK
+chmod +x "$D30/apk/bin/apk"
+d30_p10_apk() {
+	PATH="$D30/apk/bin:$D30/minbin"
+	export PATH
+	. "$ROOT/files/usr/lib/isp-split/doctor.sh"
+	printf 'V=%s\n' "$(doc_pkg_version mwan3)"
+}
+d30_p10_none() {
+	PATH="$D30/minbin"
+	export PATH
+	. "$ROOT/files/usr/lib/isp-split/doctor.sh"
+	printf 'V=%s\n' "$(doc_pkg_version mwan3)"
+}
+d30_case "30.31 P10 opkg 分支：mwan3 - 3.6.12-r5" '3.6.12-r5' - d30_p10_opkg
+d30_case "30.32 P10 apk 分支：mwan3-3.6.12-r5 -> 3.6.12-r5（只剥包名前缀）" '3.6.12-r5' - d30_p10_apk
+d30_case "30.33 P10 两个包管理器都没有 -> 空（判 unknown，不猜漂移）" '' - d30_p10_none
+
+echo "== 31. doctor --json 端到端（形状/退出码/门禁，stub nft/uci/ip）"
+D31=$TMP/d31
+mkdir -p "$D31/bin" "$D31/base/state"
+# 主脚本启动即要求 CONFIG 存在（否则 die），doctor 也一样
+cat > "$D31/conf" <<'D31_CONF'
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+DNS_MODE="bind"
+D31_CONF
+cat > "$D31/bin/nft" <<'D31_NFT'
+#!/bin/sh
+case "$1" in
+--version)
+	echo "nftables v1.1.1 (Commodore Bullmoose)"
+	exit 0
+	;;
+-a) shift ;;
+esac
+case "$1 $2" in
+"list ruleset") cat "${E2E_RULES:?}"; exit 0 ;;
+"list table") [ "${4:-}" = "mwan3" ] && exit "${E2E_TABLE:-0}" || exit 1 ;;
+"list chain") exit 1 ;;
+esac
+exit 1
+D31_NFT
+cat > "$D31/bin/uci" <<'D31_UCI'
+#!/bin/sh
+[ "$1" = "-q" ] && shift
+case "$1" in
+get)
+	case "$2" in
+	mwan3.globals.mmx_mask)
+		[ -n "${E2E_MASK:-}" ] && printf '%s\n' "$E2E_MASK" && exit 0
+		exit 1
+		;;
+	# 整条 pattern 必须加引号：case 的 [0] 是 glob 字符集，会变成"只匹配 0"。
+	"firewall.@defaults[0].flow_offloading")
+		printf '%s\n' "${E2E_OFFLOAD:-0}"
+		exit 0
+		;;
+	"firewall.@defaults[0].flow_offloading_hw")
+		printf '%s\n' "${E2E_OFFLOAD_HW:-0}"
+		exit 0
+		;;
+	esac
+	exit 1
+	;;
+show) exit 1 ;;
+*) exit 1 ;;
+esac
+D31_UCI
+cat > "$D31/bin/ip" <<'D31_IP'
+#!/bin/sh
+case "$*" in
+"-4 rule show")
+		[ -n "${E2E_IPRULE:-}" ] && printf '%s\n' "$E2E_IPRULE"
+		exit 0
+		;;
+"-4 route get 223.5.5.5") echo "223.5.5.5 via 192.0.2.1 dev pppoe-wan src 192.0.2.2 uid 0"; exit 0 ;;
+"-4 route get 1.1.1.1 mark "*) echo "1.1.1.1 via 192.0.2.1 dev pppoe-wan table 5"; exit 0 ;;
+"-4 route show default") echo "default via 192.0.2.1 dev pppoe-wan"; exit 0 ;;
+"-6 route show default") exit 0 ;;
+"-o link show type tun") exit 1 ;;
+esac
+exit 0
+D31_IP
+cat > "$D31/bin/pidof" <<'D31_PIDOF'
+#!/bin/sh
+exit 0
+D31_PIDOF
+cat > "$D31/bin/opkg" <<'D31_OPKG'
+#!/bin/sh
+echo "mwan3 - 3.6.12-r5"
+exit 0
+D31_OPKG
+chmod +x "$D31/bin/"*
+cat > "$D31/rules-clean" <<'D31_R1'
+table inet mwan3 {
+	chain mwan3_rules {
+		meta mark set 0x00000500 # handle 10
+	}
+}
+D31_R1
+cat > "$D31/rules-conflict" <<'D31_R2'
+table inet mwan3 {
+	chain mwan3_rules {
+		meta mark set 0x00000500 # handle 10
+	}
+}
+table inet evil {
+	chain prerouting {
+		meta mark set 0x00001000 # handle 20
+	}
+}
+D31_R2
+
+E31_OFFLOAD=0
+e31_run() { # <out> <rules> <args...>
+	_o=$1
+	_r=$2
+	shift 2
+	(
+		PATH="$D31/bin:$PATH"
+		E2E_RULES=$_r
+		E2E_MASK=0x3F00
+		E2E_OFFLOAD=${E31_OFFLOAD:-0}
+		DNSMASQ_CONF_GLOB="$D31/none/dnsmasq.conf.*"
+		ISP_SPLIT_BASE=$D31/base
+		ISP_SPLIT_CONF=$D31/conf
+		ISP_SPLIT_LIB=$ROOT/files/usr/lib/isp-split
+		export PATH E2E_RULES E2E_MASK E2E_OFFLOAD DNSMASQ_CONF_GLOB \
+			ISP_SPLIT_BASE ISP_SPLIT_CONF ISP_SPLIT_LIB
+		sh "$ROOT/files/usr/sbin/isp-split" doctor "$@"
+	) >"$_o" 2>"$_o.err"
+}
+e31_check_ids() { # <json> -> 每个 check 的 id（不能用全部 "id"：host.openwrt.id 也叫 id）
+	grep -o '"id":"[^"]*","title"' "$1" | sed 's/^"id":"//; s/","title"$//'
+}
+e31_json_ok() { # <json> <期望 id 数> <期望 worst>
+	_f=$1
+	_n=$2
+	_w=$3
+	_bad=""
+	[ "$(grep -c '^' "$_f")" = 1 ] || _bad="$_bad 输出不是单行"
+	grep -q '^{"schema":1,' "$_f" || _bad="$_bad 缺 schema"
+	grep -q "\"version\":\"$ISPVER\"" "$_f" || _bad="$_bad 版本不是$ISPVER"
+	_ids=$(e31_check_ids "$_f" | wc -l | tr -d ' ')
+	[ "$_ids" = "$_n" ] || _bad="$_bad checks=$_ids/$_n"
+	if [ "$_w" != "-" ]; then
+		printf '%s' "$(cat "$_f")" | grep -q "\"worst\":\"$_w\"" || _bad="$_bad worst≠$_w"
+	fi
+	for k in '"generated":' '"host":{' '"summary":{' '"gate":{' '"probe_errors":[' '"ms":'; do
+		case "$(cat "$_f")" in
+		*"$k"*) ;;
+		*) _bad="$_bad 缺$k" ;;
+		esac
+	done
+	case "$(sed -n 's/.*"ms":\([0-9][0-9]*\).*/\1/p' "$_f")" in
+	'' | *[!0-9]*) _bad="$_bad ms非数字" ;;
+	esac
+	# 花括号/方括号平衡（字符串里没有括号，够用作兜底校验）
+	_ob=$(tr -cd '{' <"$_f" | wc -c | tr -d ' ')
+	_cb=$(tr -cd '}' <"$_f" | wc -c | tr -d ' ')
+	[ "$_ob" = "$_cb" ] || _bad="$_bad 花括号$_ob/$_cb"
+	_os=$(tr -cd '[' <"$_f" | wc -c | tr -d ' ')
+	_cs=$(tr -cd ']' <"$_f" | wc -c | tr -d ' ')
+	[ "$_os" = "$_cs" ] || _bad="$_bad 方括号$_os/$_cs"
+	# 有 python3 就严格解析一次（VM 上没有，走上面的结构断言）
+	if command -v python3 >/dev/null 2>&1; then
+		python3 - "$_f" "$_n" "$_w" <<'E31_PY' || _bad="$_bad python-json失败"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema"] == 1
+assert len(d["checks"]) == int(sys.argv[2])
+if sys.argv[3] != "-":
+    assert d["summary"]["worst"] == sys.argv[3]
+for c in d["checks"]:
+    for k in ("id", "title", "verdict", "status", "confidence", "facts", "findings", "advice"):
+        assert k in c, k
+assert isinstance(d["summary"]["ok"], int)
+assert isinstance(d["gate"]["can_wire"], bool)
+E31_PY
+	fi
+	printf '%s' "$_bad"
+}
+# 31.1 只有 mwan3 自己的写者：没有 conflict、退出码 0（worst 与环境有关：
+# 开发机无 :53 监听 -> unknown；VM 上有真 dnsmasq -> ok。断言的是"不阻断"，不是某个字面值）
+e31_run "$D31/clean.json" "$D31/rules-clean" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/clean.json" 6 -)
+[ "$_rc" = 2 ] && _bad="$_bad rc仍是2"
+grep -q '"conflict":0' "$D31/clean.json" || _bad="$_bad 干净夹具却报conflict"
+grep -Eq '"worst":"(ok|warn|unknown)"' "$D31/clean.json" || _bad="$_bad worst非法"
+_sum=$(sed -n 's/.*"summary":{"ok":\([0-9]*\),"warn":\([0-9]*\),"conflict":\([0-9]*\),"unknown":\([0-9]*\).*/\1 \2 \3 \4/p' "$D31/clean.json")
+set -- $_sum
+[ "$(( ${1:-0} + ${2:-0} + ${3:-0} + ${4:-0} ))" = 6 ] || _bad="$_bad 汇总不等于6项"
+if [ -z "$_bad" ]; then
+	ok "31.1 doc_main --json：单行合法 JSON，6 项齐、无 conflict、rc=0（warn/unknown 不阻断）"
+else
+	ng "31.1 --json 形状/退出码异常:$_bad"
+	sed 's/^/    /' "$D31/clean.json" | cut -c1-400 | head -2
+fi
+# 31.2 --strict：unknown 视为"不能继续"；没有 unknown 时仍返回 0
+e31_run "$D31/strict.json" "$D31/rules-clean" --json --strict
+_rc=$?
+_unk=$(sed -n 's/.*"unknown":\([0-9]*\).*/\1/p' "$D31/strict.json")
+case "${_unk:-0}" in '' | *[!0-9]*) _unk=0 ;; esac
+if [ "$_unk" -gt 0 ]; then
+	_want=1
+else
+	_want=0
+fi
+if [ "$_rc" = "$_want" ]; then
+	ok "31.2 --strict：unknown=$_unk -> rc=$_rc（有 unknown 才升级为保留，JSON 形状不变）"
+else
+	ng "31.2 --strict 未按预期返回（unknown=$_unk rc=$_rc 期望$_want）"
+fi
+# 31.3 conflict：第三方写者落在位段内 -> rc=2 + blocking + 门禁阻断
+e31_run "$D31/conflict.json" "$D31/rules-conflict" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/conflict.json" 6 conflict)
+[ "$_rc" = 2 ] || _bad="$_bad rc=$_rc(期望2)"
+grep -q '"blocking":true' "$D31/conflict.json" || _bad="$_bad 缺blocking"
+grep -q '"can_wire":false' "$D31/conflict.json" || _bad="$_bad 门禁未阻断"
+grep -q 'MARK_OVERLAP_UNORDERED' "$D31/conflict.json" || _bad="$_bad 缺finding"
+if [ -z "$_bad" ]; then
+	ok "31.3 conflict：rc=2、blocking=true、gate.can_wire=false、finding 带 C3 判据码"
+else
+	ng "31.3 conflict 场景异常:$_bad"
+fi
+# 31.4 warn：软件 offload -> rc=1，worst=warn
+E31_OFFLOAD=1
+e31_run "$D31/warn.json" "$D31/rules-clean" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/warn.json" 6 warn)
+[ "$_rc" = 1 ] || _bad="$_bad rc=$_rc(期望1)"
+if [ -z "$_bad" ]; then
+	ok "31.4 warn：rc=1、worst=warn（C4 口径问题不阻断 wire）"
+else
+	ng "31.4 warn 场景异常:$_bad"
+fi
+# 31.5 --profile=page：只跑 1/4/6
+e31_run "$D31/page.json" "$D31/rules-clean" --json --profile=page
+_rc=$?
+_ids=$(e31_check_ids "$D31/page.json" | tr '\n' ' ')
+_page_sum=$(sed -n 's/.*"summary":{"ok":\([0-9]*\),"warn":\([0-9]*\),"conflict":\([0-9]*\),"unknown":\([0-9]*\).*/\1 \2 \3 \4/p' "$D31/page.json")
+set -- $_page_sum
+_page_total=$(( ${1:-0} + ${2:-0} + ${3:-0} + ${4:-0} ))
+if [ "$_ids" = "dns53_owner offload_accounting coexist_whitelist " ] &&
+	[ "$_page_total" = 3 ]; then
+	ok "31.5 --profile=page：只跑检查 1/4/6，汇总也只统计这 3 项（不把没跑的算 unknown）"
+else
+	ng "31.5 --profile=page 跑的检查/汇总不对: ids=$_ids total=$_page_total"
+fi
+# 31.6 文本模式：人读输出必须有 6 段 + 汇总 + 门禁
+e31_run "$D31/text.log" "$D31/rules-clean"
+_rc=$?
+_tbad=""
+grep -q '^== 环境体检（doctor）' "$D31/text.log" || _tbad="$_tbad 无标题"
+for _i in 1 2 3 4 5 6; do
+	grep -q "^\[$_i/6\]" "$D31/text.log" || _tbad="$_tbad 缺[$_i/6]"
+done
+grep -q '^== 汇总: ok ' "$D31/text.log" || _tbad="$_tbad 无汇总"
+grep -q 'wire/apply 门:' "$D31/text.log" || _tbad="$_tbad 无门禁行"
+if [ -z "$_tbad" ]; then
+	ok "31.6 文本模式：6 项逐条 + 汇总 + wire/apply 门禁（人读与 JSON 同源）"
+else
+	ng "31.6 文本模式缺项:$_tbad"
+fi
+# 31.7 设备上缺 doctor.sh：必须明确拒绝，而不是静默少跑检查
+mkdir -p "$D31/nolib"
+(
+	ISP_SPLIT_BASE=$D31/base
+	ISP_SPLIT_CONF=$D31/conf
+	ISP_SPLIT_LIB=$D31/nolib
+	export ISP_SPLIT_BASE ISP_SPLIT_CONF ISP_SPLIT_LIB
+	sh "$ROOT/files/usr/sbin/isp-split" doctor --json
+) >"$D31/nolib.log" 2>&1
+_nrc=$?
+if [ "$_nrc" != 0 ] && grep -q '缺少' "$D31/nolib.log" && grep -q 'doctor.sh' "$D31/nolib.log"; then
+	ok "31.7 缺 /usr/lib/isp-split/doctor.sh：doctor 明确报错退出（不静默降级）"
+else
+	ng "31.7 缺 doctor.sh 时行为异常（rc=$_nrc）"
+	sed 's/^/    /' "$D31/nolib.log" | head -3
+fi
+
+# 31.8 未知参数：必须非 0（以前 return 0 会让 --typo 静默成功且一项没跑）
+(
+	ISP_SPLIT_BASE=$D31/base
+	ISP_SPLIT_CONF=$D31/conf
+	ISP_SPLIT_LIB=$ROOT/files/usr/lib/isp-split
+	export ISP_SPLIT_BASE ISP_SPLIT_CONF ISP_SPLIT_LIB
+	sh "$ROOT/files/usr/sbin/isp-split" doctor --typo
+) >"$D31/typo.log" 2>&1
+_rc=$?
+if [ "$_rc" != 0 ] && grep -q '未知参数' "$D31/typo.log" && ! grep -q '^== 汇总' "$D31/typo.log"; then
+	ok "31.8 未知参数：rc=$_rc 且没有跑任何检查（用法错误不再静默成功）"
+else
+	ng "31.8 未知参数处理异常（rc=$_rc）"
+fi
+
+echo "== 32. 打包链与锁纪律（doctor.sh 随包发货 / bootstrap 持锁 / 判据单一来源）"
+ISP=$ROOT/files/usr/sbin/isp-split
+DOC=$ROOT/files/usr/lib/isp-split/doctor.sh
+E32=$TMP/e32
+mkdir -p "$E32"
+s32_range() { # <起止行正则> 截一段（函数体里有顶格 } 的字符串，不能用花括号配对）
+	sed -n "/$1/,/$2/p" "$ISP"
+}
+s32_bad=""
+# 32.1 分发器认这两个子命令
+grep -q '^bootstrap) shift; cmd_bootstrap "\$@" ;;' "$ISP" || s32_bad="$s32_bad 缺bootstrap分发"
+grep -q '^doctor) shift; cmd_doctor "\$@" ;;' "$ISP" || s32_bad="$s32_bad 缺doctor分发"
+# 32.2 fix32A 的 op.lock：写命令必须持锁；doctor 只读，明确不持锁
+s32_range '^cmd_bootstrap() {' '^_cmd_bootstrap_body() {' >"$E32/boot.fn"
+s32_range '^cmd_doctor() {' '^# 机器可读的策略状态' >"$E32/doc.fn"
+grep -q '_op_lock_acquire' "$E32/boot.fn" || s32_bad="$s32_bad bootstrap未持锁"
+grep -q '_op_lock_release' "$E32/boot.fn" || s32_bad="$s32_bad bootstrap未释放锁"
+grep -q '_op_lock' "$E32/doc.fn" && s32_bad="$s32_bad doctor误持锁"
+grep -q 'doc_main' "$E32/doc.fn" || s32_bad="$s32_bad doctor未调doc_main"
+# 32.3 写入只进私有 confdir + rename 原子替换（不碰全局暂存区）
+s32_range '^_bt_apply() {' '^# 列出全部 isp_split=1' >"$E32/apply.fn"
+grep -Fq 'uci -c "$_bt_tmp"' "$E32/apply.fn" || s32_bad="$s32_bad 未用私有confdir"
+grep -q '_mwan3_atomic_install' "$E32/apply.fn" || s32_bad="$s32_bad 未原子替换"
+grep -q 'uci -q set "mwan3' "$E32/apply.fn" && s32_bad="$s32_bad 直接写全局暂存区"
+grep -q 'uci -q revert mwan3' "$E32/apply.fn" && s32_bad="$s32_bad 失败走全局revert"
+if [ -z "$s32_bad" ]; then
+	ok "32.1/32.2/32.3 分发器 + bootstrap 持 op.lock（doctor 只读不持锁）+ 私有 confdir 事务 + rename 原子替换"
+else
+	ng "32 结构断言失败:$s32_bad"
+fi
+
+# 32.4 主包清单：doctor.sh 用 INSTALL_DATA（644，被 source，不单独执行）
+if grep -Fq '$(INSTALL_DATA) $(PKG_BUILD_DIR)/files/usr/lib/isp-split/doctor.sh $(1)/usr/lib/isp-split/doctor.sh' \
+	"$ROOT/Makefile"; then
+	ok "32.4 主包 Makefile 安装 doctor.sh（INSTALL_DATA=644，合理：它只被 source）"
+else
+	ng "32.4 主包 Makefile 未安装 doctor.sh（设备上 doctor 会拒绝运行）"
+fi
+# 32.5 三条安装/校验/同步链都要覆盖 doctor.sh
+s32_bad=""
+grep -q 'cp -f "$SRC/usr/lib/isp-split/doctor.sh"' "$ROOT/scripts/install.sh" ||
+	s32_bad="$s32_bad install.sh未拷贝"
+grep -q 'usr/lib/isp-split/doctor.sh' "$ROOT/scripts/verify-package-payload.sh" ||
+	s32_bad="$s32_bad payload校验未覆盖"
+grep -q 'usr/lib/isp-split/doctor.sh' "$ROOT/tools/sync-feed.sh" ||
+	s32_bad="$s32_bad sync-feed清单未覆盖"
+if [ -z "$s32_bad" ]; then
+	ok "32.5 安装（install.sh）/ 产物断言（verify-package-payload.sh）/ feed 同步（sync-feed.sh）三处都点名 doctor.sh"
+else
+	ng "32.5 发货链漏项:$s32_bad"
+fi
+# 32.6 feed 镜像逐字节一致（sync-feed 跑过之后）
+if [ -f "$ROOT/feed/op-packages/isp-split/files/usr/lib/isp-split/doctor.sh" ] &&
+   cmp -s "$DOC" "$ROOT/feed/op-packages/isp-split/files/usr/lib/isp-split/doctor.sh"; then
+	ok "32.6 feed/op-packages 的 doctor.sh 与主源码逐字节一致（Kwrt 源不会滞后）"
+else
+	ng "32.6 feed 镜像缺 doctor.sh 或内容漂移（发版前必须 tools/sync-feed.sh）"
+fi
+# 32.7 判据只此一份：preflight 不许再手写 render_config_ipsets 判据
+if grep -q 'grep -q render_config_ipsets' "$ROOT/tools/router-preflight.sh"; then
+	ng "32.7 preflight 仍手写 mwan3-nft 判据（F7 式两套实现）"
+elif grep -q 'doc_mwan3_is_nft' "$ROOT/tools/router-preflight.sh" &&
+     grep -q 'doc_mwan3_is_nft()' "$DOC"; then
+	ok "32.7 mwan3-nft 判据只有 doctor.sh 一份（preflight 调 doc_mwan3_is_nft）"
+else
+	ng "32.7 preflight 没有复用 doctor 的 mwan3-nft 判据"
+fi
+# 32.8 busybox ash 兼容：禁用语法/命令逐个点名
+s32_bad=""
+grep -qE '\[\[[^:]' "$DOC" && s32_bad="$s32_bad 含'[['"
+grep -q 'read -a' "$DOC" && s32_bad="$s32_bad 含'read -a'"
+grep -q 'mapfile' "$DOC" && s32_bad="$s32_bad 含'mapfile'"
+grep -q 'declare ' "$DOC" && s32_bad="$s32_bad 含'declare'"
+grep -qE '^[[:space:]]*local[[:space:]]+[A-Za-z_]+=' "$DOC" && s32_bad="$s32_bad 含'local'"
+grep -q '+%N' "$DOC" && s32_bad="$s32_bad 含'date %N'"
+grep -qE '(^|[;&|])[[:space:]]*jq[[:space:]]' "$DOC" && s32_bad="$s32_bad 含'jq'"
+sh -n "$DOC" 2>/dev/null || s32_bad="$s32_bad 语法错"
+grep -q '^set -u' "$DOC" || s32_bad="$s32_bad 缺set -u"
+if [ -z "$s32_bad" ]; then
+	ok "32.8 doctor.sh：busybox ash 兼容（无 [[ / read -a / mapfile / local / date %N / jq），sh -n 通过"
+else
+	ng "32.8 doctor.sh 兼容性问题:$s32_bad"
+fi
+# 32.9 版本链（0.3.3）：ISP_VERSION 与 4 个 Makefile 一致
+_v=$ISPVER
+s32_bad=""
+for _f in Makefile luci-app-isp-split/Makefile feed/op-packages/isp-split/Makefile \
+	feed/op-packages/luci-app-isp-split/Makefile; do
+	_mv=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/$_f" | head -1)
+	[ "$_mv" = "$_v" ] || s32_bad="$s32_bad $_f=$_mv"
+done
+if [ -z "$s32_bad" ]; then
+	ok "32.9 版本链一致：ISP_VERSION=PKG_VERSION=$_v（主/luci/feed×2）"
+else
+	ng "32.9 版本漂移:$_s32_bad"
+fi
+
+echo "== 33. router-preflight.sh 与 doctor 共用判据（行为不回退）"
+PF=$ROOT/tools/router-preflight.sh
+E33=$TMP/e33
+mkdir -p "$E33"
+# 33.1 静态：只 source 判据库，不另写一套
+s33_bad=""
+grep -q '^\. "\$DOCTOR_LIB"' "$PF" || s33_bad="$s33_bad 未source判据库"
+grep -q 'grep -q render_config_ipsets' "$PF" && s33_bad="$s33_bad 仍手写mwan3-nft判据"
+for _fn in doc_host_firmware doc_host_mem doc_nft_version doc_mwan3_installed \
+	doc_mwan3_is_nft doc_mwan3_table doc_bin_have doc_bins; do
+	grep -q "$_fn" "$PF" || s33_bad="$s33_bad 未用$_fn"
+	grep -q "^$_fn()" "$ROOT/files/usr/lib/isp-split/doctor.sh" || s33_bad="$s33_bad doctor缺$_fn"
+done
+if [ -z "$s33_bad" ]; then
+	ok "33.1 preflight 只 source doctor.sh 的 8 个判据函数，没有第二套 render_config_ipsets 判据"
+else
+	ng "33.1 preflight 判据共享不完整:$s33_bad"
+fi
+
+# 33.2 判据库找不到时：明确报错退出，而不是"少跑几项还返回 0"
+ISP_SPLIT_DOCTOR_LIB="$E33/none.sh" sh "$PF" >"$E33/missing.log" 2>&1
+_rc=$?
+if [ "$_rc" = 1 ] && grep -q '找不到 doctor.sh' "$E33/missing.log"; then
+	ok "33.2 判据库缺失：preflight 以 rc=1 报'找不到 doctor.sh'（不静默放行）"
+else
+	ng "33.2 判据库缺失时行为异常（rc=$_rc）"
+	sed 's/^/    /' "$E33/missing.log" | head -4
+fi
+
+# 33.3 真跑一次：非 OpenWrt 主机应给出明确结论并 rc=1；VM 上应完整跑完
+sh "$PF" >"$E33/run.log" 2>&1
+_rc=$?
+if [ -f /etc/openwrt_release ]; then
+	s33_bad=""
+	grep -q '^== 0. 环境识别' "$E33/run.log" || s33_bad="$s33_bad 无环境段"
+	grep -q '内存: 共 ' "$E33/run.log" || s33_bad="$s33_bad 无内存段（判据未共享）"
+	grep -q '^结论:' "$E33/run.log" || s33_bad="$s33_bad 无结论"
+	grep -q 'command not found' "$E33/run.log" && s33_bad="$s33_bad 有命令缺失"
+	[ "$_rc" -le 2 ] || s33_bad="$s33_bad rc=$_rc"
+	if [ -x /usr/sbin/isp-split ] && [ -f /usr/lib/isp-split/doctor.sh ]; then
+		grep -q 'doctor 判据在设备上' "$E33/run.log" ||
+			s33_bad="$s33_bad 未确认设备上的doctor.sh"
+	fi
+	if [ -z "$s33_bad" ]; then
+		ok "33.3 preflight 在 OpenWrt 上完整跑完（环境/内存/结论齐，rc=$_rc，无命令缺失）"
+	else
+		ng "33.3 preflight 运行异常:$s33_bad"
+		sed 's/^/    /' "$E33/run.log" | tail -8
+	fi
+else
+	if [ "$_rc" = 1 ] && grep -q '不是 OpenWrt 环境' "$E33/run.log"; then
+		ok "33.3 preflight 在非 OpenWrt 主机上：加载判据库后明确报'不是 OpenWrt 环境'并 rc=1"
+	else
+		ng "33.3 preflight 在非 OpenWrt 主机上的退出行为异常（rc=$_rc）"
+		sed 's/^/    /' "$E33/run.log" | head -4
 	fi
 fi
 

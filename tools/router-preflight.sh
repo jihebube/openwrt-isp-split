@@ -6,8 +6,33 @@
 #
 # 用法：sh tools/router-preflight.sh
 # 退出码：0 = 可以部署；1 = 有阻断项；2 = 只有可忽略的提醒
-
+#
+# 判据的归属（fix34 起）：固件 / 内存 / nft 版本 / mwan3-nft 存在性 / 依赖
+# 二进制这五项，与设备上的 `isp-split doctor` 是**同一份实现**——
+# files/usr/lib/isp-split/doctor.sh 里的 doc_* 函数。本文件只负责取数、
+# 排版与汇总，不再自己写 `grep render_config_ipsets` 之类的判据。
+# 这样 doctor 与 preflight 不会各说一套（F7 的根因就是两处实现）。
 set -u
+
+# 判据库：设备上优先 /usr/lib/isp-split/doctor.sh；在仓库里直接跑时回落到
+# tools/../files/usr/lib/isp-split/doctor.sh。允许用 ISP_SPLIT_DOCTOR_LIB 覆盖。
+DOCTOR_LIB=${ISP_SPLIT_DOCTOR_LIB:-}
+if [ -z "$DOCTOR_LIB" ]; then
+	for _pl_cand in /usr/lib/isp-split/doctor.sh \
+		"$(cd "$(dirname "$0")" 2>/dev/null && pwd)/../files/usr/lib/isp-split/doctor.sh"; do
+		[ -f "$_pl_cand" ] && {
+			DOCTOR_LIB=$_pl_cand
+			break
+		}
+	done
+fi
+if [ -z "$DOCTOR_LIB" ] || [ ! -f "$DOCTOR_LIB" ]; then
+	echo "找不到 doctor.sh（环境体检的判据实现）" >&2
+	echo "  设备上应在 /usr/lib/isp-split/doctor.sh；仓库内跑时应在 files/usr/lib/isp-split/doctor.sh" >&2
+	echo "  可用 ISP_SPLIT_DOCTOR_LIB=<路径> 显式指定" >&2
+	exit 1
+fi
+. "$DOCTOR_LIB"
 
 PASS=0
 FAIL=0
@@ -26,12 +51,14 @@ hdr() {
 	echo "== $1 =="
 }
 
+# 依赖二进制清单（一次探测，后面各处复用；与 doctor 的 host.bins 同源）
+doc_bins
+
 # ---------------------------------------------------------------- 0. 环境
 
 hdr "0. 环境识别"
-if [ -f /etc/openwrt_release ]; then
-	. /etc/openwrt_release
-	ok "固件: ${DISTRIB_DESCRIPTION:-$DISTRIB_ID $DISTRIB_RELEASE} ($(uname -m))"
+if doc_host_firmware; then
+	ok "固件: ${DOC_FW_DESC:-$DOC_FW_ID $DOC_FW_RELEASE} (${DOC_ARCH:-$(uname -m)})"
 else
 	bad "不是 OpenWrt 环境（/etc/openwrt_release 不存在）"
 	echo
@@ -39,6 +66,10 @@ else
 	echo "无法在此环境运行，停止检查。"
 	exit 1
 fi
+# 内存：只提示不计数（判据与 doctor 的 host.mem 同源；数据管线的峰值在几 MB，
+# 这里不给阻断，避免在 32MB 内存的老机器上误杀可用配置）
+doc_host_mem >/dev/null
+info "内存: 共 ${DOC_MEM_TOTAL_KB} kB，可用 ${DOC_MEM_AVAIL_KB} kB（${DOC_MEM_VERDICT}）"
 
 if [ "$(id -u)" != "0" ]; then
 	warn "当前不是 root，部分检查可能失败"
@@ -47,26 +78,26 @@ fi
 # ---------------------------------------------------------------- 1. mwan3
 
 hdr "1. mwan3（核心前提）"
-if [ -f /lib/mwan3/mwan3.sh ]; then
+if doc_mwan3_installed; then
 	ok "mwan3 已安装"
 else
 	bad "mwan3 未安装 —— 本项目必须运行在 mwan3 之上"
 fi
 
-if grep -q render_config_ipsets /lib/mwan3/mwan3.sh 2>/dev/null; then
+if doc_mwan3_is_nft; then
 	ok "mwan3 是 nftables 版（render_config_ipsets 存在）"
 else
 	bad "mwan3 是 iptables 版 —— 本项目不支持"
 	bad "  需要替换为 nftables 版: https://github.com/dl12345/mwan3 (>= 3.6.0)"
 fi
 
-if command -v nft >/dev/null 2>&1; then
-	ok "nft: $(nft --version 2>/dev/null | head -1)"
+if doc_nft_version; then
+	ok "nft: ${DOC_NFT_FULL:-$DOC_NFT_VERSION}"
 else
 	bad "缺少 nft 命令"
 fi
 
-if nft list table inet mwan3 >/dev/null 2>&1; then
+if doc_mwan3_table; then
 	ok "table inet mwan3 存在（mwan3-nft 正在运行）"
 else
 	bad "table inet mwan3 不存在 —— mwan3-nft 未启动，或装的仍是 iptables 版"
@@ -81,7 +112,7 @@ for p in $_needed; do
 	if [ "$(uci -q get "mwan3.$p" 2>/dev/null)" = "policy" ]; then
 		ok "策略 $p 存在"
 	else
-		bad "策略 $p 不存在 —— 需在 MultiWAN 管理器创建"
+		bad "策略 $p 不存在 —— 需在 MultiWAN 管理器创建，或先跑 isp-split bootstrap"
 		_missing="$_missing $p"
 	fi
 done
@@ -89,7 +120,7 @@ done
 # ---------------------------------------------------------------- 3. 数据源
 
 hdr "3. 数据源与工具"
-if command -v curl >/dev/null 2>&1; then
+if doc_bin_have curl; then
 	ok "curl: $(curl --version 2>/dev/null | head -1 | awk '{print $1, $2}')"
 else
 	bad "缺少 curl（apk add curl / opkg install curl）"
@@ -103,7 +134,7 @@ else
 	detail "而该集合对应的线路恰好不可用（见 README 已知限制第 6 条）"
 fi
 
-if command -v conntrack >/dev/null 2>&1; then
+if doc_bin_have conntrack; then
 	ok "conntrack: 已安装（verify-domains 需要）"
 else
 	warn "缺 conntrack（tools/verify-domains.sh 需要）: apk add conntrack"
@@ -125,7 +156,7 @@ fi
 # ---------------------------------------------------------------- 5. DNS（可选功能）
 
 hdr "5. dnsmasq（仅多线路 DNS 功能需要）"
-if command -v dnsmasq >/dev/null 2>&1; then
+if doc_bin_have dnsmasq; then
 	ok "dnsmasq: $(dnsmasq --version 2>/dev/null | head -1 | sed 's/Dnsmasq version //')"
 	if dnsmasq --help 2>/dev/null | grep -q conf-dir; then
 		ok "支持 conf-dir（多线路 DNS 可用）"
@@ -158,6 +189,12 @@ fi
 hdr "6. 当前安装状态"
 if [ -x /usr/sbin/isp-split ]; then
 	ok "isp-split 已安装: $(/usr/sbin/isp-split --version 2>/dev/null || echo '未知版本')"
+	# 0.3.3 起 doctor 的判据实现必须在设备上，否则 `isp-split doctor` 会拒绝运行
+	if [ -f /usr/lib/isp-split/doctor.sh ]; then
+		ok "doctor 判据在设备上（/usr/lib/isp-split/doctor.sh）"
+	else
+		warn "设备上缺 /usr/lib/isp-split/doctor.sh：isp-split doctor 会拒绝运行（重装同版本包）"
+	fi
 else
 	info "尚未安装（预期内）"
 fi
@@ -192,6 +229,8 @@ echo
 echo "结论: 全部通过，可以部署。"
 echo
 echo "下一步："
+echo "  isp-split doctor                 环境体检（六项兼容矩阵，只读）"
+echo "  isp-split bootstrap              净机骨架预演（默认 dry-run）"
 echo "  sh scripts/install.sh --all      安装（含每日自动更新）"
 echo "  isp-split plan                   只读预演"
 echo "  isp-split check                  nft 干跑校验"

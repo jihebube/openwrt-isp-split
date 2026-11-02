@@ -179,6 +179,14 @@ assert_clean() { # <pkg> <payload-dir>
 		echo "::error::$_pkg：缺少 /usr/lib/isp-split/teardown.sh（卸载清理无实现可用）" >&2
 		return 1
 	fi
+	# 环境体检的判据实现：doctor 子命令与 preflight 共用，缺了 doctor 直接拒绝运行
+	if [ ! -f "$_payload/usr/lib/isp-split/doctor.sh" ]; then
+		echo "::error::$_pkg：缺少 /usr/lib/isp-split/doctor.sh（doctor 无判据可用）" >&2
+		return 1
+	elif ! sh -n "$_payload/usr/lib/isp-split/doctor.sh" 2>/dev/null; then
+		echo "::error::$_pkg：usr/lib/isp-split/doctor.sh 语法错误" >&2
+		return 1
+	fi
 	return 0
 }
 
