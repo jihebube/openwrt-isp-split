@@ -6,13 +6,31 @@
 |---|---|---|---|
 | A. 源码编译（buildroot） | 30-90 分钟 | 是 | 发布自编译固件 |
 | B. ImageBuilder + `FILES=` 注入 | 2-5 分钟 | 否 | 向现成镜像添加脚本 |
-| C. ImageBuilder + 本地 ipk 仓库 | 3-8 分钟 | 仅 opkg 系 | OpenWrt ≤ 24.10 |
+| C. ImageBuilder + 本地 ipk 仓库 | 3-8 分钟 | 仅 opkg 系 | OpenWrt ≤ 24.10（mwan3 仍需自备 nft 版，见文首「前提」） |
 
 ## 前提：mwan3 必须为 nftables 版
 
-上游官方 feed 的 `mwan3` 是 iptables 版（2.12.5），缺少 `render_config_ipsets`，与本工具不兼容。编译进固件前需将其替换为 nftables 版（[dl12345/mwan3](https://github.com/dl12345/mwan3)，≥ 3.6.0）。
+上游官方 feed 的 `mwan3` 是 iptables 版（25.12 源里是 2.12.5，24.10 源里是 2.11.16-r5），缺少 `render_config_ipsets`，与本工具不兼容。编译进固件前需将其替换为 nftables 版（[dl12345/mwan3](https://github.com/dl12345/mwan3)，≥ 3.6.0）。
 
 Kwrt 用户不受影响：Kwrt 源内直接提供 `mwan3-nft`。
+
+**24.10 的边界（官方源依赖不可得）**：OpenWrt 24.10 官方 packages 索引里只有 iptables 版
+mwan3，**没有** `mwan3-nft`。复核于 24.10.4 官方 packages 索引（x86_64）：
+
+```sh
+# 索引里 mwan3 只有一条，且依赖 iptables 系
+grep -A2 '^Package: mwan3$' Packages
+# Package: mwan3
+# Version: 2.11.16-r5
+# Depends: libc, ip, ipset, iptables, ip6tables, iptables-mod-conntrack-extra, iptables-mod-ipopt, jshn
+
+grep -c 'mwan3-nft' Packages    # 0：官方源没有 nft 版替代包
+```
+
+也就是说，24.10 上不是“装个包”能解决的事：要么按方式 A 自己把 mwan3 换成 nft 版再编进固件，
+要么直接上 25.12 + Kwrt 源。只装官方 `mwan3` 的 24.10 固件：`sh scripts/install.sh` 会直接拒绝
+（`检测到 iptables 版 mwan3`）；从包安装时，后续 `apply` 也会因为 mwan3 侧没有渲染出 `inet mwan3`
+的集合而硬失败——失败在明面上，不会“装好了但没效果”。
 
 确认方法（任一）：
 
@@ -50,7 +68,7 @@ EOF
 make defconfig
 
 # 5. 编译
-make -j$(nproc) V=s
+make -j4 V=s
 ```
 
 产物在 `bin/targets/<架构>/`，包清单在同目录 `*.manifest` 中应包含 `isp-split`。
@@ -112,7 +130,9 @@ make image PROFILE=generic \
 
 > **警告**：上游官方 feed 的 `mwan3` 为 iptables 版，上面的 `PACKAGES="... mwan3 ..."` 会安装错误版本；需先替换为 nft 版，或改用含 `mwan3-nft` 的自定义 feed（见文首「前提」）。
 
-25.12 的 apk 索引（`packages.adb`）无法手工生成，此方式仅适用于 opkg 系。
+25.12 的 apk 索引（`packages.adb`）无法手工生成，此方式仅适用于 opkg 系。24.10 属于此方式，
+但官方 24.10 源里没有 `mwan3-nft`（见文首「24.10 的边界」）：本地仓库必须一并放 nft 版 mwan3，
+否则 `PACKAGES="... mwan3 ..."` 拉到的还是 iptables 版。
 
 ## 首次启动初始化
 

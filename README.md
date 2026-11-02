@@ -26,7 +26,7 @@
 ## 环境要求
 
 - OpenWrt 23.05+（firewall4 / 纯 nftables）；25.12（x86_64）完整验证，其余平台见下表
-- **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源的 `mwan3` 是 iptables 版，不兼容。安装前可自查：`grep -c render_config_ipsets /lib/mwan3/mwan3.sh`，结果需 ≥ 1；为 0 时请改用 Kwrt 源中的 `mwan3-nft`，或从 [dl12345/mwan3 releases](https://github.com/dl12345/mwan3/releases) 安装 nft 版
+- **nftables 版 mwan3 3.6.0+**：Kwrt 源内的 `mwan3-nft` 即为所需版本；上游官方源（23.05 / 24.10）的 `mwan3` 是 iptables 版，不兼容。安装前可自查：`grep -c render_config_ipsets /lib/mwan3/mwan3.sh`，结果需 ≥ 1；为 0 时请改用 Kwrt 源中的 `mwan3-nft`，或从 [dl12345/mwan3 releases](https://github.com/dl12345/mwan3/releases) 安装 nft 版
 - `nftables`、`curl`；LuCI 页面为可选组件
 <!-- lc:begin -->
 - 线路体检另需 `socat`（UDP STUN 锁线探测）；缺失时自动降级为“NAT 未知”，不阻断其他功能
@@ -37,7 +37,7 @@
 | 平台 | 状态 |
 |---|---|
 | OpenWrt/Kwrt 25.12（x86_64） | ✅ 完整验证（双 PPPoE 长期运行 + 自动化回归） |
-| OpenWrt 24.10（x86_64） | ✅ CI 双 SDK 构建，未真机长测 |
+| OpenWrt 24.10（x86_64） | ⚠️ **依赖不可得**——24.10 官方源只有 iptables 版 mwan3，没有 `mwan3-nft`；需自行编译 nft 版 mwan3，或直接上 25.12（本包自身可构建，但缺了 nft 版 mwan3 就没有可信的运行时结论；复核于 24.10.4 官方 packages 索引，x86_64） |
 | ARM / MIPS 软路由（MT7981、IPQ 等） | ⚠️ 理论兼容（纯 shell/awk，无架构相关代码），欢迎实测反馈 |
 | 官方固件直装 | ⚠️ 需先替换 iptables 版 mwan3 为 nft 版（见上方自查命令） |
 
@@ -66,6 +66,173 @@ isp-split status    # 各集合命中计数与流量
 安装后每日 04:17 自动更新数据（可用 `ISP_CRON` 修改）；以上命令纯命令行即可完成全部操作，LuCI 仅是可选便利。
 
 卸载：`sh scripts/install.sh --uninstall` 或 `isp-split uninstall`。三条卸载路径（脚本 / 包 postrm / install.sh）走同一份清理实现 `usr/lib/isp-split/teardown.sh`：还原 mwan3 与 dnsmasq 改动、删 `isp_fallback` 计数器、删 crontab 行、删 `/etc/isp-split*` 与 LuCI 页面，卸载后不留残留。`/etc/isp-split.conf.bak.*` 历史备份默认一并删除（删除前逐条打印路径；想留档先 `cp` 走，或加 `--keep-conf-bak`：`sh scripts/install.sh --uninstall --keep-conf-bak`）。
+
+## 引导与体检（0.4.0）
+
+0.4.0 把两件事做成了内建功能：**净机怎么把 mwan3 骨架跑起来**（CLI `bootstrap` + LuCI 首启向导），
+以及**这台机器上有没有别人会让分流静默失效**（CLI `doctor` + 状态页环境横幅）。
+两者都不改分流逻辑，只是把已有命令串成一条可回退的路径。
+
+### 1. 净机一键引导（CLI）
+
+前提：nftables 版 mwan3（≥ 3.6）已安装，`network` 里已经有 WAN（PPPoE / DHCP / 静态都行）。
+`bootstrap` 只读 `network`，一个字段都不改。
+
+```sh
+# 0）先体检：确认没有会让分流静默失效的环境问题（只读，退出码 0/1/2）
+isp-split doctor
+
+# 1）预演：默认就是 dry-run，只打印将新建的 mwan3 段，不写任何东西
+isp-split bootstrap
+
+# 2）写入骨架：为每条 WAN 补 interface + member，为 ISP_TABLE 的策略补 policy
+isp-split bootstrap --apply
+
+# 3）绑定：把每个 ISP 策略指到一条 WAN（--bind 可重复，--assume-yes 免交互）
+isp-split init --bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes
+
+# 4）写规则：集合、规则块、ipset 段写进 mwan3（策略缺失/成员为空会硬失败）
+isp-split wire
+
+# 5）生效：拉数据 + 写规则 + 刷 nftables（会 reload mwan3，短暂断流 1-3 秒）
+isp-split sync
+```
+
+每一步的边界：
+
+- **只补缺失，不覆盖**：已存在的 `mwan3.<名字>` interface / member / policy 段一律跳过，
+  不改名、不改 `enabled`。你手配的段（哪怕 `enabled=0` 做冷备）不会被“修正”。
+- **默认拒绝已配置的机器**：mwan3 里已有 ≥2 个启用的 IPv4 接口时，`bootstrap` 直接拒绝
+  （`只补缺失骨架，不覆盖既有配置`）。确实要补一个缺失的策略段时加 `--force`，它仍然只建缺失项。
+- **不自动生效**：`--apply` 不跑 `init`、不 `wire`、不 reload mwan3（灰度），结束时打印下一步。
+- **`track_ip` 可换**：默认 `1.0.0.1 1.1.1.1`（两个跨 AS 的 anycast），用
+  `--track-ip "223.5.5.5 119.29.29.29"` 覆盖。不建议填运营商 DNS——DNS 挂了会被误判成线路 down。
+- **写事务**：所有 `uci set` 先进私有暂存目录 → `uci show` 解析校验 → `rename` 原子替换正式
+  `/etc/config/mwan3`，并留一份 `state/mwan3.bootstrap.<时间戳>.bak`。中途失败时正式配置一个字节都不变。
+
+撤销：
+
+```sh
+isp-split bootstrap --rollback        # 只列清单；非交互环境直接拒绝（不改任何东西）
+isp-split bootstrap --rollback --yes  # 真正删除带 isp_split=1 标记的段
+```
+
+`--rollback` 只删本项目标记（`isp_split=1`）的段，手配段一个都不动；**仍被其它策略/成员引用的段会被
+保留并告警**（删了 mwan3 会渲染失败），解除引用后再跑一次即可清干净。备份文件只留档、不自动还原——
+避免把你后来的手改一起回滚掉。
+
+### 2. LuCI 首启向导
+
+菜单「运营商分流 → 引导」是一个四步状态机；每一步都从 CLI 走，页面只负责编排与摊开命令输出：
+
+| 步 | 标题 | 做什么 | 危险确认 |
+|---|---|---|---|
+| 0 | 环境自检 | `doctor --json` 的六项矩阵 + 主机前提；有 fail 项时「下一步」是灰的（硬门） | 无（只读） |
+| 1 | 体检 | 点按钮触发一次线路探测；没有快照就先显示占位卡 | 无（只读探测） |
+| 2 | 绑定骨架 | 「重新预演」= `bootstrap`（dry-run）；「应用骨架」= `bootstrap --apply`；ISP 表绑定深链到配置页 | ✅ 写 mwan3 前弹框 |
+| 3 | 生效 | 「预演生效」= `plan`；「启用」= `wire` + `apply`；「直接同步」= `sync` | ✅ reload 断流确认 |
+
+危险确认点的原文（确认之前不会执行任何命令）：
+
+- **写骨架**：`确认写入 mwan3 骨架？`——逐条列出“只新增、不覆盖、不碰 network/firewall/dhcp、不 reload”，
+  末尾给出命令 `isp-split bootstrap --apply`。
+- **重写规则**：`确认重写规则并生效？`——写明 `会 reload mwan3：分流流量短暂中断 1-3 秒`，
+  命令 `isp-split wire && isp-split apply`。
+- **整链同步**：`确认整链同步？`——必须先在页面上勾选「我知道会短暂断流 1-3 秒」，「同步」按钮才可点。
+- **撤销引导**：`确认撤销本次引导？`——清单不是前端猜的，来自 `bootstrap --rollback` 的真实输出
+  （非交互时 CLI 打完清单即拒绝），确认后才执行 `--rollback --yes`。
+
+引导进度写在 `/etc/isp-split/state/wizard.json`（`step` / `done` / 时间戳），刷新或重开浏览器都停在
+上次那一步。四步走完后页面标题变「重新引导」：可以重走一遍，但**任何按钮都不会自动撤销已经生效的
+配置**；要撤销请用页面右侧的「撤销本次引导」。「上一步」只改界面这一步，页面也这么写着。
+
+| 第 0 步：硬门 | 第 2 步：写 mwan3 前确认 |
+|---|---|
+| ![向导-环境自检](docs/images/wizard-step0.png) | ![向导-写骨架确认](docs/images/wizard-step2-confirm.png) |
+
+| 完成态：入口变「重新引导」 |
+|---|
+| ![向导-已完成](docs/images/wizard-done.png) |
+
+### 3. 环境体检（`isp-split doctor`）
+
+`doctor` 回答的是“这台机器上的别人会不会让本工具静默失效”，不是“分流通不通”。它**只读**：
+不发 DNS 查询、不连外网、不 STUN、不改任何配置（不碰 mwan3 / nft / uci，也不写临时文件），
+所以随时可以跑，也不会把状态页上的命中计数打脏。
+
+六项矩阵（顺序固定）：
+
+| 项 | 检查 | 一句话 | warn 时 | fail（conflict）时 |
+|---|---|---|---|---|
+| 1 | `dns53_owner`<br>53 端口归属 | 谁在应答 `:53`，我们的分线片段是否落在它**真正加载**的目录里 | 53 上还有第三方解析器（mosdns 等）：分线片段可能只对部分查询生效 | 片段写在没人读的目录 / 解析器已被接管：`isp-split dns` 重写片段；或改用 mark 模式（`isp-split conf set DNS_MODE mark && isp-split dns`），让 nft 侧承担分线 |
+| 2 | `tun_hijack`<br>TUN 与默认路由 | 有没有 TUN 抢走默认路由，或 `ip rule` 抢在 mwan3 前面 | 有 TUN 但默认路由没被抢：有意为之可忽略，否则关掉代理的自动路由 | 默认路由已指向 TUN：关掉 mihomo / sing-box 的 `auto-route`，或接受 IP 分流不生效 |
+| 3 | `mark_segment`<br>标记位段 | 谁在写 / 读 `mmx_mask`（默认 `0x3F00`）这一段 mark | 第三方也在用，但不重叠或排在后面：可不动；想彻底消歧把它的 fwmark 移到位段外（如 `0x80000` 段） | 有程序直接改写同位段、可能选错线：把它的标记值挪开，或排到 mwan3 之后 |
+| 4 | `offload_accounting`<br>offload 口径 | 软件 / 硬件流量加速对页面命中计数的影响 | 软件加速：命中只统计建连首包，看真实速率请读 `/sys/class/net/<wan>/statistics/` | 硬件加速可能连选路一起影响：先 `uci set firewall.@defaults[0].flow_offloading_hw=0` 再 `fw4 reload`，观察分流是否恢复 |
+| 5 | `mark_writers`<br>第三方 mark 写者 | 规则表里谁在写路由标记、是不是 mwan3 自己（清单型，严重度继承第 3 项） | 有外来链 / iptables-nft 残留写者：按清单逐个排查 | 同第 3 项：以 `mark_segment` 的结论为准 |
+| 6 | `coexist_whitelist`<br>共存白名单 | tailscale / ntopng / ddns-go 的机制门槛（每次现算）+ 版本基线 | 版本漂移（白名单按版本绑定）；或 tailscale 开了 exit node（全流量走 tailnet）、ntopng 开了 `ct acct`、ddns-go 不能绑出接口 | 一般不产生 fail；若继承第 3/4 项则复用其结论 |
+
+读法：
+
+```sh
+isp-split doctor                     # 人读：主机前提 + 六项逐条 + 汇总 + 建议
+isp-split doctor --json              # 机器读：stdout 只有一份 JSON（人类可读提示走 stderr）
+isp-split doctor --profile=page      # 只跑 1/4/6（页面快照用；C1/C4 仍要读一次规则表，不是零成本）
+isp-split doctor --strict            # unknown 也算“不能继续用”（退出码 1）
+```
+
+退出码：`0` 可以继续 / `1` 有保留（warn）/ `2` 有东西会静默失效（conflict）；`--strict` 把
+`unknown` 也提到 1。**doctor 永不 `die`**：探针失败一律降级为 `unknown` 并记进 `probe_errors`——
+“不知道”不会被当成“没问题”。
+
+`--json` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `schema` | 信封版本，当前 `1`（只有破坏性变更才进位） |
+| `tool.{name,version}` | 与包版本同源 |
+| `generated` / `generated_text` | epoch 秒 / 人类可读时间 |
+| `profile` | `full` / `page` / `deep`（`deep` 目前与 `full` 等价） |
+| `host.openwrt.{id,release,target,rev}` | `/etc/openwrt_release` |
+| `host.{kernel,arch,nft,pkgmgr}` | 内核、架构、nft 版本、包管理器（`opkg` / `apk` / `none`） |
+| `host.mwan3.{installed,version,nft,table,mmx_mask,mmx_mask_source}` | 是否装了 mwan3、版本、是否 nft 版、`inet mwan3` 表在不在、mark 位段及其来源（`default` / `uci mwan3.globals.mmx_mask`） |
+| `host.mem.{total_kb,avail_kb,verdict}` | 内存总量 / 可用量 / 判定 |
+| `host.bins.*` | 关键命令是否存在（布尔） |
+| `host.root` | 是否以 root 运行 |
+| `checks[]` | 六项，顺序固定：`dns53_owner` → `tun_hijack` → `mark_segment` → `offload_accounting` → `mark_writers` → `coexist_whitelist` |
+| `checks[].verdict` | `ok` / `warn` / `conflict` / `unknown` |
+| `checks[].status` | 同 verdict，但 `conflict` 输出为 `fail`（页面按它上色） |
+| `checks[].confidence` | `high` / `medium` / `low`（由证据等级映射） |
+| `checks[].facts` | 该项的原始证据（结构随检查不同） |
+| `checks[].findings[].{code,verdict,detail,evidence}` | 命中项；`code` 是大写下划线稳定标识，只追加不改名 |
+| `checks[].advice` | 一句话建议（页面直接显示） |
+| `summary.{ok,warn,conflict,unknown,worst,blocking,headline}` | 计数 / 最差项 / 是否阻断 / 头条 |
+| `gate.{can_wire,reasons[]}` | 给消费方（首启向导 / 脚本）的门：`can_wire=false` 时向导把「下一步」置灰并显示 `reasons`；`wire` / `apply` 自身仍以策略预检与 nft 校验为门 |
+| `probe_errors[].{probe,cmd,note}` | 探针降级溯源，必填（空数组也要有） |
+| `ms` | 本次耗时（毫秒） |
+
+### 4. 环境横幅
+
+状态页顶部（标题之下、运营商卡片之前）有一条 `doctor` 横幅，四种形态（体检进行中先显示一行
+「正在做环境体检（doctor）…」占位）：
+
+| 形态 | 样子 | 能不能关 |
+|---|---|---|
+| 有 fail（任一项 conflict） | 红条：「环境体检：N 项会让分流静默失效」+ 逐项建议 | **不能关、不能折叠**——带着会静默失效的环境看后面的数字没有意义 |
+| 只有 warn | 橙条：「N 项有保留」+「查看建议 / 收起建议」 | 可折叠 |
+| 无 fail / warn（全绿） | 一行「环境体检正常（N 项）」+ 绿点 +「重新体检」；若还剩 `unknown`，副标题写「最差项：unknown」 | 一行，不占地方 |
+| doctor 跑不起来 | 橙条「环境体检不可用」+ 原因 +「重试」 | 不影响下方运行状态 |
+
+结果缓存 **10 分钟**：同一份结果在页面内复用（横幅标题、汇总计数、逐项建议都来自这一次
+`doctor --json` 调用），10 分钟内进出页面不重跑探针；横幅上会写「结果缓存 N 分钟，10 分钟内不
+重跑探针」。点「重新体检」跳过缓存强制重跑。缓存放在浏览器 `localStorage`（隐私模式写不进去时
+退化为只在内存里缓存，功能不受影响）。
+
+| 红条（fail，不可关） | 全绿一行 |
+|---|---|
+| ![横幅-fail](docs/images/banner-light.png) | ![横幅-全绿](docs/images/banner-dark.png) |
+
+> 两张图是两个真实状态：浅色是 doctor 报 conflict（dnsmasq 分线片段缺失），执行 `isp-split dns`
+> 修好后拍的深色全绿。截图来自 OpenWrt 25.12.6 的 LuCI 真实页面。
 
 ## 界面
 
@@ -102,6 +269,8 @@ isp-split status    # 各集合命中计数与流量
 |---|---|---|
 | `plan` / `check` / `selftest` | 三级预检（预演 / 干跑 / 独立表实弹） | 无 |
 | `fetch` / `rollback` | 拉取 / 回滚数据 | 数据 |
+| `bootstrap [--apply] [--force] [--track-ip "<ip> ..."]` / `bootstrap --rollback [--yes]` | 净机补 mwan3 骨架：默认 dry-run，`--apply` 只补缺失、不覆盖既有段；`--rollback` 只删 `isp_split=1` 段 | mwan3 |
+| `doctor [--json] [--profile=page\|full\|deep] [--strict]` | 环境体检：六项兼容矩阵 + 主机前提（只读，退出码 0/1/2） | 无 |
 | `init [--bind <策略>=<接口>]... [--assume-yes]` | 首次安装：发现 mwan3 接口，为 ISP_TABLE 的每个策略创建 policy/member（带 `isp_split=1` 标记） | mwan3 |
 | `wire` | 把集合与规则写入 mwan3 配置（策略缺失/空成员硬失败） | mwan3 |
 | `apply` | 把数据原子刷入 nftables 集合 | nft |
@@ -187,6 +356,7 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 | [docs/BUILDING.md](docs/BUILDING.md) | 构建：ipk（零依赖）、apk（Docker / 原生 SDK）、CI、发布 |
 | [docs/FIRMWARE.md](docs/FIRMWARE.md) | 编译进自编译固件（buildroot / ImageBuilder） |
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计与原理：数据管线、与代理共存、与商业方案对比 |
+| [docs/SECURITY.md](docs/SECURITY.md) | 安全模型：ACL 授权面、渲染链、`doctor` 六项矩阵与安全审计的关系 |
 
 ## 与 iKuai（爱快）的对比
 
@@ -251,6 +421,9 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
       归属地（默认开、可关）、可解释评分与一句话建议、60s 缓存；LuCI 卡片页只读缓存，
       点按钮才起后台探测
 <!-- lc:end -->
+- [x] **0.4.0**：净机一键引导 `bootstrap`（只补缺失骨架 + 原子写 + `--rollback`）、
+      环境体检 `doctor`（六项兼容矩阵 + `--json`）、LuCI 首启向导（四步状态机 + 危险确认）、
+      状态页环境横幅（fail 不可关 / warn 可折叠 / 10 分钟缓存）
 - [ ] IPv6 支持
 - [ ] LuCI 内集成 `probe` 分线测速与自动纠偏
 - [ ] 多格式域名清单导出（smartdns / AdGuard Home）

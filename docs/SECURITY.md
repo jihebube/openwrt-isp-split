@@ -131,7 +131,45 @@ LuCI 的 `E()` 对非 Node 子项调用 `document.createTextNode()`，不会经�
 - `linecheck.geo.tsv` 写入前清洗 TAB/CR/LF 并截断长度，避免缓存行列结构被外部
   文本破坏。
 
-## 7. 报告安全问题
+## 7. `doctor` 六项矩阵与安全审计的关系
+
+`AUDIT-SECURITY-v2` 第三部分（C0–C8）是**判据设计**，`files/usr/lib/isp-split/doctor.sh` 是它的
+唯一实现；`tools/router-preflight.sh` 也 source 同一份判据，不再自己写 `grep render_config_ipsets`
+之类的判据（两套判据必然漂移，这是 F7 的教训）。理解两者的关系要抓住三点：
+
+**它查的不是“有没有漏洞”，而是“会不会静默失效”。** 六项检查（`dns53_owner` / `tun_hijack` /
+`mark_segment` / `offload_accounting` / `mark_writers` / `coexist_whitelist`）回答的是“这台机器上
+别的插件会不会让分流看起来正常、实际没生效”。它和 A 系列审计是互补关系：A 系列看本仓库代码的
+授权面与注入面，C 系列看运行环境里的第三方接管。两者共用同一套“不信任外部输入”的原则。
+
+**只读红线与审计结论的对应：**
+
+| 红线 | 对应审计结论 | 实现约束 |
+|---|---|---|
+| 不产生业务流量（不做 DNS 查询、不 STUN、不连外网） | A-02（op lock）/ A-15（渲染链）：体检不得污染被测对象与页面计数 | 只读 `/proc`、`/sys`、`uci`、`nft`、`ip` 五样；功能性验证留给 `dnstest` / 体检页按钮 |
+| 不写系统配置 | A-10（BASE 守卫）/ A-11（ACL） | 不写 mwan3 / nft / uci / `state/`；输出只有 stdout |
+| 不假设工具存在（`ss`/`lsof`/`pgrep`/`jq`/`bpftool`） | §0.4 探针原语：主判据必须落在 procfs/sysfs | 缺工具只降级为 `unknown` 并记进 `probe_errors`，不报错中断 |
+| `unknown` 不等于 `ok` | A-08（未校验值直出）/ “静默成功”类问题 | 探针失败一律返回 `unknown`；`probe_errors` 必填（空数组也要有） |
+| 拿到 `gate.can_wire=false` 必须拒绝 | F-29“静默成功”教训 | 向导把「下一步」置灰并显示 `reasons`；`doctor` 自身永不 `die`。注意：`wire` / `apply` 目前仍以策略预检与 nft 校验为门，尚未接 `gate`（C7 的规划项，见“未做”） |
+
+**输出面的敏感度。** `doctor --json` 的 `facts` 里有监听者进程名、TUN 设备名、`ip rule` 与默认路由
+（含本机地址）、`mmx_mask` 与第三方 mark 写者清单——这些是本机拓扑信息，敏感级别与 `state/` 同级。
+因此：
+
+- doctor 结果只在本机 LuCI 页面与终端出现，**不外发**，也不落盘成快照；实现里连 `/tmp`
+  临时文件都是零（`doctor.sh` 文件头第 2 条红线）；
+- 页面横幅与向导渲染 `title` / `advice` / `findings` 一律走 `E()` 文本节点，不拼 `innerHTML`
+  （沿用 A-15 的结论：当前链路不可利用，新增字段必须继续走这条链）；
+- 它本身是**只读命令**，但 LuCI 侧是通过 `ubus file exec` 调它的，而 `exec` 属于 `write` 组
+  （见 §1）：能看横幅、能走向导的账号，本来就已经持有“以 root 执行任意 `isp-split` 子命令”的
+  权限。只授 `read` 的账号不会因此多出任何能力——横幅会显示「环境体检不可用」（exec 被拒），
+  状态页其余部分照常。向导的 `write` 面仍然只有 `wizard.json` 一个文件（见 §1.1）。
+
+**维护红线：** 六项判据只有一份实现，不要在 LuCI 或其他脚本里重写；新增/修改检查必须同时更新
+`tools/selftest.sh` §30（C1–C6 判据断言）与本文，否则“文档说查了、代码没查”会重新变成静默失效。
+`C8` 里列出的未闭环项与版本绑定白名单（`G6`）会随上游漂移，`warn` 是“有保留”，不是漏洞结论。
+
+## 8. 报告安全问题
 
 这是家用路由器上的开源工具，没有独立的漏洞奖励流程。请优先通过仓库 issue
 说明复现步骤；涉及未修复的提权/远程执行时，先不要公开 PoC 细节。

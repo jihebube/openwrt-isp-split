@@ -50,8 +50,8 @@ DNAT/un-SNAT 在 **-100**。所以 mwan3 看到的是"还没做地址转换"的�
 | 门 | 规则（mwan3 3.6 nft） | 对 DNS 响应的效果 |
 |---|---|---|
 | 1. conntrack 标记 | `meta mark & 0x3f00 == 0 ct mark & 0x3f00 vmap { … }` | 查询首包在出向时已把 ct mark 打成 `0x200/0x600`，响应直接 vmap 到策略链 |
-| 2. 入接口打标 | `... jump mwan3_ifaces_in` → `iifname "wan2" ... meta mark set ... | 0x600` | WAN 入向包按 `iifname` 打标，随后 `meta mark & 0x3f00 == 0 jump mwan3_rules` 不再命中 |
-| 3. connected / local | `... jump mwan3_connected`、`fib daddr type local return` | 响应此刻目的地址还是路由器 WAN 地址，属于 connected 网段 → `mark | 0x3f00; return` |
+| 2. 入接口打标 | `... jump mwan3_ifaces_in` → `iifname "wan2" ... meta mark set ... \| 0x600` | WAN 入向包按 `iifname` 打标，随后 `meta mark & 0x3f00 == 0 jump mwan3_rules` 不再命中 |
+| 3. connected / local | `... jump mwan3_connected`、`fib daddr type local return` | 响应此刻目的地址还是路由器 WAN 地址，属于 connected 网段 → `mark \| 0x3f00; return` |
 
 再加第四道：兜底规则自身带 `th sport != 53`。
 
