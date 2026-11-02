@@ -1,304 +1,263 @@
 name: release
-
-# 打 tag 触发：自动编译出 opkg(ipk) 与 apk 两种包，并建 Release。
-#
-# 为什么要用 CI 编译：OpenWrt 25.12 起包格式是 ADB 容器（魔数 ADBd），
-# 无法手工拼装，且 apk 3.0.5 没有 mkpkg 子命令、不接受旧的 v2 tar.gz 包。
-# 唯一产出 apk 的方式就是 OpenWrt SDK。放进 CI 后，使用者只需要下载产物。
-
-on:
+true:
   push:
-    tags: [ 'v*' ]
-  workflow_dispatch:
-
-# 0.3.0 起线路体检随包发货：默认 "1"（完整版）。
-# 需要剥离版时在这里改成 "0"，并用 FEATURE_LINECHECK=0 重跑一次 CI。
+    tags:
+    - v*
+  workflow_dispatch: null
 env:
-  FEATURE_LINECHECK: "1"
-
-# A-12：默认最小权限。只有 release job 需要 contents: write。
-# action 全部钉 40 位 commit SHA（注释保留人类可读版本），避免上游 tag
-# 被移动/仓库被接管时 CI 执行被替换的代码。
+  FEATURE_LINECHECK: '1'
 permissions:
   contents: read
-
 jobs:
-  # F-21：tag 与版本号必须在编译前对上。打 tag 忘了改 Makefile（或改了版本号
-  # 没打 tag）以前不会有任何报错，Release 页写着 v0.3.0、包内自报 0.2.3 也能
-  # 一路发出去。这里编译前硬拦；判定实现放在脚本里，本地可以原样复跑。
   version:
     name: tag ↔ 版本一致性
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: 断言 tag 的 vX.Y.Z 与 PKG_VERSION / ISP_VERSION 一致
-        env:
-          TAG_REF: ${{ github.ref }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          set -eu
-          case "$TAG_REF" in
-            refs/tags/*) sh scripts/verify-release-version.sh "$TAG_NAME" ;;
-            *) echo "非 tag 触发（$TAG_REF），跳过 tag↔版本一致性断言（F-21）" ;;
-          esac
-
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+    - name: 断言 tag 的 vX.Y.Z 与 PKG_VERSION / ISP_VERSION 一致
+      env:
+        TAG_REF: ${{ github.ref }}
+        TAG_NAME: ${{ github.ref_name }}
+      run: "set -eu\ncase \"$TAG_REF\" in\n  refs/tags/*) sh scripts/verify-release-version.sh\
+        \ \"$TAG_NAME\" ;;\n  *) echo \"非 tag 触发（$TAG_REF），跳过 tag↔版本一致性断言（F-21）\"\
+        \ ;;\nesac\n"
   build:
     name: build (${{ matrix.branch }})
-    needs: [ version ]
+    needs:
+    - version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 25.12+ 走 apk；24.10 走 opkg(ipk)
-          - branch: 25.12.6
-          - branch: 24.10.4
-
+        - branch: 25.12.6
+        - branch: 24.10.4
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+    - name: 编译（复用 scripts/build-apk.sh，与本地构建同一路径）
+      run: sh scripts/build-apk.sh ${{ matrix.branch }} x86/64
+    - name: 收集产物
+      run: 'set -eu
 
-      - name: 编译（复用 scripts/build-apk.sh，与本地构建同一路径）
-        run: sh scripts/build-apk.sh ${{ matrix.branch }} x86/64
+        mkdir -p out
 
-      - name: 收集产物
-        run: |
-          set -eu
-          mkdir -p out
-          find dist -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} out/ \;
-          ls -lh out
+        find dist -type f \( -name ''*.ipk'' -o -name ''*.apk'' \) -exec cp -v {}
+        out/ \;
 
-      # F-22：发货面断言要解 apk（0.3.0 起 apk 进了断言 glob），但 ubuntu runner
-      # 上没有 apk-tools 3.x，于是「找不到解包器」直接失败（run 40857244457）。
-      # 本地一直是绿的，因为 DSH 直接调 SDK 里的那份 apk；CI 里这份也在——只是
-      # 没人告诉断言脚本去哪找。这里把路径算出来注入，verify 与 parity 共用。
-      # 路径不许手抄字面量（F7）：build-apk.sh 的 WORK 规则 F-19 起带 $VER 分桶，
-      # 手抄的旧路径正好指空。做法是把它那行 WORK 赋值当场抠出来求值。
-      - name: 解析 APK_BIN（解包器路径与 build-apk.sh 的 WORK 规则同源）
-        run: |
-          set -eu
-          VER="${{ matrix.branch }}"
-          ROOT=$PWD
-          # >>> F22-RULE-BEGIN（tools/selftest.sh 22.9 抽这段原样跑，防再次分叉）
-          if [ -n "${OWRT_WORK:-}" ]; then
-            WORK=$OWRT_WORK
-            RULE="OWRT_WORK（显式指定，与 build-apk.sh 同优先级）"
-          else
-            WORK_RULE=$(sed -n 's/^WORK=${OWRT_WORK:-\(.*\)}$/\1/p' scripts/build-apk.sh | head -1)
-            if [ -z "$WORK_RULE" ]; then
-              echo "::error::scripts/build-apk.sh 里找不到 WORK=\${OWRT_WORK:-...} 规则，无法同源推导解包器路径"
-              exit 1
-            fi
-            WORK=$(eval "printf '%s' \"$WORK_RULE\"")
-            RULE="$WORK_RULE"
-          fi
-          APK_BIN=$WORK/sdk/staging_dir/host/bin/apk
-          # <<< F22-RULE-END
-          echo "WORK 规则（取自 scripts/build-apk.sh）: $RULE"
-          echo "WORK=$WORK（VER=$VER）"
-          echo "APK_BIN=$APK_BIN"
-          case "$VER" in
-            25.12*)
-              # 25.12 job 必须能解 apk：缺失就硬失败，绝不"跳过断言"糊过去。
-              [ -x "$APK_BIN" ] || {
-                echo "::error::$VER 要解 apk，但 $APK_BIN 不存在或不可执行（WORK 规则漂移？）；拒绝降级为跳过"
-                exit 1
-              }
-              echo "APK_BIN=$APK_BIN" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "$VER 产出 ipk，断言不解 apk：不注入 APK_BIN（避免指向不存在的文件）"
-              ;;
-          esac
+        ls -lh out
 
-      - name: 发货面断言（完整版 feature=1；未知格式显式失败）
-        run: |
-          set -eu
-          # F8：25.12 job 只产 .apk，旧循环 glob 的是 out/*.ipk，于是循环空转、
-          # “通过”是假的（run 40827542758 / 40830192705 两次都这样）。
-          # 第一步先按分支钉死预期格式，缺了就报错，不允许真空通过。
-          case "${{ matrix.branch }}" in
-            25.12*) want=apk ;;
-            24.10*) want=ipk ;;
-            *) echo "::error::未知分支 ${{ matrix.branch }}，无法确定预期包格式"; exit 1 ;;
-          esac
-          ls out/*."$want" >/dev/null 2>&1 || {
-            echo "::error::${{ matrix.branch }} 没有产出 .$want，断言会真空通过"
-            exit 1
-          }
-          # LuCI 包是体检页与 CSS 的唯一载体。它要是没产出，断言就失去覆盖面。
-          ls out/luci-app-isp-split* >/dev/null 2>&1 || {
-            echo "::error::${{ matrix.branch }} 没有产出 luci-app-isp-split 包，断言面无产物"
-            exit 1
-          }
-          # F-22：apk 容器要用 apk-tools 解包，CI 上唯一可用的是 SDK 里那份，
-          # 由上一步按 build-apk.sh 的 WORK 规则解析并注入。没注入就是配置又断了。
-          case "$want" in
-            apk)
-              [ -x "${APK_BIN:-}" ] || {
-                echo "::error::${{ matrix.branch }} 发货面断言要解 apk，但 APK_BIN 未注入或不可执行（${APK_BIN:-<空>}）"
-                exit 1
-              }
-              echo "用 APK_BIN=$APK_BIN 解 apk"
-              ;;
-          esac
-          set --
-          for f in out/*.ipk out/*.apk; do
-            [ -f "$f" ] || continue
-            set -- "$@" "$f"
-          done
-          # 0.3.0 起断言方向反转：不再要求「零残留」，而是要求体检**真的在包里**
-          # （linecheck 子命令 / lc-run / linecheck.js 与菜单节点 / CSS `.lc-*` /
-          #  conf 的 LINE_CHECK_* / Depends 的 socat）。方向由 --feature 显式给出，
-          # 与 env FEATURE_LINECHECK 同源，避免产物与断言各说各话。
-          sh scripts/verify-package-payload.sh verify --feature="${FEATURE_LINECHECK}" "$@"
-
-      - name: 脚本路径产物 vs SDK 路径产物 payload 恒等
-        run: |
-          set -eu
-          # 本次教训：本地路径全绿 ≠ SDK 路径绿。同一份源码两条构建路径，
-          # payload 必须逐文件一致；不一致就是又分叉了（F7 的本质）。
-          # F-22：25.12 job 的 sdk_main 是 .apk，parity 同样要解 apk，所以用同一个
-          # 已注入的 APK_BIN（同一处定义，不另算一遍路径）。
-          case "${{ matrix.branch }}" in
-            25.12*)
-              [ -x "${APK_BIN:-}" ] || {
-                echo "::error::parity 要解 apk，但 APK_BIN 未注入或不可执行（${APK_BIN:-<空>}）"
-                exit 1
-              }
-              echo "parity 用 APK_BIN=$APK_BIN 解 apk"
-              ;;
-          esac
-          sh scripts/build-ipk.sh
-          VER=$(sed -n 's/^PKG_VERSION:=//p' Makefile | head -1)
-          REL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head -1)
-          local_main="dist/isp-split_${VER}-${REL}_all.ipk"
-          local_luci="dist/luci-app-isp-split_${VER}-${REL}_all.ipk"
-          sdk_main=$(ls out/isp-split* | head -1)
-          test -f "$local_main"
-          echo "parity main: $sdk_main <-> $local_main"
-          sh scripts/verify-package-payload.sh parity "$sdk_main" "$local_main"
-          sdk_luci=$(ls out/luci-app-isp-split* | head -1)
-          test -f "$local_luci"
-          echo "parity luci: $sdk_luci <-> $local_luci"
-          sh scripts/verify-package-payload.sh parity "$sdk_luci" "$local_luci"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: packages-${{ matrix.branch }}
-          path: out/*
-          if-no-files-found: warn
-
+        '
+    - name: 解析 APK_BIN（解包器路径与 build-apk.sh 的 WORK 规则同源）
+      run: "set -eu\nVER=\"${{ matrix.branch }}\"\nROOT=$PWD\n# >>> F22-RULE-BEGIN（tools/selftest.sh\
+        \ 22.9 抽这段原样跑，防再次分叉）\nif [ -n \"${OWRT_WORK:-}\" ]; then\n  WORK=$OWRT_WORK\n\
+        \  RULE=\"OWRT_WORK（显式指定，与 build-apk.sh 同优先级）\"\nelse\n  WORK_RULE=$(sed -n\
+        \ 's/^WORK=${OWRT_WORK:-\\(.*\\)}$/\\1/p' scripts/build-apk.sh | head -1)\n\
+        \  if [ -z \"$WORK_RULE\" ]; then\n    echo \"::error::scripts/build-apk.sh\
+        \ 里找不到 WORK=\\${OWRT_WORK:-...} 规则，无法同源推导解包器路径\"\n    exit 1\n  fi\n  WORK=$(eval\
+        \ \"printf '%s' \\\"$WORK_RULE\\\"\")\n  RULE=\"$WORK_RULE\"\nfi\nAPK_BIN=$WORK/sdk/staging_dir/host/bin/apk\n\
+        # <<< F22-RULE-END\necho \"WORK 规则（取自 scripts/build-apk.sh）: $RULE\"\necho\
+        \ \"WORK=$WORK（VER=$VER）\"\necho \"APK_BIN=$APK_BIN\"\ncase \"$VER\" in\n\
+        \  25.12*)\n    # 25.12 job 必须能解 apk：缺失就硬失败，绝不\"跳过断言\"糊过去。\n    [ -x \"$APK_BIN\"\
+        \ ] || {\n      echo \"::error::$VER 要解 apk，但 $APK_BIN 不存在或不可执行（WORK 规则漂移？）；拒绝降级为跳过\"\
+        \n      exit 1\n    }\n    echo \"APK_BIN=$APK_BIN\" >> \"$GITHUB_ENV\"\n\
+        \    ;;\n  *)\n    echo \"$VER 产出 ipk，断言不解 apk：不注入 APK_BIN（避免指向不存在的文件）\"\n\
+        \    ;;\nesac\n"
+    - name: 发货面断言（完整版 feature=1；未知格式显式失败）
+      run: "set -eu\n# F8：25.12 job 只产 .apk，旧循环 glob 的是 out/*.ipk，于是循环空转、\n# “通过”是假的（run\
+        \ 40827542758 / 40830192705 两次都这样）。\n# 第一步先按分支钉死预期格式，缺了就报错，不允许真空通过。\ncase\
+        \ \"${{ matrix.branch }}\" in\n  25.12*) want=apk ;;\n  24.10*) want=ipk ;;\n\
+        \  *) echo \"::error::未知分支 ${{ matrix.branch }}，无法确定预期包格式\"; exit 1 ;;\nesac\n\
+        ls out/*.\"$want\" >/dev/null 2>&1 || {\n  echo \"::error::${{ matrix.branch\
+        \ }} 没有产出 .$want，断言会真空通过\"\n  exit 1\n}\n# LuCI 包是体检页与 CSS 的唯一载体。它要是没产出，断言就失去覆盖面。\n\
+        ls out/luci-app-isp-split* >/dev/null 2>&1 || {\n  echo \"::error::${{ matrix.branch\
+        \ }} 没有产出 luci-app-isp-split 包，断言面无产物\"\n  exit 1\n}\n# F-22：apk 容器要用 apk-tools\
+        \ 解包，CI 上唯一可用的是 SDK 里那份，\n# 由上一步按 build-apk.sh 的 WORK 规则解析并注入。没注入就是配置又断了。\n\
+        case \"$want\" in\n  apk)\n    [ -x \"${APK_BIN:-}\" ] || {\n      echo \"\
+        ::error::${{ matrix.branch }} 发货面断言要解 apk，但 APK_BIN 未注入或不可执行（${APK_BIN:-<空>}）\"\
+        \n      exit 1\n    }\n    echo \"用 APK_BIN=$APK_BIN 解 apk\"\n    ;;\nesac\n\
+        set --\nfor f in out/*.ipk out/*.apk; do\n  [ -f \"$f\" ] || continue\n  set\
+        \ -- \"$@\" \"$f\"\ndone\n# 0.3.0 起断言方向反转：不再要求「零残留」，而是要求体检**真的在包里**\n# （linecheck\
+        \ 子命令 / lc-run / linecheck.js 与菜单节点 / CSS `.lc-*` /\n#  conf 的 LINE_CHECK_*\
+        \ / Depends 的 socat）。方向由 --feature 显式给出，\n# 与 env FEATURE_LINECHECK 同源，避免产物与断言各说各话。\n\
+        sh scripts/verify-package-payload.sh verify --feature=\"${FEATURE_LINECHECK}\"\
+        \ \"$@\"\n"
+    - name: 脚本路径产物 vs SDK 路径产物 payload 恒等
+      run: "set -eu\n# 本次教训：本地路径全绿 ≠ SDK 路径绿。同一份源码两条构建路径，\n# payload 必须逐文件一致；不一致就是又分叉了（F7\
+        \ 的本质）。\n# F-22：25.12 job 的 sdk_main 是 .apk，parity 同样要解 apk，所以用同一个\n# 已注入的\
+        \ APK_BIN（同一处定义，不另算一遍路径）。\ncase \"${{ matrix.branch }}\" in\n  25.12*)\n \
+        \   [ -x \"${APK_BIN:-}\" ] || {\n      echo \"::error::parity 要解 apk，但 APK_BIN\
+        \ 未注入或不可执行（${APK_BIN:-<空>}）\"\n      exit 1\n    }\n    echo \"parity 用 APK_BIN=$APK_BIN\
+        \ 解 apk\"\n    ;;\nesac\nsh scripts/build-ipk.sh\nVER=$(sed -n 's/^PKG_VERSION:=//p'\
+        \ Makefile | head -1)\nREL=$(sed -n 's/^PKG_RELEASE:=//p' Makefile | head\
+        \ -1)\nlocal_main=\"dist/isp-split_${VER}-${REL}_all.ipk\"\nlocal_luci=\"\
+        dist/luci-app-isp-split_${VER}-${REL}_all.ipk\"\nsdk_main=$(ls out/isp-split*\
+        \ | head -1)\ntest -f \"$local_main\"\necho \"parity main: $sdk_main <-> $local_main\"\
+        \nsh scripts/verify-package-payload.sh parity \"$sdk_main\" \"$local_main\"\
+        \nsdk_luci=$(ls out/luci-app-isp-split* | head -1)\ntest -f \"$local_luci\"\
+        \necho \"parity luci: $sdk_luci <-> $local_luci\"\nsh scripts/verify-package-payload.sh\
+        \ parity \"$sdk_luci\" \"$local_luci\"\n"
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: packages-${{ matrix.branch }}
+        path: out/*
+        if-no-files-found: warn
   source:
     name: source tarball
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - name: 构建分发包
-        run: sh scripts/build-release.sh
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: source
-          path: dist/*
-
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+    - name: 构建分发包
+      run: sh scripts/build-release.sh
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: source
+        path: dist/*
   release:
-    needs: [ build, source ]
+    needs:
+    - build
+    - source
     runs-on: ubuntu-latest
-    # A-12：写权限只给真正写 Release 的 job；build/source 仍是只读。
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: artifacts
-      - name: 汇总
-        run: |
-          mkdir -p rel
-          find artifacts -type f -exec cp -v {} rel/ \;
-          # 曾经的 bug：`sha256sum * > SHA256SUMS` 里，重定向先创建空文件，
-          # 于是 glob 把 SHA256SUMS 自己也算进去，清单里多出一行
-          # `e3b0c442...(空文件的 sha256)  SHA256SUMS`。这里逐个列并显式排除自身。
-          cd rel
-          : > SHA256SUMS
-          for f in *; do
-            [ -f "$f" ] || continue
-            [ "$f" = "SHA256SUMS" ] && continue
-            sha256sum "$f" >> SHA256SUMS 2>/dev/null || shasum -a 256 "$f" >> SHA256SUMS
-          done
-          echo "--- SHA256SUMS ---"
-          cat SHA256SUMS
-          # 断言：清单非空，且不含自身
-          [ -s SHA256SUMS ] || { echo "::error::SHA256SUMS 为空"; exit 1; }
-          if grep -q ' SHA256SUMS$' SHA256SUMS; then
-            echo "::error::SHA256SUMS 把自己也列进了清单"
-            exit 1
-          fi
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: rel/*
-          # 不自动生成 release notes：0.3.2 的对外口径要人工定稿（扫雷清单、体检修正、
-          # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
-          generate_release_notes: false
-          body: |
-            ## v0.4.0 体检更新
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        path: artifacts
+    - name: 汇总
+      run: "mkdir -p rel\nfind artifacts -type f -exec cp -v {} rel/ \\;\n# 曾经的 bug：`sha256sum\
+        \ * > SHA256SUMS` 里，重定向先创建空文件，\n# 于是 glob 把 SHA256SUMS 自己也算进去，清单里多出一行\n# `e3b0c442...(空文件的\
+        \ sha256)  SHA256SUMS`。这里逐个列并显式排除自身。\ncd rel\n: > SHA256SUMS\nfor f in *;\
+        \ do\n  [ -f \"$f\" ] || continue\n  [ \"$f\" = \"SHA256SUMS\" ] && continue\n\
+        \  sha256sum \"$f\" >> SHA256SUMS 2>/dev/null || shasum -a 256 \"$f\" >> SHA256SUMS\n\
+        done\necho \"--- SHA256SUMS ---\"\ncat SHA256SUMS\n# 断言：清单非空，且不含自身\n[ -s SHA256SUMS\
+        \ ] || { echo \"::error::SHA256SUMS 为空\"; exit 1; }\nif grep -q ' SHA256SUMS$'\
+        \ SHA256SUMS; then\n  echo \"::error::SHA256SUMS 把自己也列进了清单\"\n  exit 1\nfi\n"
+    - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+      with:
+        files: rel/*
+        generate_release_notes: false
+        body: '## v0.4.0 体检更新
 
-            净机首装从"先去 MultiWAN 管理器手点三遍"变成一条命令；同时把"这台机器上的其它插件会不会让分流静默失效"做成可核对的六项体检。
 
-            ### bootstrap（净机骨架，默认灰度）
+          净机首装从"先去 MultiWAN 管理器手点三遍"变成一条命令；同时把"这台机器上的其它插件会不会让分流静默失效"做成可核对的六项体检。
 
-            - `isp-split bootstrap` 只读发现 network 里的 WAN，补出 mwan3 的 interface/member/policy；默认 dry-run，`--apply` 才写
-            - 只补缺失：已存在的段（无论 enabled 0/1、无论是不是本项目建的）一律跳过并报告，绝不覆盖、不改名
-            - 写入走私有 confdir + 解析校验 + rename 原子替换；任何一步失败，正式配置一个字节都不改
-            - 不自动 init / wire / reload mwan3，结束后打印下一步——是否生效由用户显式决定（灰度）
-            - `bootstrap --rollback` 与 `uninstall` 只删带 `isp_split=1` 标记的段；仍被其它策略/成员引用的段保留并告警
 
-            ### doctor（环境体检）
+          ### bootstrap（净机骨架，默认灰度）
 
-            - `isp-split doctor [--json]`：六项兼容矩阵（53 端口归属 / TUN 劫持 / 标记位段 / offload 口径 / 第三方 mark 写者 / 共存白名单）+ 主机前提
-            - 只读、零业务流量、不写系统配置；探针缺失如实降级为 unknown，不冒充"没问题"
-            - `tools/router-preflight.sh` 与 doctor 共用同一份判据实现（`usr/lib/isp-split/doctor.sh`），不再各写一套
-            - 退出码：0 可继续 / 1 有保留 / 2 有东西会静默失效；`--profile=page` 给页面快照
 
-            ### 安装
+          - `isp-split bootstrap` 只读发现 network 里的 WAN，补出 mwan3 的 interface/member/policy；默认
+          dry-run，`--apply` 才写
 
-            **OpenWrt 25.12+（apk 系，含 Kwrt 25.12）** —— 下载源码包用脚本安装：
+          - 只补缺失：已存在的段（无论 enabled 0/1、无论是不是本项目建的）一律跳过并报告，绝不覆盖、不改名
 
-            ```sh
-            wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
-            mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-            sh /tmp/isp/isp-split-0.4.0/scripts/install.sh --all
-            ```
+          - 写入走私有 confdir + 解析校验 + rename 原子替换；任何一步失败，正式配置一个字节都不改
 
-            （busybox tar 不支持 --strip-components，进目录跑即可。）
+          - 不自动 init / wire / reload mwan3，结束后打印下一步——是否生效由用户显式决定（灰度）
 
-            若本页附带 `.apk`（CI 用 SDK 编译）：
+          - `bootstrap --rollback` 与 `uninstall` 只删带 `isp_split=1` 标记的段；仍被其它策略/成员引用的段保留并告警
 
-            ```sh
-            apk add --no-network --allow-untrusted ./isp-split-*.apk ./luci-app-isp-split-*.apk
-            ```
 
-            **OpenWrt 24.10 及以下（opkg 系）**：
+          ### doctor（环境体检）
 
-            ```sh
-            opkg install isp-split_*_all.ipk luci-app-isp-split_*_all.ipk
-            ```
 
-            opkg 用户务必重下本页 ipk（0.2.3 起容器格式已对齐官方）。LuCI 更新后浏览器强刷一次。
+          - `isp-split doctor [--json]`：六项兼容矩阵（53 端口归属 / TUN 劫持 / 标记位段 / offload 口径
+          / 第三方 mark 写者 / 共存白名单）+ 主机前提
 
-            ### v0.3.2 回顾：扫雷更新
+          - 只读、零业务流量、不写系统配置；探针缺失如实降级为 unknown，不冒充"没问题"
 
-            上一个版本是一次全库安全审计 + 全量 bug 回归的产物：审计 16 条发现全部闭环（其中高危 0 条），回归断言从 251 涨到 281 项。
+          - `tools/router-preflight.sh` 与 doctor 共用同一份判据实现（`usr/lib/isp-split/doctor.sh`），不再各写一套
 
-            ### 安全加固（全库审计 audit v2）
+          - 退出码：0 可继续 / 1 有保留 / 2 有东西会静默失效；`--profile=page` 给页面快照
 
-            - 源数据下载体积闸门前置：流式截断 + 暂存 tmpfs + 磁盘空间预检，"先落盘 20MiB 再拒收"的旧路径作废
-            - init / dns / install / uninstall 四个写命令纳入全局操作锁，与定时同步彻底互斥
-            - `conf set` 的换行盲区堵死：UA / ACCEPT 等字段不再可能把注入头带进探测请求
-            - 回显源、探测 URL、DNS 目录、集合名、策略名全部补齐读取侧校验；export / teardown 加路径守卫（`ISP_SPLIT_BASE=/etc` 之类的危险指向会被直接拒绝）
-            - 状态与缓存目录收紧 700/600；ip-api 降级链路改为仅 HTTPS
-            - LuCI 渲染层经全链审计确认无注入面（文本节点语义），并新增回归断言防止未来改坏
 
-            ### 体检修正（来自生产实测反馈）
 
-            - 出口回显源换为境内服务（ip.3322.net / myip.ipip.net / ddns.oray.com），"出口 IP 未取到"不再是境外源不可达造成的冤案
-            - 回显逐源记录 HTTP 码与错误，页面能区分"回显源不可达"与"真的没出网"
-            - DNS 段按线路实测（从 DNS_TABLE 取对应运营商 DNS），不再测到本机 dnsmasq 热缓存；亚毫秒显示 `<1ms`，未测显示 `—`，两者不再混淆
+          ### LuCI 首启向导与环境横幅（新页面「引导」）
+
+
+          - 四步状态机：**自检**（doctor 六项矩阵可视化，有 fail 停步给建议）→ **体检**（线路体检快照/一键探测）→ **绑定**（bootstrap
+          dry-run 预览→应用，改 mwan3 前弹框确认）→ **生效**（默认灰度：预演后「启用」；直接同步需勾选"我知道会短暂断流 1-3 秒"）
+
+          - 完成后菜单入口保留，改名「重新引导」——加线路、重配随时再来
+
+          - overview 顶部新增**环境横幅**：doctor 结果 10 分钟缓存展示——fail 红条不可关闭、warn 橙色可折叠、全绿一行
+
+          - 安全：向导按钮只允许调用白名单子命令，rpcd ACL 同步收紧，渲染不拼接任何外部字段
+
+
+          ### 安装
+
+
+          **OpenWrt 25.12+（apk 系，含 Kwrt 25.12）** —— 下载源码包用脚本安装：
+
+
+          ```sh
+
+          wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
+
+          mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
+
+          sh /tmp/isp/isp-split-0.4.0/scripts/install.sh --all
+
+          ```
+
+
+          （busybox tar 不支持 --strip-components，进目录跑即可。）
+
+
+          若本页附带 `.apk`（CI 用 SDK 编译）：
+
+
+          ```sh
+
+          apk add --no-network --allow-untrusted ./isp-split-*.apk ./luci-app-isp-split-*.apk
+
+          ```
+
+
+          **OpenWrt 24.10 及以下（opkg 系）**：
+
+
+          ```sh
+
+          opkg install isp-split_*_all.ipk luci-app-isp-split_*_all.ipk
+
+          ```
+
+
+          opkg 用户务必重下本页 ipk（0.2.3 起容器格式已对齐官方）。LuCI 更新后浏览器强刷一次。
+
+
+          ### v0.3.2 回顾：扫雷更新
+
+
+          上一个版本是一次全库安全审计 + 全量 bug 回归的产物：审计 16 条发现全部闭环（其中高危 0 条），回归断言从 251 涨到 281 项。
+
+
+          ### 安全加固（全库审计 audit v2）
+
+
+          - 源数据下载体积闸门前置：流式截断 + 暂存 tmpfs + 磁盘空间预检，"先落盘 20MiB 再拒收"的旧路径作废
+
+          - init / dns / install / uninstall 四个写命令纳入全局操作锁，与定时同步彻底互斥
+
+          - `conf set` 的换行盲区堵死：UA / ACCEPT 等字段不再可能把注入头带进探测请求
+
+          - 回显源、探测 URL、DNS 目录、集合名、策略名全部补齐读取侧校验；export / teardown 加路径守卫（`ISP_SPLIT_BASE=/etc`
+          之类的危险指向会被直接拒绝）
+
+          - 状态与缓存目录收紧 700/600；ip-api 降级链路改为仅 HTTPS
+
+          - LuCI 渲染层经全链审计确认无注入面（文本节点语义），并新增回归断言防止未来改坏
+
+
+          ### 体检修正（来自生产实测反馈）
+
+
+          - 出口回显源换为境内服务（ip.3322.net / myip.ipip.net / ddns.oray.com），"出口 IP 未取到"不再是境外源不可达造成的冤案
+
+          - 回显逐源记录 HTTP 码与错误，页面能区分"回显源不可达"与"真的没出网"
+
+          - DNS 段按线路实测（从 DNS_TABLE 取对应运营商 DNS），不再测到本机 dnsmasq 热缓存；亚毫秒显示 `<1ms`，未测显示
+          `—`，两者不再混淆
+
+          '
