@@ -239,7 +239,7 @@ jobs:
           # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
-            ## v0.3.3 bootstrap 与 doctor
+            ## v0.4.0 体检更新
 
             净机首装从"先去 MultiWAN 管理器手点三遍"变成一条命令；同时把"这台机器上的其它插件会不会让分流静默失效"做成可核对的六项体检。
 
@@ -265,7 +265,7 @@ jobs:
             ```sh
             wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
             mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-            sh /tmp/isp/isp-split-0.3.3/scripts/install.sh --all
+            sh /tmp/isp/isp-split-0.4.0/scripts/install.sh --all
             ```
 
             （busybox tar 不支持 --strip-components，进目录跑即可。）
