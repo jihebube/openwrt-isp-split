@@ -6801,6 +6801,64 @@ d30_case "30.36 C3 mwan3 表在 ip family（旧实现整表落 legacy）也不�
 d30_case "30.37 C3 真第三方 ct mark set 0x100（表名非 mwan3）仍报 conflict，hint 置信度低" conflict CTMARK_COLLISION d30_c3_third_ctmark_value '"hint_confidence":"low"'
 d30_case "30.38 C3 第三方 ct mark 落在位段之外 -> ok / MARK_OUTSIDE（不按字段名定罪）" ok MARK_OUTSIDE d30_c3_third_ctmark_outside
 
+# fix39：写向位求值。OpenWrt 固件自带的 fwmark 同步（裸 `table ip mangle` /
+# `table ip6 mangle`）用 `ct mark set meta mark & 0x00ff0000` 把 packet mark 的
+# 0x00ff0000 段搬进 ct mark：覆盖位只有 mask 段（bits 16-23），与 mwan3 的
+# 0x3f00（bits 8-13）无交集。旧实现把"mask 之外被清零的位"(~mask & mmx) 也算成
+# "写了位段"，于是这种非字面量的同步规则必然被判 CTMARK_COLLISION。
+d30_c3_owrt_mangle() {
+	d30_ctx
+	DOC_W="ip	mangle	OUTPUT	3	ctmark	mask_clear	0x00ff0000	-	-	meta
+ip	mangle	PREROUTING	2	mark	mask_clear	0x00ff0000	-	-	ct
+ip6	mangle	OUTPUT	4	ctmark	mask_clear	0x00ff0000	-	-	meta"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'D=%s\n' "$DOC_C3_FIND"
+}
+# 同一形态但掩码真的压在 mmx_mask 上 -> 仍 must conflict（位段 0x3f00）
+d30_c3_mask_overlap() {
+	d30_ctx
+	DOC_W="inet	evil	prerouting	30	ctmark	mask_clear	0x00003f00	-	-	meta"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+# `ct mark set meta mark`（无掩码 = 整值写）：不可判定，保守报
+d30_c3_whole_unknown() {
+	d30_ctx
+	DOC_W="inet	evil	prerouting	31	ctmark	other	-	-	-	meta"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'D=%s\n' "$DOC_C3_FIND"
+}
+# fix38 行为不回退：字面值落在位段内仍然 conflict
+d30_c3_literal_inmask() {
+	d30_ctx
+	DOC_W="inet	evil	prerouting	32	ctmark	set	-	0x00000100	-	lit"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+# fix38 行为不回退：mwan3_iface_in_* 的线路打标仍然按归属排除
+d30_c3_iface_in() {
+	d30_ctx
+	DOC_W="inet	mwan3	mwan3_iface_in_wan1	10	mark	mask_set	0xffffc1ff	0x00000100	-	meta"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+# 读向：`meta mark set ct mark & 0x00ff0000` 只写 packet mark，不进 conntrack
+d30_c3_read_direction() {
+	d30_ctx
+	DOC_W="ip	mangle	PREROUTING	2	mark	mask_clear	0x00ff0000	-	-	ct"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
+d30_case "30.40 C3 OpenWrt 自带 mangle 表（OUTPUT 同步 + PREROUTING 读向）-> ok，且 info 写明「无重叠（已验证）」" ok MARK_FWMARK_DISJOINT d30_c3_owrt_mangle '无重叠（已验证）'
+d30_case "30.41 C3 掩码真压在 mmx_mask 上（ct mark set meta mark & 0x3f00）-> conflict / CTMARK_COLLISION" conflict CTMARK_COLLISION d30_c3_mask_overlap
+d30_case "30.42 C3 ct mark set meta mark（无掩码整值写）-> 保守 conflict，文案点明不可静态求值" conflict CTMARK_COLLISION d30_c3_whole_unknown '无法静态求值'
+d30_case "30.43 C3 字面值 0x100 落在位段内 -> 仍 conflict（fix38 行为不回退）" conflict CTMARK_COLLISION d30_c3_literal_inmask
+d30_case "30.44 C3 mwan3_iface_in_wan1 线路打标 -> 不报（fix38 排除清单不回退）" ok - d30_c3_iface_in '"excluded_count":1'
+d30_case "30.45 C3 meta mark set ct mark & 0x00ff0000 是读向 -> 不报，只给 info" ok MARK_READ_DIRECTION d30_c3_read_direction
+
 # P5 回归：`ip -4 rule show` 里的空行不能被解析成一条"精确 fwmark 0xffffffff"的假规则
 mkdir -p "$D30/ipbin"
 cat > "$D30/ipbin/ip" <<'D30_IP5'
@@ -6924,6 +6982,20 @@ d30_case "30.24 C5 第三方写者位段有交集（C3 未判 conflict 时）-> 
 d30_case "30.25 C5 有人往 inet mwan3 塞外来链 -> warn / MWAN3_TABLE_FOREIGN_CHAIN" warn MWAN3_TABLE_FOREIGN_CHAIN d30_c5_warn_foreign
 d30_case "30.26 C5 继承 C3 的 conflict（同一故障不重复计数）" conflict - d30_c5_conflict_inherit
 d30_case "30.39 C5 mwan3 自有子链（iface_in_*/iface_out_*/policy_*/dynamic/mwan3_hook）不算外来链 -> ok" ok - d30_c5_mwan3_own_subchains
+
+# fix39：OpenWrt 自带 mangle 表是 ip/ip6 family（旧判据一律当 legacy），但它的
+# 写入位段经掩码求值与 mmx_mask 无交集 -> 不该再告警"iptables-nft 残留"，
+# 否则 C3 修好了、C5 又冒一条 warn。真落在位段内的 legacy 写者（30.23）照旧报。
+d30_c5_legacy_outside() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_W="ip	mangle	OUTPUT	3	ctmark	mask_clear	0x00ff0000	-	-	meta
+ip	mangle	PREROUTING	2	mark	mask_clear	0x00ff0000	-	-	ct"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+	printf 'X=%s\n' "$DOC_C5_FACTS"
+}
+d30_case "30.46 C5 OpenWrt mangle 表（legacy family）写入位段外 -> ok / MARK_WRITERS_OUTSIDE" ok MARK_WRITERS_OUTSIDE d30_c5_legacy_outside '"legacy_in_mask":0'
 
 # ---------------- C6：共存白名单 ----------------
 cat > "$D30/c6/bin/tailscale" <<'D30_TS'
@@ -7155,6 +7227,49 @@ table inet evil {
 	}
 }
 D31_R4
+# fix39 生产第二层误报：OpenWrt 固件自带的 fwmark 同步（裸 table ip/ip6 mangle）。
+# OUTPUT 的 `ct mark set meta mark & 0x00ff0000` 只搬 bits 16-23，与 mwan3 的
+# 0x3f00（bits 8-13）无交集；PREROUTING 的 `meta mark set ct mark & 0x00ff0000`
+# 是读向（只写 packet mark）。两条都取自生产 `nft -a list ruleset` 原文。
+cat > "$D31/rules-owrt-mangle" <<'D31_R5'
+table ip mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		ct mark & 0x00ff0000 != 0x00000000 meta mark set ct mark & 0x00ff0000 # handle 2
+	}
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		ct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000 # handle 3
+	}
+}
+table ip6 mangle {
+	chain PREROUTING {
+		type filter hook prerouting priority mangle; policy accept;
+		ct mark & 0x00ff0000 != 0x00000000 meta mark set ct mark & 0x00ff0000 # handle 4
+	}
+	chain OUTPUT {
+		type route hook output priority mangle; policy accept;
+		ct state new meta mark & 0x00ff0000 != 0x00000000 ct mark set meta mark & 0x00ff0000 # handle 5
+	}
+}
+table inet mwan3 {
+	chain mwan3_iface_in_wan1 {
+		meta mark set meta mark & 0xffffc1ff | 0x00000100 # handle 20
+	}
+	chain mwan3_or_ct_0x100 {
+		ct mark set ct mark & 0xffffc1ff | 0x00000100 # handle 21
+	}
+}
+D31_R5
+# 同一环境下叠一条掩码真的压在位段上的第三方 ct 写者：必须仍然 conflict。
+cat "$D31/rules-owrt-mangle" > "$D31/rules-owrt-third"
+cat >> "$D31/rules-owrt-third" <<'D31_R6'
+table inet evil {
+	chain prerouting {
+		ct mark set meta mark & 0x00003f00 # handle 40
+	}
+}
+D31_R6
 
 E31_OFFLOAD=0
 E31_IPRULE=""
@@ -7392,6 +7507,53 @@ if [ -z "$_bad" ]; then
 else
 	ng "31.10 真第三方漏报/证据不足:$_bad"
 	sed 's/^/    /' "$D31/real-third.json" | cut -c1-500 | head -2
+fi
+
+# 31.11 fix39：生产第二层误报。OpenWrt 固件自带 fwmark 同步（裸 ip/ip6 mangle
+# 表）+ mwan3 并存时，C3 必须 ok，并把"为什么没报"（位段 + 无重叠（已验证））
+# 写进 findings；C5 也不能把 ip family 的 mangle 表当 iptables-nft 残留再报一次。
+E31_IPRULE="2005:	from all fwmark 0x500/0x3f00 lookup 5"
+e31_run "$D31/owrt.json" "$D31/rules-owrt-mangle" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/owrt.json" 6 -)
+[ "$_rc" = 2 ] && _bad="$_bad rc仍是2"
+grep -q '"conflict":0' "$D31/owrt.json" || _bad="$_bad 干净夹具却报conflict"
+grep -q '"warn":0' "$D31/owrt.json" || _bad="$_bad 干净夹具却报warn(C5 legacy)"
+grep -q 'CTMARK_COLLISION' "$D31/owrt.json" && _bad="$_bad 仍报CTMARK_COLLISION"
+_c3v=$(sed -n 's/.*"id":"mark_segment","title":"[^"]*","verdict":"\([^"]*\)".*/\1/p' "$D31/owrt.json")
+[ "$_c3v" = "ok" ] || _bad="$_bad C3=$_c3v(期望ok)"
+_c5v=$(sed -n 's/.*"id":"mark_writers","title":"[^"]*","verdict":"\([^"]*\)".*/\1/p' "$D31/owrt.json")
+[ "$_c5v" = "ok" ] || _bad="$_bad C5=$_c5v(期望ok)"
+grep -q 'MARK_FWMARK_DISJOINT' "$D31/owrt.json" || _bad="$_bad 缺无重叠info"
+grep -q '无重叠（已验证）' "$D31/owrt.json" || _bad="$_bad info文案缺「无重叠（已验证）」"
+grep -q 'MARK_READ_DIRECTION' "$D31/owrt.json" || _bad="$_bad 缺读向info"
+case "$(cat "$D31/owrt.json")" in
+*CHECK_CONFLICT*) _bad="$_bad 门禁仍因误报阻断" ;;
+esac
+if [ -z "$_bad" ]; then
+	ok "31.11 fix39 对照（OpenWrt 自带 mangle）：C3/C5=ok、rc≠2、info 写明「无重叠（已验证）」、读向不计冲突"
+else
+	ng "31.11 OpenWrt 自带 mangle 仍误报:$_bad"
+	sed 's/^/    /' "$D31/owrt.json" | cut -c1-600 | head -2
+fi
+# 31.12 对照面：同一环境叠一条掩码真压在 0x3f00 上的第三方 ct 写者 -> 仍 conflict，
+# 且 detail 里带完整表达式（不是只给个裸值），门禁照旧阻断。
+e31_run "$D31/owrt-third.json" "$D31/rules-owrt-third" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/owrt-third.json" 6 conflict)
+[ "$_rc" = 2 ] || _bad="$_bad rc=$_rc(期望2)"
+grep -q 'CTMARK_COLLISION' "$D31/owrt-third.json" || _bad="$_bad 缺CTMARK_COLLISION"
+grep -q 'meta mark & 0x00003f00' "$D31/owrt-third.json" || _bad="$_bad detail没带表达式"
+grep -q '"can_wire":false' "$D31/owrt-third.json" || _bad="$_bad 门禁未阻断"
+case "$(cat "$D31/owrt-third.json")" in
+*CHECK_CONFLICT*) ;;
+*) _bad="$_bad 门禁缺CHECK_CONFLICT" ;;
+esac
+if [ -z "$_bad" ]; then
+	ok "31.12 fix39 对照（掩码真重叠）：CTMARK_COLLISION、detail 带表达式、rc=2、门禁阻断"
+else
+	ng "31.12 真重叠掩码漏报/证据不足:$_bad"
+	sed 's/^/    /' "$D31/owrt-third.json" | cut -c1-600 | head -2
 fi
 E31_IPRULE=""
 
