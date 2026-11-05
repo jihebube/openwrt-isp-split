@@ -6735,13 +6735,71 @@ d30_c3_custom_mask() {
 	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
 	printf 'X=%s\n' "$DOC_C3_FACTS"
 }
+# fix38：生产 mwan3-nft 3.6.12 的真实形态。iface_in_* 做线路打标
+# （meta mark set meta mark & 0xffffc1ff | 0x100），mwan3_or_ct_* 做 ct mark 同步，
+# 配套 ip rule 是 2001/2002（lookup）+ 3001/3002（unreachable）。
+# 这些写者全部属于 mwan3 自己的表，C3 必须按归属排除，不能因为值恰好是 0x100
+# （OAF 的默认 ct mark）就判成第三方 DPI。
+d30_c3_real_mwan3() {
+	d30_ctx
+	DOC_W="inet	mwan3	mwan3_iface_in_wan1	10	mark	mask_set	0xffffc1ff	0x00000100	-
+inet	mwan3	mwan3_or_ct_0x100	20	ctmark	mask_set	0xffffc1ff	0x00000100	-
+inet	mwan3	mwan3_or_meta_0x100	21	mark	or	-	0x00000100	-
+inet	mwan3	policy_wan_only	22	mark	mask_set	0x00003f00	0x00000100	-
+inet	mwan3	dynamic	23	mark	mask_clear	0x00003f00	-	-"
+	DOC_P5="2001	0x100	0x3f00	1	-	-	0
+2002	0x200	0x3f00	2	-	-	0
+3001	0x100	0x3f00	unreachable	-	-	0
+3002	0x200	0x3f00	unreachable	-	-	0"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+# 同一组规则放在 ip family 的 mwan3 表里：旧实现把非 inet 表整表归为 legacy，
+# legacy 又被当第三方 -> 必然报 CTMARK_COLLISION（生产误报的复现路径）。
+d30_c3_real_mwan3_ipfam() {
+	d30_ctx
+	DOC_W="ip	mwan3	mwan3_iface_in_wan1	10	mark	mask_set	0xffffc1ff	0x00000100	-
+ip	mwan3	mwan3_or_ct_0x100	20	ctmark	mask_set	0xffffc1ff	0x00000100	-
+ip	mwan3	mwan3_or_meta_0x100	21	mark	or	-	0x00000100	-
+ip	mwan3	policy_wan_only	22	mark	mask_set	0x00003f00	0x00000100	-
+ip	mwan3	dynamic	23	mark	mask_clear	0x00003f00	-	-"
+	DOC_P5="2001	0x100	0x3f00	1	-	-	0
+2002	0x200	0x3f00	2	-	-	0
+3001	0x100	0x3f00	unreachable	-	-	0
+3002	0x200	0x3f00	unreachable	-	-	0"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+# 真第三方：表名不是 mwan3，ct mark set 0x100（无掩码）。必须继续报 conflict，
+# 且产品名只能是"值签名"低置信度 hint（0x100 与 mwan3 wan1 线路值撞值）。
+d30_c3_third_ctmark_value() {
+	d30_ctx
+	DOC_W="inet	mwan3	mwan3_iface_in_wan1	10	mark	mask_set	0xffffc1ff	0x00000100	-
+inet	evil	prerouting	30	ctmark	set	-	0x00000100	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+	printf 'X=%s\n' "$DOC_C3_FACTS"
+}
+# 第三方 ct mark 落在位段之外（0x80000）：不能因为"是 ct mark"就报 conflict。
+d30_c3_third_ctmark_outside() {
+	d30_ctx
+	DOC_W="inet	evil	prerouting	30	ctmark	set	-	0x00080000	-"
+	doc_check_mark
+	printf 'V=%s\nC=%s\n' "$DOC_C3_VERDICT" "$(d30_codes "$DOC_C3_FIND")"
+}
 d30_case "30.11 C3 位段只有 mwan3 自己写 -> ok" ok - d30_c3_ok_mwan3 '"mmx_mask":"0x3F00"'
 d30_case "30.12 C3 第三方写者落在位段内且没有先手 rule -> conflict / MARK_OVERLAP_UNORDERED" conflict MARK_OVERLAP_UNORDERED d30_c3_conflict_unordered
 d30_case "30.13 C3 同一写者但它的 rule 排在 mwan3 之前 -> warn / MARK_OVERLAP_ORDERED" warn MARK_OVERLAP_ORDERED d30_c3_warn_ordered
-d30_case "30.14 C3 ct mark 被改写（OAF 类）-> conflict / CTMARK_COLLISION" conflict CTMARK_COLLISION d30_c3_conflict_ctmark
+d30_case "30.14 C3 第三方 ct mark 与位段重叠（表名 oaf）-> conflict / CTMARK_COLLISION" conflict CTMARK_COLLISION d30_c3_conflict_ctmark
 d30_case "30.15 C3 第三方写者全在位段之外 -> ok / MARK_OUTSIDE" ok MARK_OUTSIDE d30_c3_ok_outside
-d30_case "30.16 C3 table inet mwan3 不存在 -> unknown（不猜）" unknown - d30_c3_unknown
+d30_case "30.16 C3 mwan3 表不存在 -> unknown（不猜）" unknown - d30_c3_unknown
 d30_case "30.17 C3 mmx_mask 改成 0xFC00：阈值现算 + MMX_MASK_CUSTOM，不误报" ok MMX_MASK_CUSTOM d30_c3_custom_mask '"mmx_mask":"0xFC00"'
+d30_case "30.35 C3 真实 mwan3 形态（iface_in 打标 + mwan3_or_ct 同步 + 2001/2002/3001/3002）不误报 -> ok" ok - d30_c3_real_mwan3 '"excluded_count":5'
+d30_case "30.36 C3 mwan3 表在 ip family（旧实现整表落 legacy）也不误报 -> ok" ok - d30_c3_real_mwan3_ipfam '"excluded_count":5'
+d30_case "30.37 C3 真第三方 ct mark set 0x100（表名非 mwan3）仍报 conflict，hint 置信度低" conflict CTMARK_COLLISION d30_c3_third_ctmark_value '"hint_confidence":"low"'
+d30_case "30.38 C3 第三方 ct mark 落在位段之外 -> ok / MARK_OUTSIDE（不按字段名定罪）" ok MARK_OUTSIDE d30_c3_third_ctmark_outside
 
 # P5 回归：`ip -4 rule show` 里的空行不能被解析成一条"精确 fwmark 0xffffffff"的假规则
 mkdir -p "$D30/ipbin"
@@ -6831,6 +6889,28 @@ d30_c5_warn_foreign() {
 	doc_check_writers
 	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
 }
+# fix38：mwan3 3.6 的子链名不全是 mwan3* 前缀（iface_in_*/policy_*/dynamic/mwan3_hook）。
+# 这些是 mwan3 自己的链，C5 不能再报"有人往 mwan3 表里塞外来链"。
+d30_c5_mwan3_own_subchains() {
+	d30_ctx
+	DOC_C3_VERDICT=ok
+	DOC_P4="table inet mwan3 {
+	chain mwan3_hook {
+	}
+	chain iface_in_wan1 {
+	}
+	chain iface_out_wan1 {
+	}
+	chain policy_wan_only {
+	}
+	chain dynamic {
+	}
+	chain mwan3_or_ct_0x100 {
+	}
+}"
+	doc_check_writers
+	printf 'V=%s\nC=%s\n' "$DOC_C5_VERDICT" "$(d30_codes "$DOC_C5_FIND")"
+}
 d30_c5_conflict_inherit() {
 	d30_ctx
 	DOC_C3_VERDICT=conflict
@@ -6843,6 +6923,7 @@ d30_case "30.23 C5 iptables-nft 残留写者 -> warn / LEGACY_MARK_WRITER" warn 
 d30_case "30.24 C5 第三方写者位段有交集（C3 未判 conflict 时）-> warn / MARK_WRITERS_IN_MASK" warn MARK_WRITERS_IN_MASK d30_c5_warn_inmask
 d30_case "30.25 C5 有人往 inet mwan3 塞外来链 -> warn / MWAN3_TABLE_FOREIGN_CHAIN" warn MWAN3_TABLE_FOREIGN_CHAIN d30_c5_warn_foreign
 d30_case "30.26 C5 继承 C3 的 conflict（同一故障不重复计数）" conflict - d30_c5_conflict_inherit
+d30_case "30.39 C5 mwan3 自有子链（iface_in_*/iface_out_*/policy_*/dynamic/mwan3_hook）不算外来链 -> ok" ok - d30_c5_mwan3_own_subchains
 
 # ---------------- C6：共存白名单 ----------------
 cat > "$D30/c6/bin/tailscale" <<'D30_TS'
@@ -7039,8 +7120,44 @@ table inet evil {
 	}
 }
 D31_R2
+# fix38 生产形态：inet mwan3（iface_in 线路打标 + mwan3_or_ct_* 的 ct mark 同步）
+# 再叠一份 ip mwan3（Kwrt 兼容层/iptables-nft 残留；旧判据把它整表当 legacy 第三方）。
+cat > "$D31/rules-mwan3-real" <<'D31_R3'
+table inet mwan3 {
+	chain mwan3_prerouting {
+		meta mark set meta mark & 0xffffc1ff # handle 1
+	}
+	chain mwan3_iface_in_wan1 {
+		iifname "pppoe-wan1" meta nfproto ipv4 meta mark & 0x00003f00 == 0x00000000 meta mark set meta mark & 0xffffc1ff | 0x00000100 # handle 10
+	}
+	chain mwan3_or_ct_0x100 {
+		ct mark set ct mark & 0xffffc1ff | 0x00000100 # handle 20
+	}
+	chain mwan3_or_meta_0x100 {
+		meta mark set meta mark | 0x00000100 # handle 21
+	}
+}
+table ip mwan3 {
+	chain mwan3_iface_in_wan1 {
+		meta mark set meta mark & 0xffffc1ff | 0x00000100 # handle 30
+	}
+	chain mwan3_or_ct_0x100 {
+		ct mark set ct mark & 0xffffc1ff | 0x00000100 # handle 31
+	}
+}
+D31_R3
+# 真第三方：表名不是 mwan3，直接 ct mark set 0x100（OAF 的默认 ct mark 形态）。
+cat "$D31/rules-mwan3-real" > "$D31/rules-real-third"
+cat >> "$D31/rules-real-third" <<'D31_R4'
+table inet evil {
+	chain prerouting {
+		ct mark set 0x00000100 # handle 40
+	}
+}
+D31_R4
 
 E31_OFFLOAD=0
+E31_IPRULE=""
 e31_run() { # <out> <rules> <args...>
 	_o=$1
 	_r=$2
@@ -7050,11 +7167,12 @@ e31_run() { # <out> <rules> <args...>
 		E2E_RULES=$_r
 		E2E_MASK=0x3F00
 		E2E_OFFLOAD=${E31_OFFLOAD:-0}
+		E2E_IPRULE=${E31_IPRULE:-}
 		DNSMASQ_CONF_GLOB="$D31/none/dnsmasq.conf.*"
 		ISP_SPLIT_BASE=$D31/base
 		ISP_SPLIT_CONF=$D31/conf
 		ISP_SPLIT_LIB=$ROOT/files/usr/lib/isp-split
-		export PATH E2E_RULES E2E_MASK E2E_OFFLOAD DNSMASQ_CONF_GLOB \
+		export PATH E2E_RULES E2E_MASK E2E_OFFLOAD E2E_IPRULE DNSMASQ_CONF_GLOB \
 			ISP_SPLIT_BASE ISP_SPLIT_CONF ISP_SPLIT_LIB
 		sh "$ROOT/files/usr/sbin/isp-split" doctor "$@"
 	) >"$_o" 2>"$_o.err"
@@ -7224,6 +7342,58 @@ if [ "$_rc" != 0 ] && grep -q '未知参数' "$D31/typo.log" && ! grep -q '^== �
 else
 	ng "31.8 未知参数处理异常（rc=$_rc）"
 fi
+
+# 31.9 fix38：真实 mwan3-nft 3.6.12 形态（iface_in 线路打标 + mwan3_or_ct_* 的
+# ct mark 同步 + ip/ip6 同名表 + 2001/2002/3001/3002 rule 集）不得报 conflict。
+# 旧判据把 ip mwan3 整表当 legacy、把 ct mark set ...|0x100 当"OAF 类 DPI"，
+# 生产直接被 Step0 硬门禁挡住。
+E31_OFFLOAD=0
+E31_IPRULE="2001:	from all fwmark 0x100/0x3f00 lookup 1
+2002:	from all fwmark 0x200/0x3f00 lookup 2
+3001:	from all fwmark 0x100/0x3f00 unreachable
+3002:	from all fwmark 0x200/0x3f00 unreachable"
+e31_run "$D31/mwan3-real.json" "$D31/rules-mwan3-real" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/mwan3-real.json" 6 -)
+[ "$_rc" = 0 ] || _bad="$_bad rc=$_rc(期望0)"
+grep -q '"conflict":0' "$D31/mwan3-real.json" || _bad="$_bad 干净夹具却报conflict"
+grep -q 'CTMARK_COLLISION' "$D31/mwan3-real.json" && _bad="$_bad 仍报CTMARK_COLLISION"
+_c3v=$(sed -n 's/.*"id":"mark_segment","title":"[^"]*","verdict":"\([^"]*\)".*/\1/p' "$D31/mwan3-real.json")
+[ "$_c3v" = "ok" ] || _bad="$_bad C3=$_c3v(期望ok)"
+grep -q '"excluded_count":6' "$D31/mwan3-real.json" || _bad="$_bad 排除计数不对"
+# 开发机没有 /lib/mwan3/mwan3.sh，can_wire 本来就会因 MWAN3_NOT_INSTALLED=false；
+# 这里只断言"不再因为 C3 误报而加 CHECK_CONFLICT"。
+case "$(cat "$D31/mwan3-real.json")" in
+*CHECK_CONFLICT*) _bad="$_bad 门禁仍因误报阻断" ;;
+esac
+if [ -z "$_bad" ]; then
+	ok "31.9 fix38 对照（mwan3 自家）：C3=ok、无 CTMARK_COLLISION、rc=0、门禁无 CHECK_CONFLICT（ip/ip6 表也按 mwan3 归属排除）"
+else
+	ng "31.9 mwan3 自家规则仍误报:$_bad"
+	sed 's/^/    /' "$D31/mwan3-real.json" | cut -c1-500 | head -2
+fi
+
+# 31.10 同一环境下加一条真第三方 ct mark set 0x100（表名 evil）：必须继续 conflict，
+# 且产品名只能是"值签名"低置信度 hint，不能断言 OAF。
+E31_IPRULE="2001:	from all fwmark 0x100/0x3f00 lookup 1
+2002:	from all fwmark 0x200/0x3f00 lookup 2
+3001:	from all fwmark 0x100/0x3f00 unreachable
+3002:	from all fwmark 0x200/0x3f00 unreachable"
+e31_run "$D31/real-third.json" "$D31/rules-real-third" --json
+_rc=$?
+_bad=$(e31_json_ok "$D31/real-third.json" 6 conflict)
+[ "$_rc" = 2 ] || _bad="$_bad rc=$_rc(期望2)"
+grep -q 'CTMARK_COLLISION' "$D31/real-third.json" || _bad="$_bad 缺CTMARK_COLLISION"
+grep -q '"can_wire":false' "$D31/real-third.json" || _bad="$_bad 门禁未阻断"
+grep -q '"hint_confidence":"low"' "$D31/real-third.json" || _bad="$_bad hint未标低置信度"
+grep -q '"hint_basis":"value_signature"' "$D31/real-third.json" || _bad="$_bad hint依据不是值签名"
+if [ -z "$_bad" ]; then
+	ok "31.10 fix38 对照（真第三方）：CTMARK_COLLISION、rc=2、门禁阻断、产品名仅低置信度 hint"
+else
+	ng "31.10 真第三方漏报/证据不足:$_bad"
+	sed 's/^/    /' "$D31/real-third.json" | cut -c1-500 | head -2
+fi
+E31_IPRULE=""
 
 echo "== 32. 打包链与锁纪律（doctor.sh 随包发货 / bootstrap 持锁 / 判据单一来源）"
 ISP=$ROOT/files/usr/sbin/isp-split

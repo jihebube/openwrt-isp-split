@@ -234,7 +234,13 @@ doc_mwan3_is_nft() {
 
 doc_mwan3_table() {
 	_doc_have nft || return 1
-	nft list table inet mwan3 >/dev/null 2>&1
+	nft list table inet mwan3 >/dev/null 2>&1 && return 0
+	# 3.6 的 nft 端口用 inet；个别固件（Kwrt 兼容层 / iptables-nft 残留）会同时
+	# 留 ip、ip6 同名表。判据是"表在不在"，不能被 family 写死：只认 inet 会让
+	# ip mwan3 里的 mwan3 自家规则整表落到 legacy 分支（fix38 的误报根因之一）。
+	nft list table ip mwan3 >/dev/null 2>&1 && return 0
+	nft list table ip6 mwan3 >/dev/null 2>&1 && return 0
+	return 1
 }
 
 # 版本（P10）：opkg 与 apk 双分支；两者都没有 -> 空（不判"漂移"，判 unknown）
@@ -596,7 +602,10 @@ doc_p4_writers() {
 			if (p == 0) next
 			field = "mark"
 			if (index(line, "ct mark set") > 0) {
-				field = "ctmark"; p = index(line, "ct mark set") + 13
+				# "ct mark set" 是 11 字符 + 1 个空格 -> 值的起点是 index+12。
+				# 旧实现写的 +13 会吃掉值的首字符：`ct mark set 0x100` 被读成
+				# "x100" -> form=other -> ct 写者整条漏掉（fix38 顺带修的解析 bug）。
+				field = "ctmark"; p = index(line, "ct mark set") + 12
 			} else if (index(line, "meta mark set") > 0) {
 				p = index(line, "meta mark set") + 14
 			} else {
@@ -627,9 +636,18 @@ doc_p4_writers() {
 					form = "mask_clear"
 				}
 			} else {
-				split(rest, C, " ")
-				value = C[1]
-				form = "set"
+				# `meta mark set meta mark | 0x100`（OR 立即数）：nft 打印的是
+				# `|`，不是 "or"，旧实现只认 & 分支会把它读成 other -> 漏掉。
+				if (index(rest, "|") > 0) {
+					q2 = index(rest, "|")
+					split(trim(substr(rest, q2 + 1)), C, " ")
+					value = C[1]
+					form = "or"
+				} else {
+					split(rest, C, " ")
+					value = C[1]
+					form = "set"
+				}
 			}
 			if (value != "-" && value != "" && substr(value, 1, 2) != "0x") {
 				form = "other"; value = "-"; mask = "-"
@@ -640,26 +658,40 @@ doc_p4_writers() {
 	DOC_W_ROWS=$(printf '%s\n' "$DOC_W" | _doc_cnt)
 }
 
-# 归属（检查五 5.2 的顺序，写死）：① inet mwan3 + mwan3* 链 -> mwan3；
-# ② 同一张表里 comment 含 isp-split -> isp-split；③ 非 inet 表 -> legacy；
-# ④ 其余 -> third_party。顺序即优先级。
+# 归属（检查三/五共用，顺序即优先级）：
+#   ① 表名是 mwan3（任意 family：inet/ip/ip6 都算）-> 整张表连同全部子链都是
+#      mwan3 自己的（iface_in_*、policy_*、mwan3_hook、dynamic、mwan3_or_ct_* 等）；
+#   ② 表名是 isp-split 自己的表（isptest / isp_split*）-> isp-split；
+#   ③ 任何表里链名是 mwan3* / iface_in_* / iface_out_* -> mwan3（表名被改过时兜底）；
+#   ④ comment 含 isp-split -> isp-split；⑤ 非 inet 表 -> legacy（iptables-nft 残留）；
+#   ⑥ 其余 -> third_party。
+#
+# 红线（fix38）：只看"表/链是谁的"，不看 mark 的值。mwan3 的线路值
+# （0x100/0x200/...，掩码 mmx_mask）与 OAF 的默认 ct mark 0x100 完全撞值，
+# 值签名永远不能当归属判据——否则 mwan3 自己的线路打标会被判成第三方 DPI。
 _doc_owner_of() { # fam tab chain comment
+	case "$2" in
+	mwan3 | mwan3_* | mwan3-*) printf 'mwan3'; return 0 ;;
+	isp_split | isp_split_* | isp-split | isp-split_* | isptest) printf 'isp-split'; return 0 ;;
+	esac
+	case "$3" in
+	mwan3* | iface_in_* | iface_out_*) printf 'mwan3'; return 0 ;;
+	esac
+	case "${4:-}" in
+	*isp-split*) printf 'isp-split'; return 0 ;;
+	esac
 	case "$1" in
-	inet)
-		if [ "$2" = "mwan3" ]; then
-			case "$3" in
-			mwan3* | "") printf 'mwan3' ;;
-			*) printf 'isp-split' ;;
-			esac
-			return 0
-		fi
-		case "${4:-}" in
-		*isp-split*) printf 'isp-split' ;;
-		*) printf 'third_party' ;;
-		esac
-		;;
+	inet) printf 'third_party' ;;
 	*) printf 'legacy' ;;
 	esac
+}
+
+# 值是否整个落在 mmx_mask 位段内（mwan3 线路 mark 家族：0x100/0x200/... 或掩码本身）。
+# 只用于"这条写者是不是线路打标形态"的说明与 hint，绝不参与归属判定。
+_doc_val_in_mask() { # 0x..
+	_doc_hx "${1:-}"
+	[ "$HEX" -ne 0 ] || return 1
+	[ "$(( HEX & DOC_MMX_MASK_DEC ))" -eq "$HEX" ]
 }
 
 # 产品指纹（只用于文案，不作判据）
@@ -672,6 +704,19 @@ _doc_guess_product() { # fam tab chain
 	*mihomo* | *Mihomo* | *Meta*) printf 'mihomo' ;;
 	*sing* | *SING*) printf 'sing-box' ;;
 	*) printf '' ;;
+	esac
+}
+
+# 产品名的展示写法（hint 用；不改变判据）
+_doc_product_label() {
+	case "$1" in
+	oaf) printf 'OAF' ;;
+	openclash) printf 'OpenClash' ;;
+	passwall) printf 'PassWall' ;;
+	tailscale) printf 'Tailscale' ;;
+	mihomo) printf 'mihomo' ;;
+	sing-box) printf 'sing-box' ;;
+	*) printf '%s' "${1:-}" ;;
 	esac
 }
 
@@ -1227,12 +1272,21 @@ doc_check_mark() {
 	fi
 
 	_c3_writers=""
+	_c3_writers_n=0
+	_c3_excluded=""
+	_c3_excl_n=0
+	_c3_excl_mw=0
+	_c3_excl_own=0
 	_c3_wn=0
 	_c3_third=0
 	_c3_overlap=0
 	_c3_overlap_ordered=0
 	_c3_overlap_unordered=0
 	_c3_ct=0
+	_c3_ct_names=""
+	_c3_hint=""
+	_c3_hint_conf="none"
+	_c3_hint_basis="none"
 	_c3_outside=""
 	_c3_outside_n=0
 	# 第三方重叠写者的明细，供检查五继承
@@ -1245,6 +1299,11 @@ doc_check_mark() {
 		_w_cleared=0
 		case "$_w_form" in
 		set)
+			_doc_hx "$_w_val"
+			_w_owned=$(( HEX & _M ))
+			;;
+		or)
+			# `mark | imm`：只置位、不清位（mask 缺省 = 没有清掉任何位）
 			_doc_hx "$_w_val"
 			_w_owned=$(( HEX & _M ))
 			;;
@@ -1263,12 +1322,27 @@ doc_check_mark() {
 		esac
 		_w_touched=$(( _w_cleared | _w_owned ))
 		_w_prod=$(_doc_guess_product "$_w_fam" "$_w_tab" "$_w_chn")
-		if [ "$_c3_wn" -le 40 ]; then
-		_c3_writers="${_c3_writers}${_c3_writers:+,}{\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")"),\"owner\":$(_doc_jstr "$_w_owner")}"
-		fi
 		case "$_w_owner" in
-		third_party | legacy)
+		mwan3 | isp-split)
+			# 排除清单（fix38）：mwan3 自家表/链（iface_in_*、policy_*、mwan3_hook、
+			# dynamic、mwan3_or_ct_* 等，任意 family）与 isp-split 自家表里的写者，
+			# 都不是第三方。它们写的正是 mmx_mask 位段内的线路值——值签名不能
+			# 反过来当"第三方 DPI"的证据。
+			_c3_excl_n=$((_c3_excl_n + 1))
+			case "$_w_owner" in
+			mwan3) _c3_excl_mw=$((_c3_excl_mw + 1)) ;;
+			*) _c3_excl_own=$((_c3_excl_own + 1)) ;;
+			esac
+			if [ "$_c3_excl_n" -le 40 ]; then
+				_c3_excluded="${_c3_excluded}${_c3_excluded:+,}{\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")"),\"owner\":$(_doc_jstr "$_w_owner"),\"reason\":$(_doc_jstr "$([ "$_w_owner" = "mwan3" ] && printf 'mwan3_own_table' || printf 'isp_split_own')")}"
+			fi
+			;;
+		*)
 			_c3_third=$((_c3_third + 1))
+			if [ "$_c3_writers_n" -lt 40 ]; then
+				_c3_writers_n=$((_c3_writers_n + 1))
+				_c3_writers="${_c3_writers}${_c3_writers:+,}{\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")"),\"owner\":$(_doc_jstr "$_w_owner"),\"product_guess\":$(_doc_jstr "$_w_prod")}"
+			fi
 			if [ "$(( _w_touched & _M ))" -ne 0 ]; then
 				_c3_overlap=$((_c3_overlap + 1))
 				DOC_C3_OVERLAP_NAMES="${DOC_C3_OVERLAP_NAMES}${DOC_C3_OVERLAP_NAMES:+ }${_w_prod:-third_party}"
@@ -1292,11 +1366,29 @@ EOF
 				else
 					_c3_overlap_unordered=$((_c3_overlap_unordered + 1))
 				fi
+				if [ "$_w_fld" = "ctmark" ]; then
+					_c3_ct=$((_c3_ct + 1))
+					[ "$_c3_ct" -le 3 ] &&
+						_c3_ct_names="${_c3_ct_names}${_c3_ct_names:+, }${_w_fam} ${_w_tab} ${_w_chn}(${_w_val})"
+					# 产品名只是 hint：名字级证据 > 值签名（低置信度）> 未识别。
+					if [ "$_c3_hint_conf" != "high" ]; then
+						if [ -n "$_w_prod" ]; then
+							_c3_hint=$_w_prod
+							_c3_hint_conf=high
+							_c3_hint_basis=name
+						elif _doc_val_in_mask "$_w_val" && [ "$HEX" = "256" ]; then
+							# 0x100 既可能是 OAF 的默认 ct mark，也是 mwan3 的 wan1
+							# 线路值：只作低置信度猜测，绝不参与 verdict。
+							_c3_hint=oaf
+							_c3_hint_conf=low
+							_c3_hint_basis=value_signature
+						fi
+					fi
+				fi
 			else
 				_c3_outside="${_c3_outside}${_c3_outside:+,}{\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"product\":$(_doc_jstr "${_w_prod:-third_party}"),\"value\":$(_doc_jstr "$_w_val")}"
 				_c3_outside_n=$((_c3_outside_n + 1))
 			fi
-			[ "$_w_fld" = "ctmark" ] && [ "$(( _w_touched & _M ))" -ne 0 ] && _c3_ct=$((_c3_ct + 1))
 			;;
 		esac
 	done <<EOF
@@ -1307,6 +1399,10 @@ EOF
 	_c3_readers=""
 	_c3_starved=""
 	_c3_starved_n=0
+	# mwan3 线路 rule 家族（fwmark <线值>/<mmx_mask>）：这是 mwan3 自己的读者，
+	# 0x100/0x200/... 与 OAF 默认 mark 撞值也不改变归属（只做事实登记）。
+	_c3_line_n=0
+	_c3_line_vals=""
 	while IFS="	" read -r _r_pref _r_val _r_mask _r_lk _r_iif _r_sup _r_not; do
 		[ -n "${_r_pref:-}" ] || continue
 		[ "$_r_val" = "-" ] && continue
@@ -1315,6 +1411,11 @@ EOF
 		_r_v=$HEX
 		_doc_hx "$_r_mask"
 		_r_m=$HEX
+		if [ "$_r_m" -eq "$_M" ] && [ "$_r_v" -ne 0 ]; then
+			_c3_line_n=$((_c3_line_n + 1))
+			[ "$_c3_line_n" -le 8 ] &&
+				_c3_line_vals="${_c3_line_vals}${_c3_line_vals:+,}$(_doc_jstr "$_r_val")"
+		fi
 		# 精确匹配（无掩码）且值的位段内有 mwan3 的位 -> mwan3 清位后这条规则失配
 		if [ "$_r_m" -ne "$_M" ] && [ "$(( _r_v & _M ))" -ne 0 ]; then
 			_c3_starved="${_c3_starved}${_c3_starved:+,}{\"where\":\"ip rule\",\"pref\":$(_doc_jstr "$_r_pref"),\"value\":$(_doc_jstr "$_r_val"),\"lookup\":$(_doc_jstr "$_r_lk")}"
@@ -1346,7 +1447,11 @@ EOF
 		_c3_route="null"
 	fi
 
-	DOC_C3_FACTS="\"mmx_mask\":$(_doc_jstr "$DOC_MMX_MASK"),\"mmx_mask_source\":$(_doc_jstr "$DOC_MMX_SOURCE"),\"writers\":[$_c3_writers],\"readers\":[$_c3_readers],\"mwan3_min_pref\":$DOC_MINPREF,\"third_party_outside_mask\":[$_c3_outside],\"reader_starved\":[$_c3_starved],\"route_get_mark\":$_c3_route"
+	_c3_collision="null"
+	if [ "$_c3_ct" -gt 0 ]; then
+		_c3_collision="{\"kind\":\"ctmark\",\"count\":$_c3_ct,\"writers\":[$(_doc_jstr "$_c3_ct_names")],\"hint\":$(_doc_jstr "$_c3_hint"),\"hint_confidence\":$(_doc_jstr "$_c3_hint_conf"),\"hint_basis\":$(_doc_jstr "$_c3_hint_basis")}"
+	fi
+	DOC_C3_FACTS="\"mmx_mask\":$(_doc_jstr "$DOC_MMX_MASK"),\"mmx_mask_source\":$(_doc_jstr "$DOC_MMX_SOURCE"),\"writer_total\":$_c3_wn,\"writers\":[$_c3_writers],\"excluded_count\":$_c3_excl_n,\"excluded\":{\"mwan3\":$_c3_excl_mw,\"isp_split\":$_c3_excl_own},\"excluded_writers\":[$_c3_excluded],\"line_mark_rules\":{\"owner\":\"mwan3\",\"mask\":$(_doc_jstr "$DOC_MMX_MASK"),\"count\":$_c3_line_n,\"values\":[$_c3_line_vals]},\"readers\":[$_c3_readers],\"mwan3_min_pref\":$DOC_MINPREF,\"third_party_outside_mask\":[$_c3_outside],\"reader_starved\":[$_c3_starved],\"collision\":$_c3_collision,\"route_get_mark\":$_c3_route"
 
 	_c3_find=""
 	_doc_find3() {
@@ -1355,14 +1460,19 @@ EOF
 
 	if [ "$DOC_P4B" != "1" ]; then
 		DOC_C3_VERDICT=unknown
-		_doc_find3 "" unknown "没有 table inet mwan3（mwan3-nft 未运行），无法判定位段占用" "P4b"
+		_doc_find3 "" unknown "没有 mwan3 的 nft 表（inet/ip/ip6 都不存在，mwan3-nft 未运行），无法判定位段占用" "P4b"
 		DOC_C3_ADVICE="先确认 mwan3（nft 版）在跑；只看 /etc/config/mwan3 无法判断运行态。"
 	elif [ "$_c3_wn" -eq 0 ]; then
 		DOC_C3_VERDICT=ok
 		_doc_find3 "" ok "规则表里没有任何 mark 写者" "P4"
 	elif [ "$_c3_ct" -gt 0 ]; then
 		DOC_C3_VERDICT=conflict
-		_doc_find3 "CTMARK_COLLISION" conflict "有程序在写 ct mark 的位段（OAF 类 DPI），改道语义会串" "P4 ct mark set"
+		case "$_c3_hint_basis" in
+		name) _c3_hint_txt="疑似 $(_doc_product_label "$_c3_hint")（表名/链名匹配，置信度高）" ;;
+		value_signature) _c3_hint_txt="疑似 $(_doc_product_label "$_c3_hint")（ct mark 0x100 与 mwan3 的 wan1 线路值撞值；仅值签名，置信度低，不作判据）" ;;
+		*) _c3_hint_txt="产品未识别（不建议按名字臆断）" ;;
+		esac
+		_doc_find3 "CTMARK_COLLISION" conflict "有第三方程序改写了 ct mark 中与 mmx_mask($DOC_MMX_MASK) 重叠的位：$_c3_ct_names；$_c3_hint_txt" "P4 ct mark set（已排除 mwan3/isp-split 自家写者 $_c3_excl_n 条）"
 	elif [ "$_c3_overlap_unordered" -gt 0 ]; then
 		DOC_C3_VERDICT=conflict
 		_doc_find3 "MARK_OVERLAP_UNORDERED" conflict "有 $_c3_overlap_unordered 个第三方写者落在 mmx_mask 位段内，且没有排在 mwan3 之前的 rule" "P4 + P5"
@@ -1374,7 +1484,7 @@ EOF
 		_doc_find3 "MARK_OUTSIDE" ok "第三方 mark 写者共 $_c3_outside_n 个，全部落在 mmx_mask 之外" "P4"
 	else
 		DOC_C3_VERDICT=ok
-		_doc_find3 "" ok "标记位段只有 mwan3 自己在用" "P4"
+		_doc_find3 "" ok "标记位段只有 mwan3/isp-split 自己在用（$_c3_excl_n 条自家写者已按归属排除，第三方 0 条）" "P4"
 	fi
 	if [ "$_c3_starved_n" -gt 0 ]; then
 		[ "$DOC_C3_VERDICT" = "ok" ] && DOC_C3_VERDICT=warn
@@ -1384,9 +1494,15 @@ EOF
 		_doc_find3 "MMX_MASK_CUSTOM" ok "mmx_mask=$(printf '%s' "$DOC_MMX_MASK") 不是默认 0x3F00，本报告的阈值已按它现算" "P11"
 
 	case "$DOC_C3_VERDICT" in
-	ok) DOC_C3_ADVICE="路由标记位段只有 mwan3 在用（或第三方全部在位段之外），分流选路正常。" ;;
+	ok) DOC_C3_ADVICE="标记位段只有 mwan3/isp-split 自己（或位段之外的第三方）在用，分流选路正常。" ;;
 	warn) DOC_C3_ADVICE="无需改动即可用；若要彻底消除歧义，把代理的 fwmark 移到 mmx_mask 之外（如 0x80000 段）。" ;;
-	conflict) DOC_C3_ADVICE="检测到有程序直接改写与 mwan3 相同的标记位，分流可能选错线；建议把它的标记值改到位段之外，或把它排到 mwan3 之后。" ;;
+	conflict)
+		if [ "$_c3_ct" -gt 0 ]; then
+			DOC_C3_ADVICE="检测到第三方程序改写了 mwan3 用的 ct mark 位段（mmx_mask）；分流可能选错线。先把它的 mark 值移到位段之外，或让它排在 mwan3 之后；产品名只是提示，别按名字下结论。"
+		else
+			DOC_C3_ADVICE="检测到第三方程序改写了与 mwan3 相同的标记位，分流可能选错线；建议把它的标记值改到位段之外，或把它排到 mwan3 之后。"
+		fi
+		;;
 	unknown) DOC_C3_ADVICE="没能读取当前 nft 规则，无法判断标记位是否被占用。" ;;
 	esac
 	DOC_C3_FIND="$_c3_find"
@@ -1472,7 +1588,13 @@ doc_check_writers() {
 	_c5_out=0
 	_c5_legacy=0
 	_c5_third_inmask=0
+	# 清单分两段：第三方/legacy 最多 40 条（决策相关，优先展示），
+	# mwan3/isp-split 自家写者最多 10 条（生产上 mwan3_or_* 有上百条，
+	# 全列会把真正的第三方挤出清单）。
 	_c5_list=""
+	_c5_list_n=0
+	_c5_list_mw=""
+	_c5_list_mw_n=0
 	while IFS="	" read -r _w_fam _w_tab _w_chn _w_hnd _w_fld _w_form _w_msk _w_val _w_cm; do
 		[ -n "${_w_fam:-}" ] || continue
 		_c5_total=$((_c5_total + 1))
@@ -1481,6 +1603,10 @@ doc_check_writers() {
 		_w_cleared=0
 		case "$_w_form" in
 		set)
+			_doc_hx "$_w_val"
+			_w_owned=$(( HEX & DOC_MMX_MASK_DEC ))
+			;;
+		or)
 			_doc_hx "$_w_val"
 			_w_owned=$(( HEX & DOC_MMX_MASK_DEC ))
 			;;
@@ -1511,15 +1637,28 @@ doc_check_writers() {
 		else
 			_c5_out=$((_c5_out + 1))
 		fi
-		# JSON 体积上限：清单只列前 40 条（真实机器上写者通常 < 10）
-		if [ "$_c5_total" -le 40 ]; then
-			_c5_list="${_c5_list}${_c5_list:+,}{\"owner\":$(_doc_jstr "$_w_owner"),\"product_guess\":$(_doc_jstr "$_w_prod"),\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")")}"
-		fi
+		# JSON 体积上限 + 优先级：第三方最多 40 条，自家写者最多 10 条
+		case "$_w_owner" in
+		mwan3 | isp-split)
+			if [ "$_c5_list_mw_n" -lt 10 ]; then
+				_c5_list_mw_n=$((_c5_list_mw_n + 1))
+				_c5_list_mw="${_c5_list_mw}${_c5_list_mw:+,}{\"owner\":$(_doc_jstr "$_w_owner"),\"product_guess\":$(_doc_jstr "$_w_prod"),\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")")}"
+			fi
+			;;
+		*)
+			if [ "$_c5_list_n" -lt 40 ]; then
+				_c5_list_n=$((_c5_list_n + 1))
+				_c5_list="${_c5_list}${_c5_list:+,}{\"owner\":$(_doc_jstr "$_w_owner"),\"product_guess\":$(_doc_jstr "$_w_prod"),\"fam\":$(_doc_jstr "$_w_fam"),\"table\":$(_doc_jstr "$_w_tab"),\"chain\":$(_doc_jstr "$_w_chn"),\"handle\":$(_doc_jstr "$_w_hnd"),\"field\":$(_doc_jstr "$_w_fld"),\"form\":$(_doc_jstr "$_w_form"),\"mask\":$(_doc_jstr "$([ "$_w_msk" = "-" ] && printf '' || printf '%s' "$_w_msk")"),\"value\":$(_doc_jstr "$([ "$_w_val" = "-" ] && printf '' || printf '%s' "$_w_val")"),\"touched\":$(_doc_jstr "$(_doc_hxstr "$_w_touched")")}"
+			fi
+			;;
+		esac
 	done <<EOF
 ${DOC_W:-}
 EOF
 
-	# inet mwan3 里的外来链（有人往 mwan3 表里塞规则）
+	# mwan3 表里的外来链（有人往 mwan3 表里塞规则）。
+	# 3.6 的自有链名并不都是 mwan3* 前缀（iface_in_*、policy_*、dynamic、mwan3_hook），
+	# 只认 mwan3* 会把 mwan3 自己的子链当成"外来"（fix38 同一类误判）。
 	_c5_foreign=""
 	_c5_foreign_n=0
 	if [ -n "${DOC_P4:-}" ]; then
@@ -1529,7 +1668,11 @@ EOF
 			_c5_foreign_n=$((_c5_foreign_n + 1))
 		done <<EOF
 $(printf '%s\n' "$DOC_P4" | awk '
-	/^[ \t]*table / { intab = ($2 == "inet" && $3 == "mwan3"); next }
+	/^[ \t]*table / {
+		intab = (($2 == "inet" || $2 == "ip" || $2 == "ip6") &&
+		         ($3 == "mwan3" || $3 ~ /^mwan3[_-]/))
+		next
+	}
 	{
 		if (!intab) next
 		tl = $0
@@ -1537,13 +1680,16 @@ $(printf '%s\n' "$DOC_P4" | awk '
 		if (index(tl, "chain ") != 1) next
 		n = split(tl, A, " ")
 		c = A[2]
-		if (c ~ /^mwan3/) next
+		if (c ~ /^mwan3/ || c ~ /^iface_(in|out)_/ || c ~ /^policy_/ || c ~ /^dynamic/ || c == "mwan3_hook") next
 		print c
 	}')
 EOF
 	fi
 
-	DOC_C5_FACTS="\"counts\":{\"total\":$_c5_total,\"mwan3\":$_c5_mw,\"isp_split\":$_c5_own,\"third_party\":$_c5_third,\"legacy\":$_c5_legacy,\"in_mask\":$_c5_inmask,\"third_party_in_mask\":$_c5_third_inmask,\"outside_mask\":$_c5_out},\"writers\":[$_c5_list],\"foreign_chains_in_mwan3\":[$_c5_foreign],\"legacy_writers\":$(_doc_jbool "$([ "$_c5_legacy" -gt 0 ] && printf 1 || printf 0)")"
+	_c5_writers_all="$_c5_list"
+	[ -n "$_c5_list_mw" ] &&
+		_c5_writers_all="${_c5_writers_all}${_c5_writers_all:+,}${_c5_list_mw}"
+	DOC_C5_FACTS="\"counts\":{\"total\":$_c5_total,\"mwan3\":$_c5_mw,\"isp_split\":$_c5_own,\"third_party\":$_c5_third,\"legacy\":$_c5_legacy,\"in_mask\":$_c5_inmask,\"third_party_in_mask\":$_c5_third_inmask,\"outside_mask\":$_c5_out},\"writers\":[$_c5_writers_all],\"foreign_chains_in_mwan3\":[$_c5_foreign],\"legacy_writers\":$(_doc_jbool "$([ "$_c5_legacy" -gt 0 ] && printf 1 || printf 0)")"
 
 	_c5_find=""
 	_doc_find5() {
@@ -1554,10 +1700,10 @@ EOF
 		_c5_verdict=conflict
 	elif [ "$_c5_foreign_n" -gt 0 ]; then
 		_c5_verdict=warn
-		_doc_find5 "MWAN3_TABLE_FOREIGN_CHAIN" warn "inet mwan3 表里有非 mwan3* 的链：$_c5_foreign" "P4"
+		_doc_find5 "MWAN3_TABLE_FOREIGN_CHAIN" warn "mwan3 表里有不属于 mwan3 的链（已排除 mwan3*/iface_in_*/iface_out_*/policy_*/dynamic 等自有链名）：$_c5_foreign" "P4"
 	elif [ "$_c5_legacy" -gt 0 ]; then
 		_c5_verdict=warn
-		_doc_find5 "LEGACY_MARK_WRITER" warn "非 inet 表里有 mark 写者（iptables-nft 残留），清单里已列出" "P4 fam=ip/ip6"
+		_doc_find5 "LEGACY_MARK_WRITER" warn "非 mwan3 的 ip/ip6 表里有 mark 写者（iptables-nft 残留），清单里已列出" "P4 fam=ip/ip6"
 	elif [ "$_c5_third" -eq 0 ]; then
 		_c5_verdict=ok
 		_doc_find5 "" ok "规则表里没有第三方 mark 写者" "P4"

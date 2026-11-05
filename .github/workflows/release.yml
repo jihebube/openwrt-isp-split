@@ -239,9 +239,11 @@ jobs:
           # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
-            ## v0.4.0 体检更新
+            ## v0.4.1 体检修正
 
-            净机首装从"先去 MultiWAN 管理器手点三遍"变成一条命令；同时把"这台机器上的其它插件会不会让分流静默失效"做成可核对的六项体检。
+            doctor 的标记位段检查（C3）不再把 mwan3 自己的线路打标误判成第三方 DPI：生产 mwan3-nft 3.6 的 `mwan3_or_ct_*`（`ct mark set ... | 0x100`）和 `iface_in_*` 线路值会被按表/链归属排除，只有表/链不属于 mwan3、且写入位与 mmx_mask 重叠的第三方写者才报 conflict；产品名只作 hint 并标注置信度。
+
+            其余为 v0.4.0 的体检能力（首次安装仍按下面的安装段操作）：
 
             ### bootstrap（净机骨架，默认灰度）
 
@@ -272,7 +274,7 @@ jobs:
             ```sh
             wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
             mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-            sh /tmp/isp/isp-split-0.4.0/scripts/install.sh --all
+            sh /tmp/isp/isp-split-0.4.1/scripts/install.sh --all
             ```
 
             （busybox tar 不支持 --strip-components，进目录跑即可。）
