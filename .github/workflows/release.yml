@@ -110,6 +110,36 @@ jobs:
               ;;
           esac
 
+      # feed 分支的 apk 索引用 mkndx 生成，而 Ubuntu runner 没有 apk-tools。
+      # 25.12 job 的 SDK 里有现成的 apk 3.0.5，把真实二进制（wrapper 背后的
+      # .apk.bin，不依赖 SDK 的库路径）作为产物传给 feed job，避免在 feed job
+      # 里再装一套工具链或手写 ADB 索引。
+      - name: 收集 apk-tools（feed 索引用，仅 25.12）
+        if: startsWith(matrix.branch, '25.12')
+        run: |
+          set -eu
+          [ -x "${APK_BIN:-}" ] || {
+            echo "::error::APK_BIN 未注入，无法收集 apk-tools"
+            exit 1
+          }
+          BIN_DIR=$(dirname "$APK_BIN")
+          if [ -f "$BIN_DIR/.apk.bin" ]; then
+            SRC="$BIN_DIR/.apk.bin"
+          else
+            SRC="$APK_BIN"
+          fi
+          mkdir -p apktool
+          cp "$SRC" apktool/apk
+          chmod +x apktool/apk
+          ./apktool/apk --version
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: startsWith(matrix.branch, '25.12')
+        with:
+          name: apk-tool
+          path: apktool/apk
+          if-no-files-found: error
+
       - name: 发货面断言（完整版 feature=1；未知格式显式失败）
         run: |
           set -eu
@@ -311,3 +341,54 @@ jobs:
             - 出口回显源换为境内服务（ip.3322.net / myip.ipip.net / ddns.oray.com），"出口 IP 未取到"不再是境外源不可达造成的冤案
             - 回显逐源记录 HTTP 码与错误，页面能区分"回显源不可达"与"真的没出网"
             - DNS 段按线路实测（从 DNS_TABLE 取对应运营商 DNS），不再测到本机 dnsmasq 热缓存；亚毫秒显示 `<1ms`，未测显示 `—`，两者不再混淆
+
+  # 收录路线图第一步：把本次 Release 的 6 个包做成标准 opkg/apk feed，
+  # 推到独立分支 feed（快照语义：每次只保留本次发布的包）。
+  # 不在 release job 里做：release 只负责发资产，feed 失败不应影响 Release 本身。
+  feed:
+    name: feed 分支
+    needs: [ release ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      - name: 汇总 6 个包并生成 feed
+        run: |
+          set -eu
+          mkdir -p pkgs
+          find artifacts -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp -v {} pkgs/ \;
+          n=$(find pkgs -maxdepth 1 -type f | wc -l)
+          echo "包数量: $n"
+          [ "$n" -eq 6 ] || {
+            echo "::error::期望 6 个包（ipk×4 + apk×2），实际 $n"
+            ls -l pkgs
+            exit 1
+          }
+          APK_TOOL=artifacts/apk-tool/apk
+          [ -f "$APK_TOOL" ] || { echo "::error::缺少 apk-tool 产物"; exit 1; }
+          chmod +x "$APK_TOOL"
+          "$APK_TOOL" --version
+          sh scripts/build-feed.sh --src pkgs --out "$RUNNER_TEMP/feed" --apk-bin "$APK_TOOL"
+
+      - name: 发布到 feed 分支
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 孤立分支做快照：feed 不背 main 的历史，也不会把 feed/op-packages
+          # （Kwrt 打包壳）混进来。--force 覆盖上一次快照。
+          git checkout --orphan feed-publish
+          git rm -rf .
+          # artifacts/ 与 pkgs/ 是未跟踪目录，git rm 不会清；不删会被 git add -A
+          # 一起带进 feed 分支（几 MB 的重复产物 + apk-tool）。
+          rm -rf artifacts pkgs
+          cp -a "$RUNNER_TEMP/feed/." .
+          git add -A
+          git commit -m "feed: ${GITHUB_REF_NAME} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push --force origin HEAD:feed

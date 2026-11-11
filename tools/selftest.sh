@@ -5724,19 +5724,25 @@ if awk '/uses:/ && $0 !~ /@[0-9a-f]{40}/ { bad=1 } END { exit(bad ? 1 : 0) }' \
 	"$ROOT/.github/workflows/release.yml"; then :; else
 	_a26_a12_bad="$_a26_a12_bad action-SHA"
 fi
-[ "$(grep -v '^[[:space:]]*#' "$ROOT/.github/workflows/release.yml" | grep -c 'contents: write')" = "1" ] ||
+# FIX41：feed job 需要 push feed 分支，故合法写权限有两处（release / feed）。
+# 仍然禁止 build/source/version 提前拿写权限（下面的 early-write 断言）。
+[ "$(grep -v '^[[:space:]]*#' "$ROOT/.github/workflows/release.yml" | grep -c 'contents: write')" = "2" ] ||
 	_a26_a12_bad="$_a26_a12_bad write-count"
 [ "$(grep -v '^[[:space:]]*#' "$ROOT/.github/workflows/release.yml" | grep -c 'contents: read')" = "1" ] ||
 	_a26_a12_bad="$_a26_a12_bad read-count"
 awk '/^  release:/{f=1} f && /contents: write/{found=1} END { exit(found ? 0 : 1) }' \
 	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad release-write"
+awk '/^  feed:/{f=1} f && /contents: write/{found=1} END { exit(found ? 0 : 1) }' \
+	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad feed-write"
+awk '/^  feed:/{f=1} f && /needs: \[ release \]/{found=1} END { exit(found ? 0 : 1) }' \
+	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad feed-needs"
 awk '/^  release:/{exit} /^[[:space:]]*#/{next} /contents: write/{early=1} END { exit(early ? 1 : 0) }' \
 	"$ROOT/.github/workflows/release.yml" || _a26_a12_bad="$_a26_a12_bad early-write"
 grep -q 'sha256sums' "$ROOT/scripts/build-apk.sh" &&
 	grep -q 'SDK sha256 校验失败' "$ROOT/scripts/build-apk.sh" ||
 	_a26_a12_bad="$_a26_a12_bad sdk-sha256"
 if [ -z "$_a26_a12_bad" ]; then
-	ok "A-12 action 全部 40 位 SHA、contents:write 只在 release job、SDK 有 sha256 校验"
+	ok "A-12 action 全部 40 位 SHA、contents:write 只在 release/feed job、SDK 有 sha256 校验"
 else
 	ng "A-12 CI/供应链加固缺项:$_a26_a12_bad"
 fi

@@ -43,23 +43,147 @@
 
 > 内存参考：4 个启用集合（约 2300 元素）占内核内存约 350 kB；x86_64 全量加载约 800 ms。建议 128 MB 以上内存设备使用；更低配设备请先 `isp-split selftest` 看加载耗时。
 
-## 快速开始
+## 安装
+
+四种入口，按推荐顺序。全都要求 **nftables 版 mwan3 ≥ 3.6**（自查与替代方案见上方「环境要求」）。
+
+### 1. 一键在线安装（推荐）
+
+SSH 登录路由器（root），一条命令：
 
 ```sh
-# 1. 安装（二选一）
-sh scripts/install.sh --all                       # 从源码目录安装
-apk add --allow-untrusted ./isp-split-*.apk       # 或安装 Release 中的 apk 包
+curl -fsSL https://raw.githubusercontent.com/jihebube/openwrt-isp-split/main/scripts/install-online.sh | sh
+```
 
-# 2. 首次安装：给 ISP_TABLE 的策略绑定 WAN 接口
+`raw.githubusercontent.com` 在国内常被阻断，换 jsDelivr 镜像（同一份脚本）：
+
+```sh
+curl -fsSL https://cdn.jsdelivr.net/gh/jihebube/openwrt-isp-split@main/scripts/install-online.sh | sh
+```
+
+没有 `curl` 时把 `curl -fsSL` 换成 `wget -qO-`；也可以先下载再执行（便于先读一遍脚本）：
+
+```sh
+wget -O /tmp/install-online.sh https://raw.githubusercontent.com/jihebube/openwrt-isp-split/main/scripts/install-online.sh
+sh /tmp/install-online.sh
+```
+
+脚本做的事：识别 apk/opkg 与架构 → 从 GitHub Release 下载 `isp-split-<版本>.tar.gz`（默认 latest）→ 用 Release 的 `SHA256SUMS` 校验 → 完整落盘后解到 `/tmp` → 执行 `sh scripts/install.sh --all` → 打印 `isp-split --version` 与下一步。**任何一步失败都会停下并给出可读原因**（下载失败会提示换镜像），不会把半个包装上。
+
+可用环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ISP_VER` | 空（latest） | 指定版本，如 `0.4.0`；只写版本号，不带 `v`、不带 `-r1` |
+| `ISP_BASE` | `https://github.com/jihebube/openwrt-isp-split` | Release 基地址；可换成可信的 GitHub 加速前缀，脚本仍会校验 `SHA256SUMS` |
+| `ISP_INSECURE` | `0` | 设 `1` 跳过 TLS 证书校验（仅老固件缺 ca-bundle 时临时用） |
+| `ISP_DRY_RUN` | `0` | 设 `1` 只打印将使用的 URL，不下载不安装 |
+| `ISP_SKIP_INSTALL` | `0` | 设 `1` 只下载解包不安装；配 `ISP_DEST` 指定落点（默认 `/tmp/isp-split-<版本>`） |
+
+装旧版示例（详见文末「版本切换与镜像」）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jihebube/openwrt-isp-split/main/scripts/install-online.sh | ISP_VER=0.4.0 sh
+```
+
+装完 LuCI 在 **网络 → 运营商分流**，升级后浏览器 `Ctrl-F5` 强刷一次。
+
+### 2. 标准 feed（opkg / apk）
+
+feed 由 Release 工作流自动发布到独立分支 `feed`：Release 成功后重新生成索引并强制推送该分支。raw 与 jsDelivr 两个地址等价，国内优先 jsDelivr。
+
+**opkg（OpenWrt 24.10 及以下）**
+
+```sh
+# raw 地址
+echo 'src/gz isp-split https://raw.githubusercontent.com/jihebube/openwrt-isp-split/feed' >> /etc/opkg/customfeeds.conf
+# 或 jsDelivr 镜像（二选一，别同时加）
+# echo 'src/gz isp-split https://cdn.jsdelivr.net/gh/jihebube/openwrt-isp-split@feed' >> /etc/opkg/customfeeds.conf
+
+opkg update
+opkg install isp-split luci-app-isp-split
+```
+
+**apk（OpenWrt 25.12+）**
+
+apk 3 的仓库索引是 `packages.adb`，且索引必须与 `.apk` 同目录（索引里没有 Filename 字段）：
+
+```sh
+# raw 地址
+echo 'https://raw.githubusercontent.com/jihebube/openwrt-isp-split/feed/apk/packages.adb' >> /etc/apk/repositories.d/customfeeds.list
+# 或 jsDelivr 镜像（二选一，别同时加）
+# echo 'https://cdn.jsdelivr.net/gh/jihebube/openwrt-isp-split@feed/apk/packages.adb' >> /etc/apk/repositories.d/customfeeds.list
+
+apk update
+apk add --allow-untrusted isp-split luci-app-isp-split
+```
+
+`--allow-untrusted` 是必须的：本 feed 未做 apk 签名（项目没有长期私钥），apk 会把索引标成 `UNTRUSTED`。介意签名链的用户请用第 1 种一键脚本或第 4 种本地安装。
+
+feed 是**快照**：只保留最近一次发布的包，不保留历史版本；要装旧版请用 `ISP_VER` 一键脚本或 Release 页的 ipk/apk。OpenWrt 默认的 `/etc/opkg.conf` 没有 `option check_signature`，未签名 feed 可直接用；若你的固件手动开了这一行，feed 会被拒绝——删掉该行或改用一键脚本（不建议为了第三方 feed 全局关签名）。
+
+### 3. iStore 手动安装（iStoreOS）
+
+iStoreOS 是 opkg 系，用 iStore 的「手动安装」贴 ipk 直链即可。下面的链接以 v0.4.1 为例，装别的版本时把版本号与文件名一起替换（Release 页有完整文件名）。
+
+1. iStore → **手动安装**（入口位置随 iStore 版本略有差异）
+2. 粘贴主包直链：
+   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/isp-split_0.4.1-r1_all.ipk`
+3. 装完再贴 LuCI 包：
+   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/luci-app-isp-split_0.4.1-r1_all.ipk`
+4. 刷新页面，菜单 **网络 → 运营商分流**
+
+<!-- 截图占位：iStore 手动安装入口 / 粘贴 URL 对话框 / 安装完成页；待补图后替换本注释 -->
+（图文步骤截图待补：iStore 各版本入口位置不同，先按上面四步操作。）
+
+iStore 只认 ipk；25.12 的 apk 固件请走第 1/2/4 种。
+
+### 4. 传统下载安装
+
+**OpenWrt 25.12+（apk 系）**：下载 Release 的 `isp-split-<版本>.tar.gz`，在路由器上解包执行安装脚本（busybox tar 不支持 `--strip-components`，解包后进目录跑）：
+
+```sh
+wget -O /tmp/isp.tgz https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/isp-split-0.4.1.tar.gz
+mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
+sh /tmp/isp/isp-split-0.4.1/scripts/install.sh --all
+```
+
+Release 若带 `.apk`，也可直接装（未签名）：
+
+```sh
+apk add --allow-untrusted ./isp-split-*.apk ./luci-app-isp-split-*.apk
+```
+
+**OpenWrt 24.10 及以下（opkg 系）**：
+
+```sh
+opkg install ./isp-split_*_all.ipk ./luci-app-isp-split_*_all.ipk
+```
+
+opkg 用户务必用 0.2.3 起的 ipk（容器格式已对齐官方 gzip-tar）。
+
+### 版本切换与镜像
+
+- **装旧版**：`... | ISP_VER=0.4.0 sh`；`ISP_VER` 只写版本号（`0.4.0`），不要写 `v0.4.0` 或 `0.4.0-r1`
+- **换镜像**：脚本与 feed 优先 jsDelivr（`@main` / `@feed`）；Release 资产直链不稳时，用可信加速前缀覆盖 `ISP_BASE`。脚本会校验 `SHA256SUMS`，校验不过不会安装（校验和与包同源，主要防半截/网关替换，不构成对抗恶意镜像的信任链——请用可信镜像）
+- **升级**：重复执行一键脚本即可；`/etc/isp-split.conf` 会保留，LuCI 更新后 `Ctrl-F5` 强刷
+- **jsDelivr 缓存**：分支引用有缓存（通常十几分钟到数小时），刚发版看不到新包时改用 raw 或等缓存过期
+
+## 快速开始
+
+装好后（任选上面的安装方式）按顺序跑：
+
+```sh
+# 1. 首次安装：给 ISP_TABLE 的策略绑定 WAN 接口
 isp-split init      # 交互选择；脚本用法：--bind wan_only=wan1 --bind wanb_only=wan2 --assume-yes
 
-# 3. 预检与生效（前两步只读）
+# 2. 预检与生效（前两步只读）
 isp-split plan      # 预演：将要做哪些改动
 isp-split check     # nft 干跑校验
 isp-split sync      # 拉取数据并生效
 isp-split verify    # 核对规则渲染
 
-# 4. 查看分流效果
+# 3. 查看分流效果
 isp-split status    # 各集合命中计数与流量
 ```
 

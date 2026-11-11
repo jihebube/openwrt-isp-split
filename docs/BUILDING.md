@@ -92,7 +92,7 @@ OWRT_WORK=/tmp/sdkbuild sh scripts/build-apk.sh
 
 ## CI 自动构建
 
-`.github/workflows/release.yml` 已配置：push tag 后自动用 25.12.6 与 24.10.4 两个 SDK 分别编译（调用同一个 `scripts/build-apk.sh`），连同源码包一起发布到 Release。
+`.github/workflows/release.yml` 已配置：push tag 后自动用 25.12.6 与 24.10.4 两个 SDK 分别编译（调用同一个 `scripts/build-apk.sh`），连同源码包一起发布到 Release；Release 成功后再由 `feed` job 生成 opkg/apk 双索引并推送到独立分支 `feed`。
 
 ```sh
 git tag v0.2.1 && git push origin v0.2.1
@@ -109,33 +109,31 @@ git tag v0.2.1 && git push origin v0.2.1
 3. 打 tag 并推送，等待 CI 完成
 4. 检查 Release 页产物的完整性与 `SHA256SUMS`；ipk 的前两字节应为 `1f 8b`
    （gzip-tar），不是 `21 3c`（明文 ar）
+5. 检查 `feed` 分支已更新：`Packages.gz` 与 `apk/packages.adb` 都能拉取，raw 与 jsDelivr 两条 URL 至少各验一次
 
-## 自建 opkg 软件源（可选，仅 ≤24.10）
+## 自建 feed（opkg + apk）
+
+`scripts/build-feed.sh` 把 Release 的 6 个包（ipk×4 + apk×2）做成两种标准索引：
 
 ```sh
-mkdir -p repo/packages && cp dist/*.ipk repo/packages/
-cd repo/packages
-{
-  for f in *.ipk; do
-    d=$(mktemp -d)
-    # 官方 23.05/24.10 是 gzip-tar；老格式是明文 ar。两种都要能读。
-    if tar xzf "$f" -C "$d" 2>/dev/null; then
-      :
-    else
-      ar p "$f" control.tar.gz > "$d/control.tar.gz"
-    fi
-    tar xzOf "$d/control.tar.gz" ./control
-    rm -rf "$d"
-    echo "Filename: $f"
-    echo "Size: $(wc -c < "$f")"
-    echo
-  done
-} > ../Packages && gzip -kf ../Packages
+# 本地：--src 指向放包的目录（Release 下载物或 dist/），默认输出 dist/feed
+sh scripts/build-feed.sh --src /path/to/packages --out dist/feed
 ```
 
-客户端添加 `src/gz isp-split <源的 URL>` 后即可 `opkg install`。未签名索引需要客户端关闭签名校验；正式源应使用 usign 签名。
+产物与目录约定：
 
-自建 **apk 源不建议**：25.12 的 `packages.adb` 索引只能由 apk-tools 3 生成且默认要求签名，无现成工具链，用 Release 分发更简单。
+| 路径 | 内容 |
+|---|---|
+| `ipk/*.ipk` | opkg 包（gzip-tar 容器，单目录；OpenWrt 的 ipk 一直是这种，没有新旧格式之分） |
+| `Packages` / `Packages.gz` | opkg 索引；`Filename: ipk/...`，含 Size / SHA256sum / Description |
+| `apk/*.apk` | apk 包（文件名必须保持 `<name>-<version>.apk`） |
+| `apk/packages.adb` | apk 3.x 索引（ADB 容器） |
+
+**apk 索引为什么是 `apk/packages.adb` 而不是根目录 `APKINDEX.tar.gz`**：OpenWrt 25.12 的 apk-tools 3 用 `packages.adb`（官方 feeds 就是 `.../<feed>/packages.adb`）；`APKINDEX.tar.gz` 是 apk 2.x 旧格式，apk 3 的 `index` applet 甚至不接受 v3 包。apk 索引没有 Filename 字段，包地址由“索引所在目录 + `<name>-<version>.apk`”推导，所以索引必须和 `.apk` 同目录。索引由 SDK 的 `apk mkndx` 生成；CI 里 25.12 build job 把 apk-tools 3.0.5 作为 `apk-tool` 产物传给 feed job，本地则自动找 `.sdk-build/*/sdk/staging_dir/host/bin/apk`。
+
+**签名**：本 feed 未签名。apk 客户端需 `apk add --allow-untrusted`（`apk update` 只会提示 UNTRUSTED）；opkg 默认不校验签名，若固件手动开了 `option check_signature` 则需删掉该行或改用一键脚本。
+
+**发布**：`.github/workflows/release.yml` 的 `feed` job 在 Release 成功后下载 6 个包，跑本脚本，再把 `ipk/`、`apk/`、`Packages*` 以孤立快照推到 `feed` 分支（`git push --force`）。raw 与 jsDelivr 两种客户端地址见 README「安装」。
 
 ## 出货门：FEATURE_LINECHECK
 
