@@ -36,8 +36,6 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$ROOT/dist"
 OUT="$ROOT/dist/feed"
 APK_BIN=${APK_BIN:-}
-# 相对路径会在 cd "$OUT/apk" 后断链，先钉成绝对路径（fix42b）
-case "$APK_BIN" in /*) ;; *) [ -f "$APK_BIN" ] && APK_BIN=$(cd "$(dirname "$APK_BIN")" && pwd)/$(basename "$APK_BIN") ;; esac
 KEEP=0
 
 say() { printf '[feed] %s\n' "$*"; }
@@ -257,6 +255,10 @@ done
 
 [ "$apk_n" -gt 0 ] || die "在 $SRC 里没有找到 .apk"
 
+# 相对路径会在 cd "$OUT/apk"（mkndx）后断链，先钉成绝对路径（fix42b）
+if [ -n "$APK_BIN" ] && [ "${APK_BIN#/}" = "$APK_BIN" ] && [ -f "$APK_BIN" ]; then
+	APK_BIN=$(cd "$(dirname "$APK_BIN")" && pwd)/$(basename "$APK_BIN")
+fi
 if [ -n "$APK_BIN" ]; then
 	[ -x "$APK_BIN" ] || die "--apk-bin 不可执行: $APK_BIN"
 	APK=$APK_BIN
