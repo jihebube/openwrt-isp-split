@@ -36,6 +36,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC="$ROOT/dist"
 OUT="$ROOT/dist/feed"
 APK_BIN=${APK_BIN:-}
+# 相对路径会在 cd "$OUT/apk" 后断链，先钉成绝对路径（fix42b）
+case "$APK_BIN" in /*) ;; *) [ -f "$APK_BIN" ] && APK_BIN=$(cd "$(dirname "$APK_BIN")" && pwd)/$(basename "$APK_BIN") ;; esac
 KEEP=0
 
 say() { printf '[feed] %s\n' "$*"; }
