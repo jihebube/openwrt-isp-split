@@ -1,0 +1,70 @@
+Package: isp-split
+Version: 0.5.0-1
+Depends: nftables, curl, socat
+Source: https://github.com/jihebube/openwrt-isp-split
+SourceName: isp-split
+License: MIT
+Section: net
+Architecture: all
+Installed-Size: 572
+Filename: ipk/isp-split_0.5.0-1_all.ipk
+Size: 174088
+SHA256sum: b4c1a1feb6529132de24cbff06956febc3cb40a7bc1c6ab4e98c26b34a12ffaf
+Description: ISP-aware policy routing for mwan3 (nftables native)
+
+Package: isp-split
+Version: 0.5.0-r1
+Depends: libc, nftables, curl, socat
+Source: feeds/base/isp-split
+SourceName: isp-split
+License: MIT
+LicenseFiles: LICENSE
+Section: net
+SourceDateEpoch: 1760891865
+Maintainer: jihebube <jihebube@users.noreply.github.com>
+Architecture: all
+Installed-Size: 522240
+Filename: ipk/isp-split_0.5.0-r1_all.ipk
+Size: 175068
+SHA256sum: 30a1b143dbfb0ceccd5d9850dafca0df2656311b51a58e67d462112c4a4e86df
+Description:  Route traffic by the ISP that owns the destination address.
+ Builds mutually exclusive nftables sets from daily-updated
+ Chinese ISP CIDR data and wires them into mwan3-nft rules.
+ 
+ REQUIRES the nftables port of mwan3 (>= 3.6.0):
+ - Kwrt:  apk add mwan3-nft        (软件源里自带)
+ - 上游:  用 https://github.com/dl12345/mwan3 替换官方 feed 的
+ iptables 版 mwan3 (2.12.5)，或从 Release 下载
+
+Package: luci-app-isp-split
+Version: 0.5.0-1
+Depends: isp-split, luci-base
+Source: https://github.com/jihebube/openwrt-isp-split
+SourceName: luci-app-isp-split
+License: MIT
+Section: luci
+Architecture: all
+Installed-Size: 288
+Filename: ipk/luci-app-isp-split_0.5.0-1_all.ipk
+Size: 87040
+SHA256sum: 4cf67fbb560ab8e8e913ad0a528a647d5548ec60b64a4e088ce90a3c52a152c4
+Description: LuCI page for isp-split
+
+Package: luci-app-isp-split
+Version: 0.5.0-r1
+Depends: libc, isp-split, luci-base
+Source: feeds/base/luci-app-isp-split
+SourceName: luci-app-isp-split
+License: MIT
+LicenseFiles: LICENSE
+Section: luci
+SourceDateEpoch: 1760891865
+Architecture: all
+Installed-Size: 225280
+Filename: ipk/luci-app-isp-split_0.5.0-r1_all.ipk
+Size: 86498
+SHA256sum: 61a1a5430cd4471afd64c687f45bdc9930be539aac23554fde833c5773f7b293
+Description:  LuCI page for isp-split: shows per-ISP element counts and hit
+ counters, and offers one-click sync, data refresh, and config
+ editing (wire/apply/dns).
+
