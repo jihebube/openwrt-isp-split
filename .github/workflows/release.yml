@@ -45,7 +45,9 @@ jobs:
   build:
     name: build (${{ matrix.branch }})
     needs: [ version ]
-    runs-on: ubuntu-latest
+    # 2026-11-27：ubuntu-latest 镜像月更后 24.10 老 SDK 的 prereq-build 挂
+    # （25.12 在旧 24.04 上全绿过，钉回已知可行环境）
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
