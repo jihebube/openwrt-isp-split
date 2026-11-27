@@ -20,6 +20,10 @@
 #      （`isp-split --version` 与包版本不能各说各话）
 #   4. luci-app-isp-split/Makefile 的 PKG_VERSION / PKG_RELEASE 与主包一致
 #   5. feed 壳的两个 Makefile（sync-feed.sh 会同步）版本与主包一致
+#   6. release body 的版本引用与 PKG_VERSION 一致（标题 `## vX.Y.Z` 与安装段
+#      目录 `isp-split-X.Y.Z/`）。body 是手写 markdown，最容易"改了 Makefile
+#      忘了改 body"：Release 页写着 v0.4.1、安装路径还是 isp-split-0.4.1，
+#      用户照抄必错，而且 tag 一推出就删不干净。
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -76,5 +80,12 @@ for _feed in "$ROOT/feed/op-packages/isp-split/Makefile" \
 	[ "$_fv" = "$VER" ] ||
 		_err "feed 壳 ${_feed#$ROOT/} 的 PKG_VERSION '$_fv' 与主包 '$VER' 不一致（跑 tools/sync-feed.sh）"
 done
+
+REL_YML="$ROOT/.github/workflows/release.yml"
+[ -f "$REL_YML" ] || _err "缺少 .github/workflows/release.yml，无法校验 release body 版本"
+grep -q "## v$VER" "$REL_YML" ||
+	_err "release.yml 的 body 标题不是 '## v$VER'（改了 PKG_VERSION 却没改 body）"
+grep -q "isp-split-$VER/scripts/install.sh" "$REL_YML" ||
+	_err "release.yml 安装段的目录名不是 isp-split-$VER（用户照抄会 404）"
 
 echo "tag↔版本一致：tag=$TAG PKG_VERSION=$VER PKG_RELEASE=$REL ISP_VERSION=$ISPV"

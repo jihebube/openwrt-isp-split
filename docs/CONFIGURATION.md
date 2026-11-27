@@ -181,6 +181,91 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 
 ---
 
+## 手动补段（IP_SPLIT / IP_LIST_DIR，0.5.0）
+
+视频平台全面 PCDN 化之后，B 站等站点的播放节点大量落在**动态家宽地址**上
+（例如 `101.22.79.76`、`110.250.151.x`），这些地址永远不会出现在运营商汇总段表里。
+未命中的流量会落到 mwan3 的兜底规则，被 `balanced` 摇到另一家运营商——跨网就是
+卡顿。手动补段就是给这类目标一条"永久车道"。
+
+### 写法
+
+```sh
+# /etc/isp-split.conf
+IP_SPLIT="
+101.22.0.0/16:wanb_only
+110.250.0.0/16:wanb_only
+"
+# 可选：批量维护，$IP_LIST_DIR/<策略>.txt，每行一个 CIDR（# 开头为注释）
+IP_LIST_DIR=""
+```
+
+策略名必须已经在 mwan3 里存在（`conf set` 会校验）；策略对应哪个集合，取
+`ISP_TABLE` 里**第一个启用行**的策略匹配项。策略在 mwan3 里不存在会被拒绝，
+策略没有启用的运营商行只在渲染时告警跳过（不会让每日 fetch 失败）。
+
+### 语义（三条，缺一不可）
+
+1. **每次渲染都合并**：`fetch` / `wire` / `apply` / `refresh` / `sync` / `rollback`
+   都会把段表数据和手动段重新合成一次。所以 04:17 的定时 `refresh` 重建数据之后，
+   手动段会自动回来——这正是旧做法（`nft add element` + 往数据文件追加一行）丢段的原因。
+2. **手动段优先**：与段表数据重叠时保留手动段，其它集合让出这些地址。同一 IP 只
+   存在于一个集合里，mwan3 的规则先后不影响归属。
+3. **重启后仍在**：mwan3 ipset 段的 `loadfile` 指向**已合并**的文件
+   （`$BASE/data/.ipsplit/<集合名>.txt`），不是纯净段表数据。
+
+### 实现细节（排查时看这里）
+
+- 段表数据 `$BASE/data/<源名>.txt` 保持纯净，不被手动段污染；
+- 渲染产物在 `$BASE/data/.ipsplit/`，每次渲染整体替换（原子 rename）；
+- 渲染是纯函数：删掉一条手动段后，相关地址会自动回到原来的集合，不需要重新 fetch；
+- 一次渲染失败会**中止**当前操作（fetch 不替换数据、apply 不刷 nft），
+  绝不允许"手动段静默消失"这种中间态。
+
+### 缺口从哪来：`isp-split suggest`
+
+```sh
+isp-split suggest                       # 只读：列出建议补哪些段
+isp-split suggest --min-conns 200       # 调低阈值看小样本
+isp-split suggest --apply               # 写入 IP_SPLIT（写前展示 + 确认）
+isp-split suggest --apply --assume-yes  # 非交互（脚本/验收用）
+```
+
+它做两件事：
+
+1. 读 `/proc/net/nf_conntrack`，把**未命中任何启用集合**的目的网段按 `/24` 聚合
+   （同一 `/16` 内 ≥2 个 `/24` 时按 `/16` 建议），超过阈值（默认 ≥1000 连接
+   或 ≥1MiB，`SUGGEST_MIN_CONNS` / `SUGGEST_MIN_BYTES`）的段进入候选；
+<!-- lc:begin -->
+2. 对候选段查归属地：先吃 `state/linecheck.geo.tsv` 里体检留下的缓存，未命中才
+   用体检的归属地通道（默认百度 HTTPS）查一次，结果写回同一份缓存复用。
+<!-- lc:end -->
+<!-- lc:begin -->
+
+输出形如：
+
+```text
+建议: 110.250.0.0/16 → wanb_only（联通，证据: linecheck geo + 1272 连接兜底）
+```
+
+**隐私**：只发送聚合后的目标 IP（默认百度 HTTPS），不发送内网地址、设备名、MAC
+或流量内容；`LINE_CHECK_GEO=0` 时完全不外发，只用本地缓存。
+<!-- lc:end -->
+
+**不是自动任务**：`suggest` 只能手动跑或从 LuCI 触发，**绝不进 cron**——
+定时任务只跑 `refresh`（fetch + apply）。
+
+### 端口钉线顺序（ISP_PIN_PORTS）
+
+mwan3 的 `mwan3_rules` 是 first-match：集合规则一旦先命中，排在后面的端口规则
+对集合内目标就永远不生效。`ISP_PIN_PORTS`（默认 `4483 8082`，即 B 站 PCDN 回退
+端口）列出的端口，其用户 mwan3 规则会被 `wire` **整块搬到集合规则之前**，
+其余用户规则的相对顺序不动。留空 = 回到 0.4.x 的纯锚点插入行为。
+
+`isp-split verify` 会逐端口打印位置断言（"先于集合规则"或"位于集合规则之后"）。
+
+---
+
 ## 其他配置项
 
 | 变量 | 默认 | 说明 |
@@ -189,6 +274,11 @@ dnsmasq 按**最长域名后缀**匹配、与书写顺序无关。代理装进�
 | `ISP_CRON` | `17 4 * * *` | 每日更新时间（只能是 5 段 cron 时间字段） |
 | `DNSDIR` | `/etc/isp-split/dnsmasq.d` | 旧版片段目录（仅用于迁移/清理，新版本不再写入） |
 | `DOMAIN_LIST_DIR` | `/etc/isp-split/domains` | 外部域名清单目录 |
+| `IP_SPLIT` | 空 | 手动补段：`<CIDR>:<策略>` 多行；每次 fetch/apply 渲染时合并，优先级高于段表数据 |
+| `IP_LIST_DIR` | 空 | 手动补段的外部目录：`$IP_LIST_DIR/<策略>.txt`，每行一个 CIDR |
+| `ISP_PIN_PORTS` | `4483 8082` | 这些端口的用户 mwan3 规则由 wire 提到集合规则之前；留空关闭 |
+| `SUGGEST_MIN_CONNS` | `1000` | `suggest` 的连接数阈值 |
+| `SUGGEST_MIN_BYTES` | `1048576` | `suggest` 的字节数阈值 |
 | `DNS_MODE` | `bind` | 多线路 DNS 出线方式 |
 | `COUNT_FALLBACK` | `1` | 统计未命中集合的兜底流量（`status` 显示"兜底"行）；口径是 `ct state new`，即只计每条连接的首包 |
 | `COUNT_FALLBACK_SKIP_DNS` | `1` | 兜底计数排除 DNS（udp/tcp 任一侧端口 53，查询与响应都不计）；`0` 保持不排除 DNS 的旧行为 |

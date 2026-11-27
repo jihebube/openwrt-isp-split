@@ -15,6 +15,7 @@
 - **双源校验（0.2.1 默认开启）**：`gaoyifan/china-operator-ip`（MIT）出数据，`ispip.clang.cn` 只跑日 diff；Jaccard < 90% 时**拒绝更新并留档差异段**，校验源连续失效 3 天升级为拒绝更新，主源失效立即冻结旧数据
 - **原子更新不断流**：单次 `nft -f` 事务完成集合替换，不重启 mwan3、不重建规则链
 - **多线路 DNS**：域名按线路绑定 DNS 出接口，让 CDN 返回本运营商节点（bind / mark 两种模式）
+- **手动补段（0.5.0）**：`IP_SPLIT="<CIDR>:<策略>"` 把运营商段表覆盖不到的网段（典型：B 站 PCDN 家宽节点）钉到指定线路；**每次 fetch/wire/apply/rollback 渲染时自动重新合并**，每日定时 fetch 重建数据后不会再丢；手动段优先于段表数据。缺口由 `isp-split suggest` 从 conntrack + 归属地存档里算出来（只读，可选 `--apply` 写入；绝不进 cron）
 - **与代理共存**：只处理直连流量，OpenClash / sing-box 的代理流量不受影响（代理先打标，`mark & 0x3f00 == 0` 判断天然互斥）
 <!-- lc:begin -->
 - **线路体检**：`isp-split linecheck` 逐条 WAN 检查公网/CGNAT/私网、出口 IP、同运营商目标四段延迟（DNS/TCP/TLS/首字节）、双 STUN NAT 五态、IP 归属地，给出可解释评分与一句话建议；结果缓存 60s，只读探测，不改 mwan3/nft 规则。LuCI 页面只读缓存快照、点按钮才起后台探测（`--background`），网络再差也不会白屏
@@ -124,13 +125,13 @@ feed 是**快照**：只保留最近一次发布的包，不保留历史版本�
 
 ### 3. iStore 手动安装（iStoreOS）
 
-iStoreOS 是 opkg 系，用 iStore 的「手动安装」贴 ipk 直链即可。下面的链接以 v0.4.1 为例，装别的版本时把版本号与文件名一起替换（Release 页有完整文件名）。
+iStoreOS 是 opkg 系，用 iStore 的「手动安装」贴 ipk 直链即可。下面的链接以 v0.5.0 为例，装别的版本时把版本号与文件名一起替换（Release 页有完整文件名）。
 
 1. iStore → **手动安装**（入口位置随 iStore 版本略有差异）
 2. 粘贴主包直链：
-   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/isp-split_0.4.1-r1_all.ipk`
+   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.5.0/isp-split_0.5.0-r1_all.ipk`
 3. 装完再贴 LuCI 包：
-   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/luci-app-isp-split_0.4.1-r1_all.ipk`
+   `https://github.com/jihebube/openwrt-isp-split/releases/download/v0.5.0/luci-app-isp-split_0.5.0-r1_all.ipk`
 4. 刷新页面，菜单 **网络 → 运营商分流**
 
 <!-- 截图占位：iStore 手动安装入口 / 粘贴 URL 对话框 / 安装完成页；待补图后替换本注释 -->
@@ -143,9 +144,9 @@ iStore 只认 ipk；25.12 的 apk 固件请走第 1/2/4 种。
 **OpenWrt 25.12+（apk 系）**：下载 Release 的 `isp-split-<版本>.tar.gz`，在路由器上解包执行安装脚本（busybox tar 不支持 `--strip-components`，解包后进目录跑）：
 
 ```sh
-wget -O /tmp/isp.tgz https://github.com/jihebube/openwrt-isp-split/releases/download/v0.4.1/isp-split-0.4.1.tar.gz
+wget -O /tmp/isp.tgz https://github.com/jihebube/openwrt-isp-split/releases/download/v0.5.0/isp-split-0.5.0.tar.gz
 mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-sh /tmp/isp/isp-split-0.4.1/scripts/install.sh --all
+sh /tmp/isp/isp-split-0.5.0/scripts/install.sh --all
 ```
 
 Release 若带 `.apk`，也可直接装（未签名）：
@@ -428,6 +429,9 @@ unicom_cnc:isp_uni:wanb_only:1
 # 每条线路的 DNS 与需要钉到线路的域名后缀
 DNS_TABLE="wan_only:223.5.5.5 wanb_only:119.29.29.29"
 DOMAIN_SPLIT="bilivideo.com:wanb_only"
+
+# 手动补段：运营商段表覆盖不到的网段（例：B 站 PCDN 家宽节点）
+IP_SPLIT="110.250.0.0/16:wanb_only"
 ```
 
 生效方式：策略映射改动执行 `isp-split wire && isp-split apply`；DNS 改动执行 `isp-split dns`；也可在 LuCI 配置页操作。完整字段说明见 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)。
@@ -489,6 +493,7 @@ yfgao 只有 `chinanet/unicom/cmcc/cernet` 四类；`ISP_TABLE` 里的
 | 运营商网段分流 | ✅ | ✅ 默认 4 类主流运营商（可扩到 10 类），每日自动更新 |
 | 多线路 DNS | ✅ | ✅ bind / mark 双模式，兼容代理接管 DNS |
 | 域名 / 设备钉线 | ✅ | ✅ `DOMAIN_SPLIT` + mwan3 源地址规则 |
+| 网段手动补段 + 缺口建议 | ❌（只能手工加静态路由） | ✅ `IP_SPLIT`（fetch 后自动重新合并）+ `isp-split suggest` 由兜底流量反推建议 |
 | 灰度 / 预演 / 回滚 | 部分 | ✅ 三级预检 + stage 灰度 + 一键还原 |
 | 数据源质量校验 | ❌ | ✅ 主源 + 校验源日 diff（Jaccard 阈值 + 差异段留档） |
 <!-- lc:begin -->

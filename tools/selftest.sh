@@ -6612,6 +6612,23 @@ d30_c1_ok_notneeded() {
 	doc_check_dns53
 	printf 'V=%s\nC=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")"
 }
+# fix42 D1：只配了手动补段（IP_SPLIT）时，C1 不能再说"没有配置域名分流"，
+# 要给建立在这条事实上的判定；verdict 必须仍是 ok（新增 conflict 就是误报）。
+d30_c1_ip_split_only() {
+	d30_ctx
+	FAKE_DNSMASQ_COMM=1
+	FAKE_PIDOF_PID=""
+	export FAKE_DNSMASQ_COMM FAKE_PIDOF_PID
+	IP_SPLIT="
+110.250.0.0/16:wanb_only
+101.22.0.0/16:wanb_only
+"
+	DOC_P1_TSV="udp	/proc/net/udp	00000000:0035	07	4242"
+	DOC_P2_MAP="/proc/999999/fd:
+7 -> socket:[4242]"
+	doc_check_dns53
+	printf 'V=%s\nC=%s\nF=%s\n' "$DOC_C1_VERDICT" "$(d30_codes "$DOC_C1_FIND")" "$DOC_C1_FACTS"
+}
 d30_c1_conflict_orphan() {
 	d30_ctx
 	FAKE_DNSMASQ_COMM=1
@@ -6646,6 +6663,7 @@ d30_c1_warn_mark() {
 }
 d30_case "30.1 C1 无监听者 -> unknown（不把'不知道'判成'没问题'）" unknown - d30_c1_unknown
 d30_case "30.2 C1 dnsmasq 独占 :53 且没有域名分流 -> ok / DNS_FRAGMENT_NOT_NEEDED" ok DNS_FRAGMENT_NOT_NEEDED d30_c1_ok_notneeded
+d30_case "30.2b C1 只有手动补段（IP_SPLIT）-> ok / DNS_FRAGMENT_IP_SPLIT_ONLY（不再判'无需'）" ok DNS_FRAGMENT_IP_SPLIT_ONLY d30_c1_ip_split_only
 d30_case "30.3 C1 dnsmasq 在跑但片段不在加载目录 -> conflict / DNS_FRAGMENT_ORPHAN" conflict DNS_FRAGMENT_ORPHAN d30_c1_conflict_orphan
 d30_case "30.4 C1 第三方程序持有 :53（bind 模式）-> conflict / DNS_BYPASS_DEAD" conflict DNS_BYPASS_DEAD d30_c1_conflict_third
 d30_case "30.5 C1 同一机器改 mark 模式 -> warn / DNS_BYPASS_PARTIAL（nft 侧仍生效）" warn DNS_BYPASS_PARTIAL d30_c1_warn_mark
@@ -7887,6 +7905,367 @@ if [ -n "$_w35_node" ]; then
 	fi
 else
 	skip "34.9 wizard.js node --check（环境里没有 node/nodejs）"
+fi
+
+echo "== 35. fix42：IP_SPLIT 手动补段（D1）/ suggest（D2）/ 端口钉线顺序（D4）"
+F42=$TMP/f42
+rm -rf "$F42"
+mkdir -p "$F42/bin" "$F42/mirror/ispip.clang.cn"
+
+# 假下载器：URL -> fixtures（与 section 12 同一套 URL 映射思路）
+cat > "$F42/bin/uclient-fetch" <<'F42_FETCH'
+#!/bin/sh
+out=""; url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-O) out=$2; shift 2 ;;
+	-q) shift ;;
+	-T) shift 2 ;;
+	*) url=$1; shift ;;
+	esac
+done
+[ -n "$out" ] || exit 1
+rel=$(printf '%s' "$url" | sed 's|^https\?://||')
+[ -f "$F42_MIRROR/$rel" ] || exit 1
+if [ "$out" = "-" ]; then cat "$F42_MIRROR/$rel"; else cp "$F42_MIRROR/$rel" "$out"; fi
+F42_FETCH
+chmod +x "$F42/bin/uclient-fetch"
+
+# 数据：电信 1.x/5.x，联通 110.250/16 + 2.x（2.1.0.0/16 用来验证"手动段优先"）
+awk 'BEGIN { for (i = 1; i <= 12; i++) printf "1.%d.0.0/16\n", i; printf "5.5.5.0/24\n" }' \
+	> "$F42/mirror/ispip.clang.cn/chinatelecom.txt"
+awk 'BEGIN {
+	printf "110.250.0.0/16\n"
+	for (i = 1; i <= 12; i++) printf "2.%d.0.0/16\n", i
+}' > "$F42/mirror/ispip.clang.cn/unicom_cnc.txt"
+
+_f42_conf() { # <文件> <IP_SPLIT 值>
+	cat > "$1" <<F42_CONF
+ISP_TABLE="
+chinatelecom:isp_tel:wan_only:1
+unicom_cnc:isp_uni:wanb_only:1
+"
+DNS_TABLE=""
+DOMAIN_SPLIT=""
+IP_SPLIT="$2"
+IP_LIST_DIR=""
+DNS_MODE="bind"
+ISP_MIRROR="https://ispip.clang.cn"
+ISP_VERIFY_ENABLE=0
+COUNT_FALLBACK="0"
+F42_CONF
+}
+_f42_conf "$F42/c1.conf" "
+110.250.0.0/16:wanb_only
+5.5.5.0/24:wan_only
+2.1.0.0/16:wan_only
+"
+
+_f42_run() { # <conf> <base> <args...>
+	_f42_c=$1
+	_f42_b=$2
+	shift 2
+	(
+		PATH="$F42/bin:$PATH"
+		F42_MIRROR="$F42/mirror"
+		ISP_SPLIT_CONF="$_f42_c"
+		ISP_SPLIT_BASE="$_f42_b"
+		ISP_SPLIT_LIB="$LIB"
+		export PATH F42_MIRROR ISP_SPLIT_CONF ISP_SPLIT_BASE ISP_SPLIT_LIB
+		sh "$ROOT/files/usr/sbin/isp-split" "$@"
+	)
+}
+
+# ---- 35.1 fetch 重建后手动段幸存（D1 的核心断言）----
+rm -rf "$F42/b1"
+if _f42_run "$F42/c1.conf" "$F42/b1" fetch >"$F42/f1.log" 2>&1 &&
+	grep -qx '110.250.0.0/16' "$F42/b1/data/.ipsplit/isp_uni.txt" &&
+	grep -qx '5.5.5.0/24' "$F42/b1/data/.ipsplit/isp_tel.txt" &&
+	grep -qx '2.1.0.0/16' "$F42/b1/data/.ipsplit/isp_tel.txt" &&
+	! grep -qx '2.1.0.0/16' "$F42/b1/data/.ipsplit/isp_uni.txt"; then
+	ok "35.1 fetch 后手动段已合并：110.250/16 进 isp_uni、5.5.5/24 进 isp_tel"
+else
+	ng "35.1 fetch 后手动段未按策略合并"
+	sed 's/^/    /' "$F42/f1.log" | tail -6
+	sed 's/^/    uni: /' "$F42/b1/data/.ipsplit/isp_uni.txt" 2>/dev/null | tail -8
+fi
+
+if grep -qx '2.1.0.0/16' "$F42/b1/data/unicom_cnc.txt"; then
+	ok "35.2 段表数据保持纯净（手动段不写回 data/<源名>.txt）"
+else
+	ng "35.2 段表数据被手动段污染（data/unicom_cnc.txt 丢了 2.1.0.0/16）"
+fi
+
+if grep -qx '2.1.0.0/16' "$F42/b1/data/.ipsplit/isp_tel.txt" &&
+	! grep -qx '2.1.0.0/16' "$F42/b1/data/.ipsplit/isp_uni.txt"; then
+	ok "35.3 手动段优先级高于段表数据（重叠地址从其它集合让出）"
+else
+	ng "35.3 手动段没有覆盖段表归属（2.1.0.0/16 仍在 isp_uni）"
+fi
+
+# 第二次 fetch：模拟"每天 04:17 重建"，手动段必须回来
+if _f42_run "$F42/c1.conf" "$F42/b1" fetch >"$F42/f2.log" 2>&1 &&
+	grep -qx '110.250.0.0/16' "$F42/b1/data/.ipsplit/isp_uni.txt" &&
+	grep -qx '5.5.5.0/24' "$F42/b1/data/.ipsplit/isp_tel.txt"; then
+	ok "35.4 每日 fetch 重建后手动段仍然幸存（生产 04:17 丢失问题的回归断言）"
+else
+	ng "35.4 第二次 fetch 后手动段丢失"
+	sed 's/^/    /' "$F42/f2.log" | tail -6
+fi
+
+# ---- 35.5 apply 按合并结果刷集合（改配置后不 fetch 也能生效）----
+cat > "$F42/bin/nft" <<'F42_NFT_APPLY'
+#!/bin/sh
+[ "$1" = "-f" ] && { cp "$2" "$F42_BATCH"; exit 0; }
+case "$*" in
+*"list chain inet mwan3 mwan3_output"*)
+	echo "table inet mwan3 {"
+	echo "	chain mwan3_output {"
+	echo "		type route hook output priority mangle; policy accept;"
+	echo "		jump mwan3_rules"
+	echo "	}"
+	echo "}"
+	exit 0
+	;;
+*"list set inet mwan3"*) exit 0 ;;
+*"list counter inet mwan3 isp_fallback"*) exit 1 ;;
+*"list chain inet mwan3 mwan3_rules"*) exit 0 ;;
+*) exit 0 ;;
+esac
+F42_NFT_APPLY
+chmod +x "$F42/bin/nft"
+_f42_conf "$F42/c2.conf" "110.250.0.0/16:wanb_only"
+if (PATH="$F42/bin:$PATH" F42_BATCH="$F42/batch1.nft" \
+	F42_MIRROR="$F42/mirror" ISP_SPLIT_CONF="$F42/c2.conf" ISP_SPLIT_BASE="$F42/b1" \
+	ISP_SPLIT_LIB="$LIB" ISP_SPLIT_MWAN3="$F42/mwan3.none" \
+	sh "$ROOT/files/usr/sbin/isp-split" apply) >"$F42/a1.log" 2>&1 &&
+	grep -q 'add element inet mwan3 isp_uni {.*110.250.0.0/16' "$F42/batch1.nft" &&
+	grep -q 'add element inet mwan3 isp_tel {' "$F42/batch1.nft"; then
+	ok "35.5 apply 也重新合并：只跑 apply（不 fetch）即可让新配置生效"
+else
+	ng "35.5 apply 未按合并后的集合刷 nft"
+	sed 's/^/    /' "$F42/a1.log" | tail -6
+	head -3 "$F42/batch1.nft" 2>/dev/null | sed 's/^/    /'
+fi
+
+if grep -q 'add element inet mwan3 isp_uni {.*2\.1\.0\.0/16' "$F42/batch1.nft" &&
+	! grep -q 'add element inet mwan3 isp_tel {.*2\.1\.0\.0/16' "$F42/batch1.nft"; then
+	ok "35.5b 删掉手动段后地址自动回到段表集合（可逆，不粘在旧归属上）"
+else
+	ng "35.5b 删掉手动段后地址没有回到段表集合"
+fi
+
+_f42_conf "$F42/c2b.conf" ""
+if (PATH="$F42/bin:$PATH" F42_BATCH="$F42/batch2.nft" \
+	F42_MIRROR="$F42/mirror" ISP_SPLIT_CONF="$F42/c2b.conf" ISP_SPLIT_BASE="$F42/b1" \
+	ISP_SPLIT_LIB="$LIB" ISP_SPLIT_MWAN3="$F42/mwan3.none" \
+	sh "$ROOT/files/usr/sbin/isp-split" apply) >"$F42/a2.log" 2>&1 &&
+	[ ! -d "$F42/b1/data/.ipsplit" ]; then
+	ok "35.5c 清空 IP_SPLIT 后渲染产物被清理（不留过期合并结果）"
+else
+	ng "35.5c 清空 IP_SPLIT 后仍残留 data/.ipsplit"
+fi
+
+if grep -q 'loadfile=$(_set_data_file' "$ROOT/files/usr/sbin/isp-split" &&
+	grep -q '_file=$(_set_data_file' "$ROOT/files/usr/sbin/isp-split"; then
+	ok "35.6 渲染入口统一：apply 与 wire 的 loadfile 都走 _set_data_file（重启后手动段仍在）"
+else
+	ng "35.6 仍有直接读 \$DATA/<源名>.txt 的渲染入口（重启后手动段会丢）"
+fi
+
+# ---- 35.7 suggest：只读建议（阈值/聚合/隐私）----
+cat > "$F42/bin/nft" <<'F42_NFT_SUGGEST'
+#!/bin/sh
+case "$*" in
+*"counter inet mwan3 isp_fallback"*)
+	echo "table inet mwan3 {"
+	echo "	counter isp_fallback {"
+	echo "		packets 1272 bytes 5242880"
+	echo "	}"
+	echo "}"
+	exit 0
+	;;
+*"set inet mwan3 isp_tel"*)
+	echo "table inet mwan3 {"
+	echo "	set isp_tel {"
+	echo "		type ipv4_addr"
+	echo "		flags interval"
+	echo "		elements = { 1.1.0.0-1.1.255.255, 5.5.5.0/24 }"
+	echo "	}"
+	echo "}"
+	exit 0
+	;;
+*"set inet mwan3 isp_uni"*)
+	echo "table inet mwan3 {"
+	echo "	set isp_uni {"
+	echo "		type ipv4_addr"
+	echo "		flags interval"
+	echo "		elements = { 110.250.0.0-110.250.255.255 }"
+	echo "	}"
+	echo "}"
+	exit 0
+	;;
+*"table inet mwan3"*) exit 0 ;;
+esac
+exit 0
+F42_NFT_SUGGEST
+chmod +x "$F42/bin/nft"
+
+# conntrack 夹具：110.251.151.7（兜底，联通家宽段）+ 110.251.152.9（兜底）
+# + 1.1.2.3（命中 isp_tel，必须被排除）
+{
+	i=0
+	while [ "$i" -lt 1200 ]; do
+		printf 'ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.10.2 dst=110.251.151.7 sport=5000 dport=8082 packets=10 bytes=2048 src=110.251.151.7 dst=192.168.10.2 sport=8082 dport=5000 packets=9 bytes=1024 [ASSURED] mark=0 use=1\n'
+		i=$((i + 1))
+	done
+	i=0
+	while [ "$i" -lt 100 ]; do
+		printf 'ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.10.2 dst=110.251.152.9 sport=5001 dport=443 packets=4 bytes=512 src=110.251.152.9 dst=192.168.10.2 sport=443 dport=5001 packets=3 bytes=256 [ASSURED] mark=0 use=1\n'
+		i=$((i + 1))
+	done
+	i=0
+	while [ "$i" -lt 300 ]; do
+		printf 'ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.10.2 dst=1.1.2.3 sport=5002 dport=443 packets=4 bytes=512 src=1.1.2.3 dst=192.168.10.2 sport=443 dport=5002 packets=3 bytes=256 [ASSURED] mark=0 use=1\n'
+		i=$((i + 1))
+	done
+} > "$F42/conntrack.txt"
+
+mkdir -p "$F42/base/state"
+{
+	printf '110.251.151.7\tbaidu\t河北省唐山市 联通\t%s\n' "$(date +%s)"
+	printf '110.251.152.9\tbaidu\t河北省唐山市 联通\t%s\n' "$(date +%s)"
+} > "$F42/base/state/linecheck.geo.tsv"
+_f42_conf "$F42/c3.conf" ""
+
+if (PATH="$F42/bin:$PATH" F42_MIRROR="$F42/mirror" \
+	ISP_SPLIT_CONF="$F42/c3.conf" ISP_SPLIT_BASE="$F42/base" ISP_SPLIT_LIB="$LIB" \
+	ISP_SPLIT_CONNTRACK="$F42/conntrack.txt" \
+	sh "$ROOT/files/usr/sbin/isp-split" suggest --min-conns 100) >"$F42/s1.out" 2>&1 &&
+	grep -q '建议: 110.251.0.0/16 → wanb_only（联通，证据: linecheck geo + 1300 连接兜底）' "$F42/s1.out" &&
+	! grep -q '1\.1\.2\.' "$F42/s1.out"; then
+	ok "35.7 suggest 输出建议表（/24 聚合成 /16，命中集合的目标被排除）"
+else
+	ng "35.7 suggest 输出格式/聚合/排除不对"
+	sed 's/^/    /' "$F42/s1.out" | tail -12
+fi
+
+if (PATH="$F42/bin:$PATH" F42_MIRROR="$F42/mirror" \
+	ISP_SPLIT_CONF="$F42/c3.conf" ISP_SPLIT_BASE="$F42/base" ISP_SPLIT_LIB="$LIB" \
+	ISP_SPLIT_CONNTRACK="$F42/conntrack.txt" \
+	sh "$ROOT/files/usr/sbin/isp-split" suggest --min-conns 5000 --min-bytes 999999999) >"$F42/s2.out" 2>&1 &&
+	grep -q '没有超过阈值的兜底目的网段' "$F42/s2.out"; then
+	ok "35.8 suggest 阈值（--min-conns）生效：低于阈值不产生建议"
+else
+	ng "35.8 suggest 阈值未生效"
+	sed 's/^/    /' "$F42/s2.out" | tail -8
+fi
+
+# 非交互 --apply 必须被拒绝，且配置一个字节都不动
+cp "$F42/c3.conf" "$F42/c3.before"
+if (PATH="$F42/bin:$PATH" F42_MIRROR="$F42/mirror" \
+	ISP_SPLIT_CONF="$F42/c3.conf" ISP_SPLIT_BASE="$F42/base" ISP_SPLIT_LIB="$LIB" \
+	ISP_SPLIT_CONNTRACK="$F42/conntrack.txt" \
+	sh "$ROOT/files/usr/sbin/isp-split" suggest --apply --min-conns 100 </dev/null) >"$F42/s3.out" 2>&1; then
+	ng "35.9 非交互 --apply 未被拒绝（会静默写配置）"
+else
+	if cmp -s "$F42/c3.conf" "$F42/c3.before"; then
+		ok "35.9 非交互 --apply 被拒绝（提示 --assume-yes）且配置未改动"
+	else
+		ng "35.9 非交互 --apply 失败路径仍改动了配置"
+	fi
+fi
+
+# --assume-yes 才写；写入后 IP_SPLIT 里应有该段，且第二次幂等
+cat > "$F42/bin/uci" <<'F42_UCI'
+#!/bin/sh
+[ "${1:-}" = "-q" ] && shift
+[ "${1:-}" = "show" ] && { echo "mwan3.wan_only=policy"; echo "mwan3.wanb_only=policy"; exit 0; }
+exit 1
+F42_UCI
+chmod +x "$F42/bin/uci"
+if (PATH="$F42/bin:$PATH" F42_MIRROR="$F42/mirror" \
+	ISP_SPLIT_CONF="$F42/c3.conf" ISP_SPLIT_BASE="$F42/base" ISP_SPLIT_LIB="$LIB" \
+	ISP_SPLIT_CONNTRACK="$F42/conntrack.txt" \
+	sh "$ROOT/files/usr/sbin/isp-split" suggest --apply --assume-yes --min-conns 100 </dev/null) >"$F42/s4.out" 2>&1 &&
+	grep -q '110\.251\.0\.0/16:wanb_only' "$F42/c3.conf"; then
+	ok "35.10 suggest --apply --assume-yes 把建议写进 IP_SPLIT"
+else
+	ng "35.10 suggest --apply 未写入配置"
+	sed 's/^/    /' "$F42/s4.out" | tail -8
+	grep -n 'IP_SPLIT' -A3 "$F42/c3.conf" | sed 's/^/    /'
+fi
+
+if (PATH="$F42/bin:$PATH" F42_MIRROR="$F42/mirror" \
+	ISP_SPLIT_CONF="$F42/c3.conf" ISP_SPLIT_BASE="$F42/base" ISP_SPLIT_LIB="$LIB" \
+	ISP_SPLIT_CONNTRACK="$F42/conntrack.txt" \
+	sh "$ROOT/files/usr/sbin/isp-split" suggest --apply --assume-yes --min-conns 100 </dev/null) >"$F42/s5.out" 2>&1 &&
+	grep -q '没有需要新增的段' "$F42/s5.out"; then
+	ok "35.11 suggest --apply 幂等（已存在的网段不重复写入）"
+else
+	ng "35.11 suggest --apply 不幂等"
+	sed 's/^/    /' "$F42/s5.out" | tail -6
+fi
+
+# ---- 35.12 端口钉线顺序（D4）----
+cat > "$F42/pin.conf" <<'F42_PIN'
+config globals 'globals'
+	option mmx_mask '0x3F00'
+
+config rule 'nas_all'
+	option src_ip '192.168.50.9'
+	option use_policy 'balanced'
+
+config rule 'https'
+	option sticky '1'
+	option dest_port '443'
+	option proto 'tcp'
+	option use_policy 'wanb_wan'
+
+config rule 'pin_bili'
+	option dest_port '4483 8082'
+	option proto 'tcp'
+	option use_policy 'wan_only'
+
+config rule 'default_rule_v4'
+	option dest_ip '0.0.0.0/0'
+	option use_policy 'balanced'
+F42_PIN
+cat > "$F42/pin-rules.txt" <<'F42_PINR'
+config rule 'isp_tel'
+	option ipset 'isp_tel'
+	option use_policy 'wan_only'
+	option isp_split '1'
+
+config rule 'isp_uni'
+	option ipset 'isp_uni'
+	option use_policy 'wanb_only'
+	option isp_split '1'
+
+F42_PINR
+awk -v insert="$F42/pin-rules.txt" -v anchor="$ANCHOR" -v pinports="4483 8082" \
+	-f "$LIB/rules-splice.awk" "$F42/pin.conf" > "$F42/pin1"
+awk -v insert="$F42/pin-rules.txt" -v anchor="$ANCHOR" -v pinports="4483 8082" \
+	-f "$LIB/rules-splice.awk" "$F42/pin1" > "$F42/pin2"
+_pin_order=$(grep -oE "^config rule '[^']+'" "$F42/pin1" | sed "s/.*'\(.*\)'/\1/" | tr '\n' ' ')
+if [ "$_pin_order" = "nas_all pin_bili isp_tel isp_uni https default_rule_v4 " ]; then
+	ok "35.12 端口钉线规则被提到集合规则之前：$_pin_order"
+else
+	ng "35.12 端口钉线顺序不对：$_pin_order"
+fi
+if cmp -s "$F42/pin1" "$F42/pin2"; then
+	ok "35.13 端口钉线搬迁幂等（二次 wire 不再翻回集合规则之后）"
+else
+	ng "35.13 端口钉线搬迁不幂等"
+	diff "$F42/pin1" "$F42/pin2" | head -10 | sed 's/^/    /'
+fi
+awk -v insert="$F42/pin-rules.txt" -v anchor="$ANCHOR" \
+	-f "$LIB/rules-splice.awk" "$F42/pin.conf" > "$F42/pin0"
+_pin_order0=$(grep -oE "^config rule '[^']+'" "$F42/pin0" | sed "s/.*'\(.*\)'/\1/" | tr '\n' ' ')
+if [ "$_pin_order0" = "nas_all isp_tel isp_uni https pin_bili default_rule_v4 " ]; then
+	ok "35.14 ISP_PIN_PORTS 为空时保持 0.4.x 行为（不搬任何用户规则）"
+else
+	ng "35.14 未配置 ISP_PIN_PORTS 时规则顺序变了：$_pin_order0"
 fi
 
 echo

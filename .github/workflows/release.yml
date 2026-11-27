@@ -269,11 +269,40 @@ jobs:
           # 安装姿势都写在下面手写 body 里），自动 notes 只会把提交标题堆上去。
           generate_release_notes: false
           body: |
-            ## v0.4.1 体检修正
+            ## v0.5.0 手动补段 + geo 反哺
 
-            doctor 的标记位段检查（C3）不再把 mwan3 自己的线路打标误判成第三方 DPI：生产 mwan3-nft 3.6 的 `mwan3_or_ct_*`（`ct mark set ... | 0x100`）和 `iface_in_*` 线路值会被按表/链归属排除，只有表/链不属于 mwan3、且写入位与 mmx_mask 重叠的第三方写者才报 conflict；产品名只作 hint 并标注置信度。
+            视频平台全面 PCDN 化之后，"运营商段表 + 兜底 balanced"对视频流量的覆盖率持续下降：B 站 PCDN 家宽节点的 IP 是动态家宽地址，永远不会出现在段表里，落兜底后被 balanced 摇到另一家运营商就是跨网卡顿（生产两次实证）。本版把"手工补段"做成产品级能力，并补上把缺口变成建议的反哺通道。
 
-            其余为 v0.4.0 的体检能力（首次安装仍按下面的安装段操作）：
+            ### 手动补段（`IP_SPLIT` / `IP_LIST_DIR`）
+
+            - `/etc/isp-split.conf` 新增 `IP_SPLIT="<CIDR>:<策略>"`（多行，写法同 `DOMAIN_SPLIT`）；可选用 `IP_LIST_DIR/<策略>.txt` 批量维护
+            - **每次 fetch / wire / apply / refresh / sync / rollback 渲染集合时都重新合并**：04:17 的定时 fetch 重建数据后手动段自动回来，不再被冲掉
+            - 手动段优先级高于段表数据：与段表数据重叠时保留手动段，其它集合让出这些地址（同一 IP 只归一个集合，规则先后不影响归属）
+            - mwan3 ipset 段的 `loadfile` 指向"已合并"的文件，重启后照样在
+            - 升级迁移：生产当前手工加的两段直接写进 `IP_SPLIT` 即可——`101.22.0.0/16:wanb_only`、`110.250.0.0/16:wanb_only`
+
+            ### 兜底缺口建议（`isp-split suggest`，只读 + 可选 `--apply`）
+
+            - 扫 `state/linecheck.geo.tsv` 的归属地存档 + conntrack 里"未命中任何启用集合"的目的网段（/24 聚合，同 /16 内 ≥2 个 /24 时按 /16 建议）
+            - 阈值默认 ≥1000 连接 或 ≥1MiB（`SUGGEST_MIN_CONNS` / `SUGGEST_MIN_BYTES`，或 `--min-conns` / `--min-bytes`）
+            - 只向归属地服务发**聚合后的目标 IP**（默认百度 HTTPS，沿用 linecheck 的隐私纪律），结果缓存进 `geo.tsv` 复用
+            - `--apply` 写入 `IP_SPLIT`（等价手工编辑配置）：写前展示改动，交互确认；非交互必须 `--assume-yes`
+            - **不是自动任务**：只能手动跑或 LuCI 点按钮，绝不进 cron
+
+            ### 端口钉线顺序修复
+
+            - `mwan3_rules` 是 first-match：集合规则原本排在用户的端口钉线规则（B 站 PCDN 回退 8082 / edge 4483）之前，那条规则对集合内目标永远不命中
+            - `wire` 现在把命中 `ISP_PIN_PORTS`（默认 `4483 8082`）的用户规则提到集合规则之前，其余顺序不动；`verify` 增加顺序断言
+
+            ### LuCI
+
+            - 配置页新增「手动补段」区块（提示"fetch 后自动合并"）
+            - 状态页兜底卡：占比 >30% 时显示一行提示，指向 `isp-split suggest`（只提示，不自动跑）
+
+            ### doctor
+
+            - C1 新增 `ip_split_configured` / `ip_split_segments` 事实；有手动段时不再判"无需片段"，改判 `DNS_FRAGMENT_IP_SPLIT_ONLY`（仍是 ok，不新增误报）
+            - 其余为 v0.4.x 的体检能力（首次安装仍按下面的安装段操作）：
 
             ### bootstrap（净机骨架，默认灰度）
 
@@ -304,7 +333,7 @@ jobs:
             ```sh
             wget -O /tmp/isp.tgz <本页 isp-split-*.tar.gz 的地址>
             mkdir -p /tmp/isp && tar -xzf /tmp/isp.tgz -C /tmp/isp
-            sh /tmp/isp/isp-split-0.4.1/scripts/install.sh --all
+            sh /tmp/isp/isp-split-0.5.0/scripts/install.sh --all
             ```
 
             （busybox tar 不支持 --strip-components，进目录跑即可。）
